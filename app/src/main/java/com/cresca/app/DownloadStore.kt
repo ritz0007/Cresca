@@ -11,6 +11,8 @@ import java.util.concurrent.ConcurrentHashMap
 
 object DownloadStore {
     private const val PREFS = "dlmap"
+    private const val APP_PREFS = "cresca_prefs"
+    private const val KEY_LOCATION = "dl_location"
     private const val SUBDIR = "Cresca"
     private const val EXT = ".m4a"
 
@@ -20,15 +22,64 @@ object DownloadStore {
     private fun prefs(ctx: Context) =
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-    private fun dirFor(ctx: Context): File =
+    // "app" (private app folder) or "device" (public Music folder).
+    fun location(ctx: Context): String {
+        return try {
+            ctx.getSharedPreferences(APP_PREFS, Context.MODE_PRIVATE)
+                .getString(KEY_LOCATION, "app") ?: "app"
+        } catch (e: Exception) {
+            "app"
+        }
+    }
+
+    fun setLocation(ctx: Context, value: String) {
+        try {
+            ctx.getSharedPreferences(APP_PREFS, Context.MODE_PRIVATE)
+                .edit().putString(KEY_LOCATION, value).apply()
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun appDir(ctx: Context): File =
         File(ctx.getExternalFilesDir(Environment.DIRECTORY_MUSIC), SUBDIR)
 
-    private fun fileNameFor(trackId: String): String =
-        sanitize(trackId) + EXT
+    private fun publicDir(): File? {
+        return try {
+            @Suppress("DEPRECATION")
+            File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC),
+                SUBDIR
+            )
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun dirsFor(ctx: Context): List<File> {
+        val out = ArrayList<File>(2)
+        try {
+            out.add(appDir(ctx))
+        } catch (e: Exception) {
+        }
+        try {
+            val p = publicDir()
+            if (p != null) {
+                out.add(p)
+            }
+        } catch (e: Exception) {
+        }
+        return out
+    }
+
+    // Human file name: "Artist - Title". Falls back to the id.
+    private fun fileNameFor(track: YtTrack): String {
+        val base = (track.artist.trim() + " - " + track.title.trim()).trim()
+        val clean = sanitize(if (base == "-") track.id else base)
+        return clean + EXT
+    }
 
     // Read one persisted row; null when absent or corrupt.
     private fun readRow(ctx: Context, trackId: String): JSONObject? {
-        // Check memory first so callers stay fast after enqueue.
         try {
             val raw = prefs(ctx).getString(trackId, null) ?: return null
             return JSONObject(raw)
@@ -37,13 +88,15 @@ object DownloadStore {
         }
     }
 
-    // Persist id -> (downloadId, title, artist) as a JSON string.
-    private fun writeRow(ctx: Context, track: YtTrack, downloadId: Long) {
+    // Persist id -> (downloadId, title, artist, name, public) as JSON.
+    private fun writeRow(ctx: Context, track: YtTrack, name: String, pub: Boolean, downloadId: Long) {
         try {
             val obj = JSONObject()
             obj.put("downloadId", downloadId)
             obj.put("title", track.title)
             obj.put("artist", track.artist)
+            obj.put("name", name)
+            obj.put("public", pub)
             prefs(ctx).edit().putString(track.id, obj.toString()).apply()
         } catch (e: Exception) {
             // Ignore persistence failure; memory map still works.
@@ -73,17 +126,23 @@ object DownloadStore {
 
     fun enqueue(ctx: Context, track: YtTrack, audioUrl: String): Long {
         val mgr = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-        val dest = SUBDIR + "/" + fileNameFor(track.id)
+        val name = fileNameFor(track)
+        val pub = location(ctx) == "device"
         val req = DownloadManager.Request(Uri.parse(audioUrl))
             .setTitle(track.title)
             .setDescription(track.artist)
             .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            .setDestinationInExternalFilesDir(ctx, Environment.DIRECTORY_MUSIC, dest)
             .setAllowedOverMetered(true)
             .setAllowedOverRoaming(true)
+        if (pub) {
+            @Suppress("DEPRECATION")
+            req.setDestinationInExternalPublicDir(Environment.DIRECTORY_MUSIC, SUBDIR + "/" + name)
+        } else {
+            req.setDestinationInExternalFilesDir(ctx, Environment.DIRECTORY_MUSIC, SUBDIR + "/" + name)
+        }
         val id = mgr.enqueue(req)
         memIds[track.id] = id
-        writeRow(ctx, track, id)
+        writeRow(ctx, track, name, pub, id)
         return id
     }
 
@@ -120,8 +179,27 @@ object DownloadStore {
 
     fun fileFor(ctx: Context, trackId: String): File? {
         try {
-            val f = File(dirFor(ctx), fileNameFor(trackId))
-            if (f.exists() && f.isFile) return f
+            val row = readRow(ctx, trackId)
+            val name = row?.optString("name", null)?.takeIf { it.isNotEmpty() }
+            if (name != null) {
+                // New layout: exact stored file name, either location.
+                for (d in dirsFor(ctx)) {
+                    try {
+                        val f = File(d, name)
+                        if (f.exists() && f.isFile) return f
+                    } catch (e: Exception) {
+                    }
+                }
+            }
+            // Legacy layout: sanitized id as file name.
+            val legacy = sanitize(trackId) + EXT
+            for (d in dirsFor(ctx)) {
+                try {
+                    val f = File(d, legacy)
+                    if (f.exists() && f.isFile) return f
+                } catch (e: Exception) {
+                }
+            }
             return null
         } catch (e: Exception) {
             return null
@@ -129,38 +207,64 @@ object DownloadStore {
     }
 
     fun listAll(ctx: Context): List<Pair<YtTrack, File>> {
-        val dir = try { dirFor(ctx) } catch (e: Exception) { return emptyList() }
-        val files = try {
-            dir.listFiles { f -> f.isFile && f.name.endsWith(EXT, ignoreCase = true) }
-                ?: return emptyList()
-        } catch (e: Exception) {
-            return emptyList()
-        }
-        val out = ArrayList<Pair<YtTrack, File>>(files.size)
-        for (f in files) {
-            try {
-                val base = f.nameWithoutExtension
-                // Filename is sanitized track id; use it as the id.
-                val trackId = base
-                val row = readRow(ctx, trackId)
-                val title = row?.optString("title", null)?.takeIf { it.isNotEmpty() } ?: base
-                val artist = row?.optString("artist", null)?.takeIf { it.isNotEmpty() } ?: "Unknown Artist"
-                // Keep persisted download id warm in memory when present.
+        // Index rows by stored file name for lookup.
+        val byName = HashMap<String, Pair<String, JSONObject>>()
+        try {
+            val all = prefs(ctx).all
+            for ((key, value) in all) {
                 try {
-                    val did = row?.optLong("downloadId", Long.MIN_VALUE) ?: Long.MIN_VALUE
-                    if (did != Long.MIN_VALUE) memIds[trackId] = did
-                } catch (e: Exception) { /* ignore */ }
-                val track = YtTrack(
-                    id = trackId,
-                    title = title,
-                    artist = artist,
-                    thumbUrl = "",
-                    watchUrl = "",
-                    localPath = f.absolutePath
-                )
-                out.add(track to f)
+                    if (value is String) {
+                        val o = JSONObject(value)
+                        val nm = o.optString("name", "")
+                        if (nm.isNotEmpty()) {
+                            byName[nm] = Pair(key, o)
+                        }
+                    }
+                } catch (e: Exception) {
+                }
+            }
+        } catch (e: Exception) {
+        }
+        val out = ArrayList<Pair<YtTrack, File>>()
+        for (d in dirsFor(ctx)) {
+            val files = try {
+                d.listFiles { f -> f.isFile && f.name.endsWith(EXT, ignoreCase = true) }
+                    ?: continue
             } catch (e: Exception) {
-                // Skip unreadable entries.
+                continue
+            }
+            for (f in files) {
+                try {
+                    val hit = byName[f.name]
+                    val trackId: String
+                    val title: String
+                    val artist: String
+                    if (hit != null) {
+                        trackId = hit.first
+                        title = hit.second.optString("title", "").ifEmpty { f.nameWithoutExtension }
+                        artist = hit.second.optString("artist", "").ifEmpty { "Unknown Artist" }
+                        try {
+                            val did = hit.second.optLong("downloadId", Long.MIN_VALUE)
+                            if (did != Long.MIN_VALUE) memIds[trackId] = did
+                        } catch (e: Exception) { /* ignore */ }
+                    } else {
+                        // Legacy id-named file or unknown origin.
+                        trackId = f.nameWithoutExtension
+                        title = f.nameWithoutExtension
+                        artist = "Unknown Artist"
+                    }
+                    val track = YtTrack(
+                        id = trackId,
+                        title = title,
+                        artist = artist,
+                        thumbUrl = "",
+                        watchUrl = "",
+                        localPath = f.absolutePath
+                    )
+                    out.add(track to f)
+                } catch (e: Exception) {
+                    // Skip unreadable entries.
+                }
             }
         }
         return out
@@ -175,11 +279,10 @@ object DownloadStore {
                 try { mgr.remove(did) } catch (e: Exception) { /* ignore */ }
             }
         } catch (e: Exception) { /* ignore */ }
-        // Remove the file when present.
+        // Remove the file when present (any known location + legacy name).
         try {
-            val f = File(dirFor(ctx), fileNameFor(trackId))
-            if (f.exists()) {
-                try { f.delete() } catch (e: Exception) { /* ignore */ }
+            fileFor(ctx, trackId)?.let {
+                try { it.delete() } catch (e: Exception) { /* ignore */ }
             }
         } catch (e: Exception) { /* ignore */ }
         // Drop memory + persisted rows.
@@ -192,11 +295,11 @@ object DownloadStore {
     fun sanitize(name: String): String {
         val kept = StringBuilder(name.length)
         for (ch in name) {
-            if ((ch in 'A'..'Z') || (ch in 'a'..'z') || (ch in '0'..'9') || ch == ' ' || ch == '_' || ch == '-') {
+            if ((ch in 'A'..'Z') || (ch in 'a'..'z') || (ch in '0'..'9') || ch == ' ' || ch == '_' || ch == '-' || ch == '(' || ch == ')' || ch == '&') {
                 kept.append(ch)
             }
         }
-        val s = kept.toString().trim().take(60).trim()
+        val s = kept.toString().trim().take(80).trim()
         if (s.isEmpty()) return "track"
         return s
     }

@@ -63,7 +63,14 @@ private class OkHttpDownloader(private val client: OkHttpClient) : Downloader() 
 
 object YoutubeRepository {
     private const val TAG = "YoutubeRepo"
-    private val http = OkHttpClient()
+    // Generous timeouts: search does several round trips; slow networks
+    // must not surface as crashes or instant failures.
+    private val http = okhttp3.OkHttpClient.Builder()
+        .connectTimeout(25, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(25, java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(25, java.util.concurrent.TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
+        .build()
 
     @Volatile private var ready = false
     @Volatile private var appContext: Context? = null
@@ -218,6 +225,71 @@ object YoutubeRepository {
 
     /** One playable muxed quality level for the quality picker. */
     data class VideoOption(val url: String, val height: Int, val label: String)
+
+    /** Credits-style details for the About card (Shazam-like). */
+    data class VideoDetails(
+        val views: Long,
+        val likes: Long,
+        val uploadDate: String,
+        val description: String,
+        val durationSec: Long,
+        val dashUrl: String
+    )
+
+    private val detailsCache =
+        java.util.concurrent.ConcurrentHashMap<String, VideoDetails>()
+
+    suspend fun videoDetails(watchUrl: String): VideoDetails? =
+        withContext(Dispatchers.IO) {
+            ensureInit()
+            try {
+                detailsCache[watchUrl]?.let { return@withContext it }
+            } catch (e: Exception) {
+            }
+            try {
+                val se = YouTube.getStreamExtractor(watchUrl)
+                se.fetchPage()
+                var desc = ""
+                try {
+                    desc = se.description?.content ?: ""
+                } catch (e: Exception) {
+                }
+                var dash = ""
+                try {
+                    dash = se.dashMpdUrl ?: ""
+                } catch (e: Exception) {
+                }
+                var views = -1L
+                try {
+                    views = se.viewCount
+                } catch (e: Exception) {
+                }
+                var likes = -1L
+                try {
+                    likes = se.likeCount
+                } catch (e: Exception) {
+                }
+                var date = ""
+                try {
+                    date = se.textualUploadDate ?: ""
+                } catch (e: Exception) {
+                }
+                var dur = -1L
+                try {
+                    dur = se.length
+                } catch (e: Exception) {
+                }
+                val d = VideoDetails(views, likes, date, desc, dur, dash)
+                try {
+                    detailsCache[watchUrl] = d
+                } catch (e: Exception) {
+                }
+                d
+            } catch (e: Exception) {
+                Log.e(TAG, "videoDetails failed", e)
+                null
+            }
+        }
 
     /** All muxed (video+audio) quality levels, best first. Empty on failure. */
     suspend fun videoOptions(watchUrl: String): List<VideoOption> =

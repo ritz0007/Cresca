@@ -7,6 +7,7 @@ import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
@@ -23,6 +24,8 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -36,10 +39,12 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.res.painterResource
@@ -69,8 +74,10 @@ import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.materials.ExperimentalHazeMaterialsApi
 import dev.chrisbanes.haze.materials.HazeMaterials
 import dev.chrisbanes.haze.rememberHazeState
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -80,12 +87,6 @@ private const val TAG = "Cresca"
 private const val HOME_QUERY = "latest hindi songs"
 private const val HOME_CACHE_TTL = 12 * 60 * 60 * 1000L
 private const val SEARCH_CACHE_TTL = 30 * 60 * 1000L
-
-// Offline fallback so UI/preview works without network
-private val demoTracks = listOf(
-    YtTrack("n_E3bLYuQBo", "Midnight Drive (demo)", "Neon Coast", "", ""),
-    YtTrack("abc123", "Golden Hour (demo)", "Aria Bloom", "", "")
-)
 
 private data class Tab(val label: String, val icon: ImageVector)
 
@@ -101,6 +102,20 @@ private fun fmtMs(ms: Long): String {
     if (ms <= 0) return "0:00"
     val s = ms / 1000
     return "${s / 60}:${String.format("%02d", s % 60)}"
+}
+
+// Shared track metadata for audio/video media items (top-level: usable anywhere).
+private fun metaFor(t: YtTrack): androidx.media3.common.MediaMetadata {
+    val b = androidx.media3.common.MediaMetadata.Builder()
+        .setTitle(t.title)
+        .setArtist(t.artist)
+    try {
+        if (t.thumbUrl.isNotBlank()) {
+            b.setArtworkUri(android.net.Uri.parse(t.thumbUrl))
+        }
+    } catch (e: Exception) {
+    }
+    return b.build()
 }
 
 // True when the player failed on an HTTP block (403/410 throttling).
@@ -294,7 +309,10 @@ fun AppleMusicAppContent(
 
     var selectedTab by remember { mutableIntStateOf(0) }
     var query by remember { mutableStateOf("") }
-    var homeTracks by remember { mutableStateOf(demoTracks) }
+    var homeTracks by remember { mutableStateOf<List<YtTrack>>(emptyList()) }
+    var homeLoading by remember { mutableStateOf(true) }
+    var homeError by remember { mutableStateOf<String?>(null) }
+    var homeTick by remember { mutableIntStateOf(0) }
     var live by remember { mutableStateOf(false) }
     var nowPlaying by remember { mutableStateOf<YtTrack?>(null) }
     var resolving by remember { mutableStateOf(false) }
@@ -302,19 +320,58 @@ fun AppleMusicAppContent(
     // Video mode lives here (before the queue) so resolve callbacks can see it.
     var videoMode by remember { mutableStateOf(false) }
     var videoFollowTick by remember { mutableIntStateOf(0) }
+    var primeTick by remember { mutableIntStateOf(0) }
     var videoOpts by remember { mutableStateOf<List<YoutubeRepository.VideoOption>>(emptyList()) }
     var videoLoading by remember { mutableStateOf(false) }
     var videoQualityH by remember { mutableIntStateOf(-1) }
-    // Live alert pill: pops around the camera hole on track change, hides itself.
-    var islandVisible by remember { mutableStateOf(false) }
-    LaunchedEffect(nowPlaying) {
-        if (nowPlaying != null) {
-            islandVisible = true
-            delay(4000)
-            islandVisible = false
+    var dashUrl by remember { mutableStateOf("") }
+    var dashCapH by remember { mutableIntStateOf(0) }
+
+    // Quality rows for the picker: DASH caps when available, else muxed heights.
+    fun qualityLabels(): List<String> {
+        return if (dashUrl.isNotBlank()) {
+            listOf("Auto", "1080p", "720p", "480p", "360p")
         } else {
-            islandVisible = false
+            videoOpts.map { it.label }.distinct()
         }
+    }
+
+    fun currentQualityLabel(): String {
+        if (dashUrl.isNotBlank()) {
+            return if (dashCapH <= 0) "Auto" else "${dashCapH}p"
+        }
+        return if (videoQualityH > 0) "${videoQualityH}p" else "Auto"
+    }
+
+    fun playDash(t: YtTrack, url: String, capH: Int, fromPos: Long, autoplay: Boolean) {
+        player.setMediaItem(
+            MediaItem.Builder()
+                .setUri(url)
+                .setMediaId("v:" + t.id)
+                .setMediaMetadata(metaFor(t))
+                .setMimeType(androidx.media3.common.MimeTypes.APPLICATION_MPD)
+                .build()
+        )
+        try {
+            if (capH > 0) {
+                player.trackSelectionParameters = player.trackSelectionParameters
+                    .buildUpon()
+                    .setMaxVideoSize(capH * 16 / 9, capH)
+                    .build()
+            } else {
+                player.trackSelectionParameters = player.trackSelectionParameters
+                    .buildUpon()
+                    .setMaxVideoSize(Int.MAX_VALUE, Int.MAX_VALUE)
+                    .build()
+            }
+        } catch (e: Exception) {
+        }
+        player.prepare()
+        player.seekTo(fromPos)
+        if (autoplay) {
+            player.play()
+        }
+        dashCapH = capH
     }
     var announced by remember { mutableStateOf(false) }
     fun announce() { if (!announced) { announced = true; onReady() } }
@@ -329,17 +386,50 @@ fun AppleMusicAppContent(
     val hazeState = remember { HazeState() }
     var newTracks by remember { mutableStateOf<List<YtTrack>>(emptyList()) }
     val recent = remember { mutableStateListOf<YtTrack>() }
-    var liked by remember { mutableStateOf<List<YtTrack>>(LikedStore.load(context)) }
+    var liked by remember { mutableStateOf<List<YtTrack>>(emptyList()) }
+    // Likes load off the main thread (file IO must never block composition).
+    LaunchedEffect(Unit) {
+        try {
+            liked = withContext(Dispatchers.IO) { LikedStore.load(context) }
+        } catch (e: Exception) {
+        }
+    }
     var showQueue by remember { mutableStateOf(false) }
     var seeAllTitle by remember { mutableStateOf("") }
     var seeAllTracks by remember { mutableStateOf<List<YtTrack>>(emptyList()) }
     var showSeeAll by remember { mutableStateOf(false) }
     var searchFocusTick by remember { mutableIntStateOf(0) }
     var lastSearchTap by remember { mutableLongStateOf(0L) }
-    var loggedIn by remember { mutableStateOf(YtSessionManager.isLoggedIn(context)) }
+    var loggedIn by remember { mutableStateOf(false) }
+    var loginFailed by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        try {
+            loggedIn = withContext(Dispatchers.IO) { YtSessionManager.isLoggedIn(context) }
+        } catch (e: Exception) {
+        }
+    }
     var showSession by remember { mutableStateOf(false) }
     var dlItems by remember { mutableStateOf<List<Pair<YtTrack, File>>>(emptyList()) }
     var showDownloads by remember { mutableStateOf(false) }
+    var showProfile by remember { mutableStateOf(false) }
+    var dlLoc by remember { mutableStateOf(DownloadStore.location(context)) }
+
+    fun clearSongCache() {
+        scope.launch(Dispatchers.IO) {
+            try {
+                context.cacheDir
+                    .listFiles { f -> f.isFile && f.name.startsWith("yt_") }
+                    ?.forEach {
+                        try {
+                            it.delete()
+                        } catch (e: Exception) {
+                        }
+                    }
+            } catch (e: Exception) {
+            }
+        }
+        homeTick++
+    }
     var showPlaylist by remember { mutableStateOf<Playlist?>(null) }
 
     fun openPlaylist(id: String) {
@@ -350,10 +440,12 @@ fun AppleMusicAppContent(
     }
 
     fun refreshDownloads() {
-        try {
-            dlItems = DownloadStore.listAll(context)
-        } catch (e: Exception) {
-            dlItems = emptyList()
+        scope.launch(Dispatchers.IO) {
+            try {
+                dlItems = DownloadStore.listAll(context)
+            } catch (e: Exception) {
+                dlItems = emptyList()
+            }
         }
     }
 
@@ -374,7 +466,13 @@ fun AppleMusicAppContent(
     fun toggleLike(t: YtTrack) {
         liked = if (liked.any { it.id == t.id }) liked.filter { it.id != t.id }
         else listOf(t) + liked
-        try { LikedStore.save(context, liked) } catch (e: Exception) { }
+        val snapshot = liked
+        scope.launch(Dispatchers.IO) {
+            try {
+                LikedStore.save(context, snapshot)
+            } catch (e: Exception) {
+            }
+        }
     }
 
     fun isLiked(t: YtTrack) = liked.any { it.id == t.id }
@@ -409,6 +507,9 @@ fun AppleMusicAppContent(
                 // New track while watching video: follow it into video mode.
                 if (videoMode) {
                     videoFollowTick++
+                } else {
+                    // Buffer the track after this one: gapless change.
+                    primeTick++
                 }
             },
             onError = { msg ->
@@ -422,10 +523,23 @@ fun AppleMusicAppContent(
         if (playerState == Player.STATE_ENDED) queue.next()
     }
 
+    // Gapless lookahead trigger (set by resolve callbacks above).
+    LaunchedEffect(primeTick) {
+        if (primeTick > 0 && !videoMode) {
+            queue.primeNext()
+        }
+    }
+
     DisposableEffect(player) {
         val listener = object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) { playerState = state }
             override fun onIsPlayingChanged(v: Boolean) { isPlaying = v }
+            override fun onMediaItemTransition(item: MediaItem?, reason: Int) {
+                // Player flipped gaplessly onto the primed item: adopt it.
+                if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
+                    queue.confirmAdvanced()
+                }
+            }
             override fun onPlayerError(error: PlaybackException) {
                 Log.e(TAG, "player error", error)
                 // YouTube 403/410 throttling: drop the stale URL, try the next host.
@@ -547,19 +661,6 @@ fun AppleMusicAppContent(
 
     // ---- Video mode: the SAME session player swaps audio<->video streams,
     // so the music transport (play/pause/seek/prev/next) always drives video.
-    fun metaFor(t: YtTrack): androidx.media3.common.MediaMetadata {
-        val b = androidx.media3.common.MediaMetadata.Builder()
-            .setTitle(t.title)
-            .setArtist(t.artist)
-        try {
-            if (t.thumbUrl.isNotBlank()) {
-                b.setArtworkUri(Uri.parse(t.thumbUrl))
-            }
-        } catch (e: Exception) {
-        }
-        return b.build()
-    }
-
     fun enterVideo() {
         val t = nowPlaying
         if (t == null || t.watchUrl.isBlank()) {
@@ -575,24 +676,37 @@ fun AppleMusicAppContent(
             try {
                 val opts = YoutubeRepository.videoOptions(t.watchUrl)
                 videoOpts = opts
-                val url = opts.firstOrNull()?.url
-                    ?: YoutubeRepository.videoUrl(t.watchUrl)
-                if (url != null) {
-                    val pos = player.currentPosition
-                    val playing = player.isPlaying
-                    player.setMediaItem(
-                        MediaItem.Builder()
-                            .setUri(url)
-                            .setMediaId("v:" + t.id)
-                            .setMediaMetadata(metaFor(t))
-                            .build()
-                    )
-                    player.prepare()
-                    player.seekTo(pos)
-                    if (playing) {
-                        player.play()
+                var dash = ""
+                try {
+                    dash = YoutubeRepository.videoDetails(t.watchUrl)?.dashUrl ?: ""
+                } catch (e: Exception) {
+                }
+                dashUrl = dash
+                val pos = player.currentPosition
+                val playing = player.isPlaying
+                if (dash.isNotBlank()) {
+                    // DASH manifest: adaptive up to 1080p+, instant start.
+                    playDash(t, dash, 0, pos, playing)
+                    videoQualityH = -1
+                } else {
+                    dashCapH = 0
+                    val url = opts.firstOrNull()?.url
+                        ?: YoutubeRepository.videoUrl(t.watchUrl)
+                    if (url != null) {
+                        player.setMediaItem(
+                            MediaItem.Builder()
+                                .setUri(url)
+                                .setMediaId("v:" + t.id)
+                                .setMediaMetadata(metaFor(t))
+                                .build()
+                        )
+                        player.prepare()
+                        player.seekTo(pos)
+                        if (playing) {
+                            player.play()
+                        }
+                        videoQualityH = opts.firstOrNull()?.height ?: -1
                     }
-                    videoQualityH = opts.firstOrNull()?.height ?: -1
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "enter video failed", e)
@@ -638,8 +752,23 @@ fun AppleMusicAppContent(
         }
     }
 
-    fun switchVideoQuality(opt: YoutubeRepository.VideoOption) {
+    // Quality picker entry point: DASH caps when available, else muxed URLs.
+    fun pickQuality(label: String) {
         val t = nowPlaying ?: return
+        val dash = dashUrl
+        if (dash.isNotBlank()) {
+            val cap = when (label) {
+                "1080p" -> 1080
+                "720p" -> 720
+                "480p" -> 480
+                "360p" -> 360
+                else -> 0
+            }
+            playDash(t, dash, cap, player.currentPosition, player.isPlaying)
+            return
+        }
+        val opt = videoOpts.firstOrNull { it.label == label } ?: return
+        val ot = nowPlaying ?: return
         scope.launch {
             try {
                 val pos = player.currentPosition
@@ -647,8 +776,8 @@ fun AppleMusicAppContent(
                 player.setMediaItem(
                     MediaItem.Builder()
                         .setUri(opt.url)
-                        .setMediaId("v:" + t.id)
-                        .setMediaMetadata(metaFor(t))
+                        .setMediaId("v:" + ot.id)
+                        .setMediaMetadata(metaFor(ot))
                         .build()
                 )
                 player.prepare()
@@ -670,10 +799,15 @@ fun AppleMusicAppContent(
         }
     }
 
-    // Home: cache instantly (splash releases fast), refresh silently
-    LaunchedEffect(Unit) {
+    // Home: cache instantly (splash releases fast), refresh silently.
+    // No demo data: loading spinner, then error + retry when offline.
+    LaunchedEffect(homeTick) {
+        homeLoading = homeTracks.isEmpty()
+        homeError = null
         try {
-            SongCache.load(context, "home", HOME_CACHE_TTL)?.let { cached ->
+            withContext(Dispatchers.IO) {
+                SongCache.load(context, "home", HOME_CACHE_TTL)
+            }?.let { cached ->
                 homeTracks = cached
                 live = true
                 if (queue.items.isEmpty()) {
@@ -686,35 +820,108 @@ fun AppleMusicAppContent(
         } catch (e: Exception) {
             Log.w(TAG, "cache read failed", e)
         }
-        try {
-            val res = YoutubeRepository.searchSongs(HOME_QUERY, 25)
-            if (res.isNotEmpty()) {
-                homeTracks = res
-                live = true
-                if (queue.items.isEmpty()) {
-                    queue.replaceAll(res)
-                    if (nowPlaying == null) nowPlaying = res.first()
+        var attempt = 0
+        var loaded = false
+        while (attempt < 2 && !loaded) {
+            attempt++
+            try {
+                val res = YoutubeRepository.searchSongs(HOME_QUERY, 25)
+                if (res.isNotEmpty()) {
+                    homeTracks = res
+                    live = true
+                    if (queue.items.isEmpty()) {
+                        queue.replaceAll(res)
+                        if (nowPlaying == null) nowPlaying = res.first()
+                    }
+                    try {
+                        scope.launch(Dispatchers.IO) {
+                            try {
+                                SongCache.save(context, "home", res)
+                            } catch (e: Exception) {
+                            }
+                        }
+                    } catch (e: Exception) {
+                    }
+                    Log.i(TAG, "home loaded ${res.size} songs from YouTube")
+                    loaded = true
                 }
-                try { SongCache.save(context, "home", res) } catch (e: Exception) { }
-                Log.i(TAG, "home loaded ${res.size} songs from YouTube")
+            } catch (e: Exception) {
+                Log.w(TAG, "home load failed (attempt $attempt)", e)
+                if (attempt < 2) {
+                    delay(1500)
+                }
             }
+        }
+        if (homeTracks.isEmpty()) {
+            homeError = "Couldn't reach YouTube — check connection and retry"
+        }
+        homeLoading = false
+        announce() // never trap the splash
+    }
+
+    // Reconnect reload: when the device regains network, refresh silently.
+    DisposableEffect(Unit) {
+        val cm = try {
+            context.getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
+                as android.net.ConnectivityManager
         } catch (e: Exception) {
-            Log.w(TAG, "home offline, cache/demo fallback", e)
-        } finally {
-            announce() // never trap the splash
+            null
+        }
+        val cb = object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: android.net.Network) {
+                if (homeTracks.isEmpty() || !live) {
+                    homeTick++
+                }
+            }
+        }
+        try {
+            cm?.registerDefaultNetworkCallback(cb)
+        } catch (e: Exception) {
+        }
+        onDispose {
+            try {
+                cm?.unregisterNetworkCallback(cb)
+            } catch (e: Exception) {
+            }
         }
     }
 
-    // Second rail: new releases (cached, refreshed silently)
+    // Update check: once a day, silent unless a newer release exists.
+    var update by remember { mutableStateOf<UpdateCheck.Update?>(null) }
     LaunchedEffect(Unit) {
         try {
-            SongCache.load(context, "new", 24 * 60 * 60 * 1000L)?.let { newTracks = it }
+            if (!UpdateCheck.dueForCheck(context)) {
+                return@LaunchedEffect
+            }
+            val latest = UpdateCheck.latest()
+            UpdateCheck.markChecked(context)
+            if (latest != null &&
+                UpdateCheck.isNewer(UpdateCheck.currentVersion(context), latest.tag)
+            ) {
+                update = latest
+            }
+        } catch (e: Exception) {
+        }
+    }
+    LaunchedEffect(Unit) {
+        try {
+            withContext(Dispatchers.IO) {
+                SongCache.load(context, "new", 24 * 60 * 60 * 1000L)
+            }?.let { newTracks = it }
         } catch (e: Exception) { }
         try {
             val fresh = YoutubeRepository.searchSongs("new hindi songs 2026", 12)
             if (fresh.isNotEmpty()) {
                 newTracks = fresh
-                try { SongCache.save(context, "new", fresh) } catch (e: Exception) { }
+                try {
+                    scope.launch(Dispatchers.IO) {
+                        try {
+                            SongCache.save(context, "new", fresh)
+                        } catch (e: Exception) {
+                        }
+                    }
+                } catch (e: Exception) {
+                }
             }
         } catch (e: Exception) {
             Log.w(TAG, "new releases failed", e)
@@ -776,6 +983,8 @@ fun AppleMusicAppContent(
             when (selectedTab) {
                 0 -> ListenNowScreen(
                     tracks = homeTracks, recent = recent, fresh = newTracks, live = live,
+                    loading = homeLoading, loadError = homeError,
+                    onRetryLoad = { homeTick++ },
                     onPlay = ::play,
                     onPlayList = ::playList,
                     onMood = { mood -> query = mood; selectedTab = 4 },
@@ -783,7 +992,19 @@ fun AppleMusicAppContent(
                     onPlayNext = { queue.playNext(it) },
                     onAddQueue = { queue.addToQueue(it) },
                     likedOf = { isLiked(it) },
-                    onToggleLike = { toggleLike(it) }
+                    onToggleLike = { toggleLike(it) },
+                    updateTag = update?.tag,
+                    onUpdateTap = {
+                        val u = update
+                        if (u != null) {
+                            try {
+                                context.startActivity(
+                                    Intent(Intent.ACTION_VIEW, Uri.parse(u.url))
+                                )
+                            } catch (e: Exception) {
+                            }
+                        }
+                    }
                 )
                 4 -> SearchScreen(
                     query = query, onQuery = { query = it },
@@ -822,33 +1043,15 @@ fun AppleMusicAppContent(
                     onAddQueue = { queue.addToQueue(it) },
                     likedOf = { isLiked(it) },
                     onToggleLike = { toggleLike(it) },
-                    onSignIn = { showSession = true },
+                    onSignIn = { loginFailed = false; showSession = true },
                     onSignOut = {
                         YtSessionManager.logout(context)
                         loggedIn = false
                     },
                     onOpenDownloads = { refreshDownloads(); showDownloads = true },
-                    onOpenPlaylist = { openPlaylist(it) }
+                    onOpenPlaylist = { openPlaylist(it) },
+                    onOpenProfile = { showProfile = true }
                 )
-            }
-            // Live alert pill floating under the camera hole.
-            AnimatedVisibility(
-                visible = islandVisible && !showFullPlayer && nowPlaying != null,
-                enter = fadeIn(animationSpec = tween(250)) +
-                    slideInVertically(animationSpec = tween(300)) { -it },
-                exit = fadeOut(animationSpec = tween(250)) +
-                    slideOutVertically(animationSpec = tween(250)) { -it },
-                modifier = Modifier.align(Alignment.TopCenter)
-            ) {
-                nowPlaying?.let { t ->
-                    IslandPill(
-                        track = t,
-                        isPlaying = isPlaying,
-                        onTap = { showFullPlayer = true },
-                        onPlayPause = { togglePlay(t) },
-                        onNext = { queue.next() }
-                    )
-                }
             }
         }
     }
@@ -880,8 +1083,8 @@ fun AppleMusicAppContent(
                 liked = isLiked(t),
                 videoMode = videoMode,
                 videoLoading = videoLoading,
-                videoOpts = videoOpts,
-                videoQualityH = videoQualityH,
+                qualities = qualityLabels(),
+                currentQuality = currentQualityLabel(),
                 onPlayPause = { togglePlay(t) },
                 onPrev = { queue.previous() },
                 onNext = { queue.next() },
@@ -894,7 +1097,7 @@ fun AppleMusicAppContent(
                         exitVideo(true)
                     }
                 },
-                onQuality = { switchVideoQuality(it) },
+                onQuality = { pickQuality(it) },
                 onLike = { toggleLike(t) },
                 onQueue = { showQueue = true },
                 onSeek = { player.seekTo(it) },
@@ -937,9 +1140,22 @@ fun AppleMusicAppContent(
     if (showSession) {
         SessionSheet(
             loggedIn = loggedIn,
+            loginFailed = loginFailed,
             onLoginDone = {
-                loggedIn = YtSessionManager.isLoggedIn(context)
-                showSession = false
+                scope.launch(Dispatchers.IO) {
+                    val ok = try {
+                        YtSessionManager.isLoggedIn(context)
+                    } catch (e: Exception) {
+                        false
+                    }
+                    loggedIn = ok
+                    if (ok) {
+                        loginFailed = false
+                        showSession = false
+                    } else {
+                        loginFailed = true
+                    }
+                }
             },
             onLogout = {
                 YtSessionManager.logout(context)
@@ -950,6 +1166,42 @@ fun AppleMusicAppContent(
                 loggedIn = YtSessionManager.isLoggedIn(context)
                 showSession = false
             }
+        )
+    }
+
+    // Profile + settings.
+    if (showProfile) {
+        ProfileSheet(
+            loggedIn = loggedIn,
+            themeMode = themeMode,
+            dlLoc = dlLoc,
+            dlCount = dlItems.size,
+            onTheme = onThemeMode,
+            onLoc = {
+                dlLoc = it
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        DownloadStore.setLocation(context, it)
+                    } catch (e: Exception) {
+                    }
+                }
+            },
+            onSignIn = {
+                showProfile = false
+                loginFailed = false
+                showSession = true
+            },
+            onSignOut = {
+                YtSessionManager.logout(context)
+                loggedIn = false
+            },
+            onOpenDownloads = {
+                showProfile = false
+                refreshDownloads()
+                showDownloads = true
+            },
+            onClearCache = { clearSongCache() },
+            onDismiss = { showProfile = false }
         )
     }
 
@@ -1008,7 +1260,7 @@ fun AppleMusicAppContent(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalHazeMaterialsApi::class)
 @Composable
 private fun FullPlayerSheet(
     track: YtTrack,
@@ -1025,15 +1277,15 @@ private fun FullPlayerSheet(
     liked: Boolean,
     videoMode: Boolean,
     videoLoading: Boolean,
-    videoOpts: List<YoutubeRepository.VideoOption>,
-    videoQualityH: Int,
+    qualities: List<String>,
+    currentQuality: String,
     onPlayPause: () -> Unit,
     onPrev: () -> Unit,
     onNext: () -> Unit,
     onShuffle: () -> Unit,
     onRepeat: () -> Unit,
     onVideoToggle: (Boolean) -> Unit,
-    onQuality: (YoutubeRepository.VideoOption) -> Unit,
+    onQuality: (String) -> Unit,
     onLike: () -> Unit,
     onQueue: () -> Unit,
     onSeek: (Long) -> Unit,
@@ -1041,22 +1293,55 @@ private fun FullPlayerSheet(
 ) {
     ModalBottomSheet(
         onDismissRequest = onDismiss,
-        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        containerColor = Color(0xFF121212),
+        dragHandle = {
+            Box(
+                Modifier.padding(vertical = 8.dp).size(36.dp, 4.dp)
+                    .clip(RoundedCornerShape(2.dp))
+                    .background(Color.White.copy(alpha = 0.4f))
+            )
+        }
     ) {
         val dlscope = rememberCoroutineScope()
         val dlctx = LocalContext.current
-        LazyColumn(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
+        var domColor by remember(track.id) { mutableStateOf(Color(0xFF3A0A12)) }
+        val domAnimated by animateColorAsState(
+            targetValue = domColor, animationSpec = tween(800), label = "dom")
+        LaunchedEffect(track.thumbUrl) {
+            domColor = dominantColor(dlctx, track.thumbUrl)
+        }
+        AppleMusicTheme(darkTheme = true) {
+        Box(Modifier.fillMaxWidth()) {
+            // Blurred artwork base merged into the page (RenderEffect on S+).
+            if (thumbUrl.isNotBlank()) {
+                AsyncImage(
+                    model = thumbUrl,
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize().blur(70.dp)
+                )
+            }
+            // Dominant-color lava wash over the blur.
+            LavaBackground(base = domAnimated, modifier = Modifier.fillMaxSize())
+            Surface(
+                color = Color.Transparent,
+                contentColor = Color.White,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+            LazyColumn(
+                state = rememberLazyListState(),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
             item {
                 // Session-driven embed: the music transport owns this picture.
                 if (videoMode && track.watchUrl.isNotBlank()) {
                     InlineVideo(
                         player = player,
                         loading = videoLoading,
-                        options = videoOpts,
-                        currentH = videoQualityH,
+                        qualities = qualities,
+                        currentQuality = currentQuality,
                         onQuality = onQuality,
                         modifier = Modifier.fillMaxWidth()
                             .aspectRatio(16f / 9f)
@@ -1073,24 +1358,24 @@ private fun FullPlayerSheet(
                     TrackArt("", track.id.hashCode(), 280.dp, 16.dp)
                 }
                 Spacer(Modifier.height(16.dp))
+                // Live lyric ticker: one line at a time above the song name.
+                if (lyrics is LyricsState.Synced) {
+                    val lines = (lyrics as LyricsState.Synced).lines
+                    val li = lines.indexOfLast { it.ms <= position }.coerceAtLeast(0)
+                    Text(
+                        lines.getOrNull(li)?.text ?: "",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(bottom = 4.dp)
+                    )
+                }
                 Text(track.title, style = MaterialTheme.typography.titleLarge,
                     maxLines = 2, overflow = TextOverflow.Ellipsis)
                 Text(track.artist, style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(Modifier.height(8.dp))
-                // Seek bar
-                Slider(
-                    value = position.toFloat(),
-                    onValueChange = { onSeek(it.toLong()) },
-                    valueRange = 0f..(duration.coerceAtLeast(1L).toFloat()),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text(fmtMs(position), style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(fmtMs(duration), style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
+                SleekBar(positionMs = position, durationMs = duration, onSeek = onSeek)
                 if (error != null) {
                     Text(error, style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error)
@@ -1114,7 +1399,7 @@ private fun FullPlayerSheet(
                     FilledIconButton(onClick = onPlayPause, modifier = Modifier.size(72.dp)) {
                         if (buffering) CircularProgressIndicator(
                             modifier = Modifier.size(28.dp), strokeWidth = 3.dp,
-                            color = MaterialTheme.colorScheme.onPrimary)
+                            color = Color.White)
                         else Icon(
                             if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                             contentDescription = if (isPlaying) "Pause" else "Play",
@@ -1185,9 +1470,16 @@ private fun FullPlayerSheet(
                     state = lyrics, positionMs = position, isPlaying = isPlaying,
                     modifier = Modifier.fillMaxWidth().height(420.dp)
                 )
+            }
+            // Shazam-like details card.
+            item {
+                DetailsCard(track = track)
                 Spacer(Modifier.height(32.dp))
             }
-        }
+            } // LazyColumn
+            } // content Surface
+        } // bg Box
+        } // dark theme
     }
 }
 
@@ -1512,51 +1804,6 @@ private fun IntroScreen() {
     }
 }
 
-/** Dynamic-island style live alert: artwork, title, transport. */
-@Composable
-private fun IslandPill(
-    track: YtTrack,
-    isPlaying: Boolean,
-    onTap: () -> Unit,
-    onPlayPause: () -> Unit,
-    onNext: () -> Unit
-) {
-    Surface(
-        color = Color.Black.copy(alpha = 0.92f),
-        shape = RoundedCornerShape(28.dp),
-        tonalElevation = 6.dp,
-        modifier = Modifier.fillMaxWidth(0.94f)
-            .statusBarsPadding()
-            .padding(top = 6.dp)
-            .clickable { onTap() }
-    ) {
-        Row(
-            Modifier.padding(start = 8.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            TrackArt(track.thumbUrl, track.id.hashCode(), 38.dp, 19.dp)
-            Spacer(Modifier.width(10.dp))
-            Column(Modifier.weight(1f)) {
-                Text(track.title, style = MaterialTheme.typography.bodyMedium,
-                    color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(track.artist, style = MaterialTheme.typography.bodySmall,
-                    color = Color.White.copy(alpha = 0.6f),
-                    maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
-            IconButton(onClick = onPlayPause, modifier = Modifier.size(40.dp)) {
-                Icon(
-                    if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                    contentDescription = if (isPlaying) "Pause" else "Play",
-                    tint = Color.White
-                )
-            }
-            IconButton(onClick = onNext, modifier = Modifier.size(40.dp)) {
-                Icon(Icons.Filled.SkipNext, contentDescription = "Next", tint = Color.White)
-            }
-        }
-    }
-}
-
 /** Fancy floating music bar: glow card, live equalizer, round red play. */
 @Composable
 private fun FancyBar(
@@ -1683,10 +1930,414 @@ private fun EqBars() {
     }
 }
 
+/** Sleek seek bar: slim glowing track, tap or drag. */
+@Composable
+private fun SleekBar(
+    positionMs: Long,
+    durationMs: Long,
+    onSeek: (Long) -> Unit
+) {
+    var dragging by remember { mutableStateOf(false) }
+    var dragFrac by remember { mutableFloatStateOf(0f) }
+    val frac = if (dragging) {
+        dragFrac
+    } else if (durationMs > 0) {
+        (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+    } else {
+        0f
+    }
+    Box(
+        Modifier.fillMaxWidth().height(26.dp)
+            .pointerInput(durationMs) {
+                detectTapGestures { offset ->
+                    if (durationMs > 0 && size.width > 0) {
+                        onSeek(((offset.x / size.width).coerceIn(0f, 1f) * durationMs).toLong())
+                    }
+                }
+            }
+            .pointerInput(durationMs) {
+                detectHorizontalDragGestures(
+                    onDragStart = { offset ->
+                        if (durationMs > 0 && size.width > 0) {
+                            dragging = true
+                            dragFrac = (offset.x / size.width).coerceIn(0f, 1f)
+                        }
+                    },
+                    onDragEnd = {
+                        dragging = false
+                        if (durationMs > 0) {
+                            onSeek((dragFrac * durationMs).toLong())
+                        }
+                    },
+                    onDragCancel = { dragging = false },
+                    onHorizontalDrag = { change, _ ->
+                        if (durationMs > 0 && size.width > 0) {
+                            dragFrac = (change.position.x / size.width).coerceIn(0f, 1f)
+                            change.consume()
+                        }
+                    }
+                )
+            }
+    ) {
+        Canvas(Modifier.fillMaxSize()) {
+            val cy = size.height / 2f
+            val trackH = 4.dp.toPx()
+            drawRoundRect(
+                color = Color.White.copy(alpha = 0.22f),
+                topLeft = androidx.compose.ui.geometry.Offset(0f, cy - trackH / 2f),
+                size = androidx.compose.ui.geometry.Size(size.width, trackH),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(trackH / 2f)
+            )
+            val fw = size.width * frac
+            if (fw > 0f) {
+                val brush = Brush.horizontalGradient(
+                    listOf(Color(0xFFFF2D55), Color(0xFFFA243C))
+                )
+                drawRoundRect(
+                    brush = brush,
+                    topLeft = androidx.compose.ui.geometry.Offset(0f, cy - trackH / 2f),
+                    size = androidx.compose.ui.geometry.Size(fw, trackH),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(trackH / 2f)
+                )
+                // Glowing knob.
+                drawCircle(
+                    color = Color(0xFFFA243C).copy(alpha = 0.30f),
+                    radius = 11.dp.toPx(),
+                    center = androidx.compose.ui.geometry.Offset(fw, cy)
+                )
+                drawCircle(
+                    color = Color.White,
+                    radius = 6.dp.toPx(),
+                    center = androidx.compose.ui.geometry.Offset(fw, cy)
+                )
+            }
+        }
+    }
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text(fmtMs(if (dragging) (dragFrac * durationMs).toLong() else positionMs),
+            style = MaterialTheme.typography.bodySmall,
+            color = Color.White.copy(alpha = 0.7f))
+        Text(fmtMs(durationMs),
+            style = MaterialTheme.typography.bodySmall,
+            color = Color.White.copy(alpha = 0.7f))
+    }
+}
+
+private fun fmtCompact(n: Long): String {
+    if (n < 0) return "—"
+    if (n < 1000) return n.toString()
+    if (n < 1_000_000) {
+        return String.format("%.1f", n / 1000f).trimEnd('0').trimEnd('.') + "K"
+    }
+    return String.format("%.1f", n / 1_000_000f).trimEnd('0').trimEnd('.') + "M"
+}
+
+/** Average thumbnail color, darkened for backgrounds. */
+private suspend fun dominantColor(ctx: android.content.Context, url: String): Color =
+    withContext(Dispatchers.IO) {
+        try {
+            if (url.isBlank()) {
+                return@withContext Color(0xFF3A0A12)
+            }
+            val req = coil.request.ImageRequest.Builder(ctx)
+                .data(url)
+                .allowHardware(false)
+                .build()
+            val res = coil.Coil.imageLoader(ctx).execute(req)
+            val bmp = (res.drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap
+                ?: return@withContext Color(0xFF3A0A12)
+            val small = android.graphics.Bitmap.createScaledBitmap(bmp, 8, 8, true)
+            var r = 0L
+            var g = 0L
+            var b = 0L
+            for (x in 0 until 8) {
+                for (y in 0 until 8) {
+                    val px = small.getPixel(x, y)
+                    r += android.graphics.Color.red(px)
+                    g += android.graphics.Color.green(px)
+                    b += android.graphics.Color.blue(px)
+                }
+            }
+            small.recycle()
+            var rf = r / 64f / 255f
+            var gf = g / 64f / 255f
+            var bf = b / 64f / 255f
+            val mx = maxOf(rf, gf, bf)
+            val mn = minOf(rf, gf, bf)
+            if (mx > 0f) {
+                val boost = 1f + 0.4f * (1f - (mx - mn) / mx)
+                rf = (rf * boost).coerceAtMost(1f)
+                gf = (gf * boost).coerceAtMost(1f)
+                bf = (bf * boost).coerceAtMost(1f)
+            }
+            Color(rf * 0.5f, gf * 0.5f, bf * 0.5f)
+        } catch (e: Exception) {
+            Color(0xFF3A0A12)
+        }
+    }
+
+/** Slow drifting blobs over the base color: lava-lamp wash. */
+@Composable
+private fun LavaBackground(base: Color, modifier: Modifier = Modifier) {
+    val inf = rememberInfiniteTransition(label = "lava")
+    val x1 by inf.animateFloat(0f, 1f,
+        infiniteRepeatable(tween(11000), RepeatMode.Reverse), label = "lx1")
+    val x2 by inf.animateFloat(0f, 1f,
+        infiniteRepeatable(tween(14000), RepeatMode.Reverse), label = "lx2")
+    val x3 by inf.animateFloat(0f, 1f,
+        infiniteRepeatable(tween(9000), RepeatMode.Reverse), label = "lx3")
+    Box(
+        modifier.background(
+            Brush.verticalGradient(
+                listOf(
+                    base.copy(alpha = 0.88f),
+                    Color.Black.copy(alpha = 0.72f)
+                )
+            )
+        )
+    ) {
+        Canvas(Modifier.fillMaxSize()) {
+            val r = size.minDimension * 0.30f
+            drawCircle(Color.White.copy(alpha = 0.08f), r,
+                androidx.compose.ui.geometry.Offset(size.width * x1, size.height * 0.22f))
+            drawCircle(base.copy(alpha = 0.50f), r * 0.75f,
+                androidx.compose.ui.geometry.Offset(size.width * (1f - x2), size.height * 0.55f))
+            drawCircle(Color.White.copy(alpha = 0.05f), r,
+                androidx.compose.ui.geometry.Offset(size.width * x3, size.height * 0.85f))
+        }
+    }
+}
+
+/** Shazam-like credits card. */
+@Composable
+private fun DetailsCard(track: YtTrack) {
+    var details by remember(track.id) {
+        mutableStateOf<YoutubeRepository.VideoDetails?>(null)
+    }
+    LaunchedEffect(track.id) {
+        if (track.watchUrl.isNotBlank()) {
+            details = try {
+                YoutubeRepository.videoDetails(track.watchUrl)
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = Color.White.copy(alpha = 0.08f),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Text("About this song",
+                style = MaterialTheme.typography.titleSmall,
+                color = Color.White.copy(alpha = 0.6f))
+            Spacer(Modifier.height(8.dp))
+            DetailRow("Artist", track.artist)
+            details?.let { d ->
+                if (d.views >= 0) {
+                    DetailRow("Plays", fmtCompact(d.views))
+                }
+                if (d.likes > 0) {
+                    DetailRow("Likes", fmtCompact(d.likes))
+                }
+                if (d.uploadDate.isNotBlank()) {
+                    DetailRow("Released", d.uploadDate)
+                }
+                if (d.durationSec > 0) {
+                    DetailRow("Duration", fmtMs(d.durationSec * 1000))
+                }
+                if (d.description.isNotBlank()) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(d.description.take(220),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.White.copy(alpha = 0.6f),
+                        maxLines = 4, overflow = TextOverflow.Ellipsis)
+                }
+            }
+            DetailRow("Source", "YouTube")
+        }
+    }
+}
+
+@Composable
+private fun DetailRow(k: String, v: String) {
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 3.dp),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(k, style = MaterialTheme.typography.bodySmall,
+            color = Color.White.copy(alpha = 0.55f))
+        Spacer(Modifier.width(12.dp))
+        Text(v, style = MaterialTheme.typography.bodySmall,
+            color = Color.White, maxLines = 2, overflow = TextOverflow.Ellipsis)
+    }
+}
+
+/** Profile + settings: account, appearance, downloads, storage, about. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ProfileSheet(
+    loggedIn: Boolean,
+    themeMode: String,
+    dlLoc: String,
+    dlCount: Int,
+    onTheme: (String) -> Unit,
+    onLoc: (String) -> Unit,
+    onSignIn: () -> Unit,
+    onSignOut: () -> Unit,
+    onOpenDownloads: () -> Unit,
+    onClearCache: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ) {
+        LazyColumn(Modifier.fillMaxWidth()) {
+            item {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Surface(
+                        shape = androidx.compose.foundation.shape.CircleShape,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(56.dp)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                Icons.Filled.Person,
+                                contentDescription = null,
+                                tint = Color.White,
+                                modifier = Modifier.size(32.dp)
+                            )
+                        }
+                    }
+                    Spacer(Modifier.width(16.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("My Profile", style = MaterialTheme.typography.titleLarge)
+                        Text(
+                            if (loggedIn) "YouTube connected" else "Guest — not signed in",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+            item {
+                SectionHeader("Account")
+            }
+            item {
+                ListItem(
+                    headlineContent = {
+                        Text(if (loggedIn) "Sign out of YouTube" else "Sign in with YouTube")
+                    },
+                    supportingContent = {
+                        Text(if (loggedIn) "Session lives only on this device"
+                        else "Unlock your real library")
+                    },
+                    leadingContent = {
+                        Icon(Icons.Filled.AccountCircle, contentDescription = null)
+                    },
+                    modifier = Modifier.clickable {
+                        if (loggedIn) {
+                            onSignOut()
+                        } else {
+                            onSignIn()
+                        }
+                    }
+                )
+            }
+            item {
+                SectionHeader("Appearance")
+            }
+            item {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf("system" to "System", "light" to "Light", "dark" to "Dark").forEach { (v, label) ->
+                        FilterChip(
+                            selected = themeMode == v,
+                            onClick = { onTheme(v) },
+                            label = { Text(label) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+            }
+            item {
+                SectionHeader("Downloads")
+            }
+            item {
+                ListItem(
+                    headlineContent = { Text("Saved songs ($dlCount)") },
+                    supportingContent = { Text("Open offline library") },
+                    leadingContent = {
+                        Icon(Icons.Filled.DownloadForOffline, contentDescription = null)
+                    },
+                    modifier = Modifier.clickable { onOpenDownloads() }
+                )
+            }
+            item {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)) {
+                    Text("Save new downloads to",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(
+                            selected = dlLoc != "device",
+                            onClick = { onLoc("app") },
+                            label = { Text("In-app") },
+                            modifier = Modifier.weight(1f)
+                        )
+                        FilterChip(
+                            selected = dlLoc == "device",
+                            onClick = { onLoc("device") },
+                            label = { Text("Device Music folder") },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+            }
+            item {
+                SectionHeader("Storage")
+            }
+            item {
+                ListItem(
+                    headlineContent = { Text("Clear song cache") },
+                    supportingContent = { Text("Frees space; songs reload from YouTube") },
+                    leadingContent = {
+                        Icon(Icons.Filled.CleaningServices, contentDescription = null)
+                    },
+                    modifier = Modifier.clickable { onClearCache() }
+                )
+            }
+            item {
+                SectionHeader("About")
+            }
+            item {
+                ListItem(
+                    headlineContent = { Text("Cresca Music 0.5.0") },
+                    supportingContent = {
+                        Text("Live YouTube audio • karaoke lyrics • offline mode")
+                    },
+                    leadingContent = {
+                        Icon(Icons.Filled.Info, contentDescription = null)
+                    }
+                )
+                Spacer(Modifier.height(32.dp))
+            }
+        }
+    }
+}
+
 @Composable
 private fun LiveBadge(live: Boolean) {
     Text(
-        if (live) "● LIVE — real YouTube results" else "○ demo data (offline)",
+        if (live) "● LIVE — real YouTube results" else "○ connecting…",
         style = MaterialTheme.typography.bodySmall,
         color = if (live) Color(0xFF30D158) else MaterialTheme.colorScheme.onSurfaceVariant
     )
@@ -1695,11 +2346,13 @@ private fun LiveBadge(live: Boolean) {
 @Composable
 private fun ListenNowScreen(
     tracks: List<YtTrack>, recent: List<YtTrack>, fresh: List<YtTrack>, live: Boolean,
+    loading: Boolean, loadError: String?, onRetryLoad: () -> Unit,
     onPlay: (YtTrack) -> Unit,
     onPlayList: (List<YtTrack>, Int, Boolean) -> Unit,
     onMood: (String) -> Unit, onSeeAll: (String, List<YtTrack>) -> Unit,
     onPlayNext: (YtTrack) -> Unit, onAddQueue: (YtTrack) -> Unit,
-    likedOf: (YtTrack) -> Boolean, onToggleLike: (YtTrack) -> Unit
+    likedOf: (YtTrack) -> Boolean, onToggleLike: (YtTrack) -> Unit,
+    updateTag: String? = null, onUpdateTap: () -> Unit = {}
 ) {
     LazyColumn(
         Modifier.fillMaxSize(),
@@ -1713,6 +2366,33 @@ private fun ListenNowScreen(
             )
             Box(Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
                 LiveBadge(live)
+            }
+            // Empty states: spinner while loading, retry when offline. No demo.
+            if (tracks.isEmpty() && loading) {
+                Box(
+                    Modifier.fillMaxWidth().padding(vertical = 48.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        CircularProgressIndicator()
+                        Spacer(Modifier.height(12.dp))
+                        Text("Loading songs…",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+            if (tracks.isEmpty() && !loading && loadError != null) {
+                Column(
+                    Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 32.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(loadError,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error)
+                    Spacer(Modifier.height(12.dp))
+                    Button(onClick = onRetryLoad) { Text("Retry") }
+                }
             }
             Surface(
                 shape = RoundedCornerShape(16.dp),
@@ -1767,6 +2447,37 @@ private fun ListenNowScreen(
                 }
             }
             SectionHeader("Top Picks For You") { onSeeAll("Top Picks For You", tracks) }
+        }
+        if (updateTag != null) {
+            item {
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 6.dp)
+                        .clickable { onUpdateTap() }
+                ) {
+                    Row(
+                        Modifier.padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Filled.SystemUpdate,
+                            contentDescription = null,
+                            tint = Color.White
+                        )
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("Update available: $updateTag",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = Color.White)
+                            Text("Tap to download the latest Cresca",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color.White.copy(alpha = 0.85f))
+                        }
+                    }
+                }
+            }
         }
         item {
             LazyRow(contentPadding = PaddingValues(horizontal = 16.dp),
@@ -1904,12 +2615,15 @@ private fun TrackMenu(
                 leadingIcon = { Icon(Icons.Filled.PlaylistAdd, contentDescription = null) },
                 onClick = {
                     open = false
-                    try {
-                        plists = PlaylistStore.list(context)
-                    } catch (e: Exception) {
-                        plists = emptyList()
+                    dlscope.launch(Dispatchers.IO) {
+                        val loaded = try {
+                            PlaylistStore.list(context)
+                        } catch (e: Exception) {
+                            emptyList()
+                        }
+                        plists = loaded
+                        showPicker = true
                     }
-                    showPicker = true
                 }
             )
             DropdownMenuItem(
@@ -1948,21 +2662,25 @@ private fun TrackMenu(
             track = track,
             playlists = plists,
             onPick = { id ->
-                try {
-                    PlaylistStore.add(context, id, track)
-                    plists = PlaylistStore.list(context)
-                } catch (e: Exception) {
+                dlscope.launch(Dispatchers.IO) {
+                    try {
+                        PlaylistStore.add(context, id, track)
+                        plists = PlaylistStore.list(context)
+                    } catch (e: Exception) {
+                    }
+                    showPicker = false
                 }
-                showPicker = false
             },
             onNew = { name ->
-                try {
-                    val p = PlaylistStore.create(context, name)
-                    PlaylistStore.add(context, p.id, track)
-                    plists = PlaylistStore.list(context)
-                } catch (e: Exception) {
+                dlscope.launch(Dispatchers.IO) {
+                    try {
+                        val p = PlaylistStore.create(context, name)
+                        PlaylistStore.add(context, p.id, track)
+                        plists = PlaylistStore.list(context)
+                    } catch (e: Exception) {
+                    }
+                    showPicker = false
                 }
-                showPicker = false
             },
             onDismiss = { showPicker = false }
         )
@@ -2175,7 +2893,8 @@ private fun LibraryScreen(
     onSignIn: () -> Unit,
     onSignOut: () -> Unit,
     onOpenDownloads: () -> Unit,
-    onOpenPlaylist: (String) -> Unit
+    onOpenPlaylist: (String) -> Unit,
+    onOpenProfile: () -> Unit
 ) {
     val ctx = LocalContext.current
     var lists by remember { mutableStateOf<List<Playlist>>(emptyList()) }
@@ -2184,7 +2903,7 @@ private fun LibraryScreen(
     LaunchedEffect(active) {
         if (active) {
             try {
-                lists = PlaylistStore.list(ctx)
+                lists = withContext(Dispatchers.IO) { PlaylistStore.list(ctx) }
             } catch (e: Exception) {
             }
         }
@@ -2193,6 +2912,42 @@ private fun LibraryScreen(
         item {
             Text("Your Library", style = MaterialTheme.typography.displaySmall,
                 modifier = Modifier.padding(start = 16.dp, top = 8.dp, end = 16.dp))
+        }
+        item {
+            Surface(
+                shape = RoundedCornerShape(16.dp),
+                tonalElevation = 2.dp,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)
+                    .clickable { onOpenProfile() }
+            ) {
+                Row(
+                    Modifier.padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Surface(
+                        shape = androidx.compose.foundation.shape.CircleShape,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(48.dp)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                Icons.Filled.Person,
+                                contentDescription = null,
+                                tint = Color.White,
+                                modifier = Modifier.size(28.dp)
+                            )
+                        }
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("Profile & settings", style = MaterialTheme.typography.titleMedium)
+                        Text("Account, appearance, downloads",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Icon(Icons.Filled.ChevronRight, contentDescription = null)
+                }
+            }
         }
         // YouTube account session
         item {
@@ -2411,6 +3166,7 @@ private fun SearchScreen(
     var searching by remember { mutableStateOf(false) }
     val context = LocalContext.current
     var error by remember { mutableStateOf<String?>(null) }
+    var retryTick by remember { mutableIntStateOf(0) }
     // Double-tap on the Search tab icon focuses the bar with keyboard up
     val focusRequester = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
@@ -2422,14 +3178,17 @@ private fun SearchScreen(
         }
     }
 
-    // Debounced real YouTube search: cached results first, refresh after
-    LaunchedEffect(query) {
+    // Debounced real YouTube search: cached results first, refresh after,
+    // one automatic retry on failure, manual retry button on error.
+    LaunchedEffect(query, retryTick) {
         if (query.length < 2) {
             results = emptyList(); error = null; searching = false; return@LaunchedEffect
         }
         val cacheKey = "q_" + query.trim().lowercase().hashCode()
         try {
-            SongCache.load(context, cacheKey, SEARCH_CACHE_TTL)?.let { cached ->
+            withContext(Dispatchers.IO) {
+                SongCache.load(context, cacheKey, SEARCH_CACHE_TTL)
+            }?.let { cached ->
                 results = cached
                 error = null
             }
@@ -2437,15 +3196,36 @@ private fun SearchScreen(
         delay(800)
         searching = true
         error = null
+        var fresh: List<YtTrack> = emptyList()
+        var attempt = 0
+        while (attempt < 2 && fresh.isEmpty()) {
+            attempt++
+            try {
+                fresh = YoutubeRepository.searchSongs(query, 20)
+            } catch (e: Exception) {
+                Log.w(TAG, "search failed (attempt $attempt)", e)
+                if (attempt < 2) {
+                    delay(1500)
+                }
+            }
+        }
         try {
-            val fresh = YoutubeRepository.searchSongs(query, 20)
             if (fresh.isNotEmpty()) {
                 results = fresh
-                try { SongCache.save(context, cacheKey, fresh) } catch (e: Exception) { }
-            } else if (results.isEmpty()) error = "No songs found"
+                val snapshot = fresh
+                try {
+                    withContext(Dispatchers.IO) {
+                        SongCache.save(context, cacheKey, snapshot)
+                    }
+                } catch (e: Exception) {
+                }
+            } else if (results.isEmpty()) {
+                error = "No songs found — check connection and retry"
+            }
         } catch (e: Exception) {
-            Log.w(TAG, "search failed", e)
-            if (results.isEmpty()) error = "Search failed: check connection"
+            if (results.isEmpty()) {
+                error = "Search failed — check connection and retry"
+            }
         } finally {
             searching = false
         }
@@ -2467,8 +3247,12 @@ private fun SearchScreen(
             LiveBadge(live)
             if (error != null) {
                 Spacer(Modifier.height(4.dp))
-                Text(error!!, style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(error!!, style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.weight(1f))
+                    TextButton(onClick = { retryTick++ }) { Text("Retry") }
+                }
             }
             Spacer(Modifier.height(8.dp))
         }

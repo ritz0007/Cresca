@@ -79,6 +79,13 @@ object YtSessionManager {
         }
         wv.settings.javaScriptEnabled = true
         wv.settings.domStorageEnabled = true
+        // Desktop UA: Google blocks logins from embedded-WebView agents.
+        try {
+            wv.settings.userAgentString =
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        } catch (e: Exception) {
+        }
         try {
             CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
         } catch (e: Exception) {

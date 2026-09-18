@@ -31,6 +31,7 @@ import kotlinx.coroutines.launch
 @Composable
 fun SessionSheet(
     loggedIn: Boolean,
+    loginFailed: Boolean = false,
     onLoginDone: () -> Unit,
     onLogout: () -> Unit,
     onDismiss: () -> Unit
@@ -61,6 +62,14 @@ fun SessionSheet(
                     modifier = Modifier.fillMaxWidth().height(420.dp)
                 )
                 Spacer(modifier = Modifier.height(12.dp))
+                if (loginFailed) {
+                    Text(
+                        text = "No session detected — finish signing in above, then tap Done.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
                 Button(
                     onClick = {
                         if (!capturing) {

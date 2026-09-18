@@ -75,9 +75,9 @@ private fun Context.findActivity(): android.app.Activity? {
 fun InlineVideo(
     player: Player,
     loading: Boolean,
-    options: List<YoutubeRepository.VideoOption>,
-    currentH: Int,
-    onQuality: (YoutubeRepository.VideoOption) -> Unit,
+    qualities: List<String>,
+    currentQuality: String,
+    onQuality: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -121,17 +121,17 @@ fun InlineVideo(
                     expanded = showQuality,
                     onDismissRequest = { showQuality = false }
                 ) {
-                    if (options.isEmpty()) {
+                    if (qualities.isEmpty()) {
                         DropdownMenuItem(
                             text = { Text("Auto") },
                             onClick = { showQuality = false }
                         )
                     } else {
-                        options.forEach { opt ->
+                        qualities.forEach { q ->
                             DropdownMenuItem(
-                                text = { Text(opt.label) },
+                                text = { Text(q) },
                                 trailingIcon = {
-                                    if (opt.height == currentH) {
+                                    if (q == currentQuality) {
                                         Icon(
                                             Icons.Filled.Check,
                                             contentDescription = null
@@ -140,8 +140,8 @@ fun InlineVideo(
                                 },
                                 onClick = {
                                     showQuality = false
-                                    if (opt.height != currentH) {
-                                        onQuality(opt)
+                                    if (q != currentQuality) {
+                                        onQuality(q)
                                     }
                                 }
                             )

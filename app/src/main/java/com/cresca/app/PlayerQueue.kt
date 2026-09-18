@@ -143,6 +143,40 @@ class PlayerQueue(
             if (shuffleOn) rebuildShuffled() else rebuildIdentity()
             return
         }
+        // Instant path: the next item is already buffered behind current.
+        if (player.mediaItemCount > 1) {
+            val expected = if (pos < order.lastIndex) {
+                order[pos + 1]
+            } else if (repeatModeState == Player.REPEAT_MODE_ALL) {
+                order[0]
+            } else {
+                null
+            }
+            if (expected != null) {
+                val got = try {
+                    player.getMediaItemAt(1).mediaId
+                } catch (e: Exception) {
+                    null
+                }
+                val want = items.getOrNull(expected)?.id
+                if (got != null && want != null && got == want) {
+                    currentIndex = expected
+                    try {
+                        player.seekToNext()
+                        player.play()
+                        if (player.mediaItemCount > 1) {
+                            player.removeMediaItem(0)
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "seekToNext failed", e)
+                        resolveAndPlay(items[currentIndex])
+                        return
+                    }
+                    onResolved(items[currentIndex])
+                    return
+                }
+            }
+        }
         if (pos < order.lastIndex) {
             currentIndex = order[pos + 1]
             resolveAndPlay(items[currentIndex])
@@ -165,6 +199,67 @@ class PlayerQueue(
         } else if (repeatModeState == Player.REPEAT_MODE_ALL) {
             currentIndex = order[order.lastIndex]
             resolveAndPlay(items[currentIndex])
+        }
+    }
+
+    private fun mediaItemFor(t: YtTrack, url: String): MediaItem {
+        val metaBuilder = MediaMetadata.Builder()
+            .setTitle(t.title)
+            .setArtist(t.artist)
+        try {
+            if (t.thumbUrl.isNotBlank()) {
+                metaBuilder.setArtworkUri(android.net.Uri.parse(t.thumbUrl))
+            }
+        } catch (e: Exception) {
+        }
+        return MediaItem.Builder()
+            .setUri(url)
+            .setMediaId(t.id)
+            .setMediaMetadata(metaBuilder.build())
+            .build()
+    }
+
+    // Buffer the upcoming track behind the current one: ExoPlayer then
+    // flips gaplessly on auto-advance, and manual next() is instant.
+    fun primeNext() {
+        if (items.isEmpty() || currentIndex == -1) return
+        if (repeatModeState == Player.REPEAT_MODE_ONE) return
+        if (player.mediaItemCount != 1) return
+        val idx = peekNextIndex() ?: return
+        val t = items.getOrNull(idx) ?: return
+        if (t.watchUrl.isBlank()) return
+        scope.launch {
+            try {
+                val url = YoutubeRepository.audioUrl(t.watchUrl)
+                if (url == null) return@launch
+                if (player.mediaItemCount != 1) return@launch
+                if (peekNextIndex() != idx) return@launch
+                player.addMediaItem(mediaItemFor(t, url))
+            } catch (e: Exception) {
+            }
+        }
+    }
+
+    // Called when the player auto-advanced onto the primed item.
+    fun confirmAdvanced() {
+        try {
+            if (player.mediaItemCount < 2) return
+            val idx = peekNextIndex() ?: return
+            val got = try {
+                player.getMediaItemAt(1).mediaId
+            } catch (e: Exception) {
+                null
+            }
+            val want = items.getOrNull(idx)?.id
+            if (got == null || want == null || got != want) return
+            currentIndex = idx
+            try {
+                player.removeMediaItem(0)
+            } catch (e: Exception) {
+            }
+            items.getOrNull(idx)?.let { onResolved(it) }
+        } catch (e: Exception) {
+            Log.e(TAG, "confirmAdvanced failed", e)
         }
     }
 
