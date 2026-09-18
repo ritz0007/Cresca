@@ -1,0 +1,16 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <group android:name="mark">
+        <path
+            android:fillColor="#FA243C"
+            android:fillType="evenOdd"
+            android:pathData="M20,54 a34,34 0 1,0 68,0 a34,34 0 1,0 -68,0 z M38,46 a28,28 0 1,1 56,0 a28,28 0 1,1 -56,0 z" />
+        <path
+            android:fillColor="#FA243C"
+            android:pathData="M62,66 a8,6.5 0 1,0 16,0 a8,6.5 0 1,0 -16,0 z" />
+        <path
+            android:fillColor="#FA243C"
+            android:pathData="M76,38 h4.5 v28 h-4.5 z" />
+    </group>
+</vector>

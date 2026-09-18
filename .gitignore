@@ -1,0 +1,17 @@
+# Gradle / Android build outputs
+.gradle/
+build/
+app/build/
+.kotlin/
+local.properties
+*.log
+
+# Internal build notes (not for distribution)
+docs/BUILD.md
+docs/ARCHITECTURE.md
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+*.iml

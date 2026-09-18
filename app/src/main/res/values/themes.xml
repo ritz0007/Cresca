@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Apple Music red -->
+    <color name="apple_red">#FA243C</color>
+    <color name="apple_red_dark">#FC5C6E</color>
+    <style name="Theme.Cresca" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">?android:attr/colorBackground</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+    <!-- Boot splash: white + animated Cresca mark, shown before first frame -->
+    <style name="Theme.Cresca.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@android:color/white</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_splash_animated</item>
+        <item name="windowSplashScreenAnimationDuration">1000</item>
+        <item name="postSplashScreenTheme">@style/Theme.Cresca</item>
+    </style>
+</resources>
