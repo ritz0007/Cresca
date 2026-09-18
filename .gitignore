@@ -15,3 +15,6 @@ docs/ARCHITECTURE.md
 Thumbs.db
 .idea/
 *.iml
+
+# Release APKs live on GitHub Releases, not in git
+*.apk
