@@ -1,5 +1,7 @@
 package com.cresca.app
 
+import android.content.Context
+import android.content.ContextWrapper
 import android.util.Log
 import android.view.ViewGroup
 import androidx.compose.foundation.background
@@ -52,6 +54,18 @@ import androidx.media3.ui.PlayerView
 
 private const val VIDEO_TAG = "VideoSheet"
 
+// Bottom sheets/dialogs wrap the Activity; unwrap to reach it.
+private fun Context.findActivity(): android.app.Activity? {
+    var c: Context? = this
+    while (c != null) {
+        if (c is android.app.Activity) {
+            return c
+        }
+        c = (c as? ContextWrapper)?.baseContext
+    }
+    return null
+}
+
 /**
  * Session-driven embed (YT Music style): a bare video surface on the shared
  * session player. Play/pause/seek/prev/next all live on the music controls;
@@ -66,6 +80,7 @@ fun InlineVideo(
     onQuality: (YoutubeRepository.VideoOption) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
     var expanded by remember { mutableStateOf(false) }
     var showQuality by remember { mutableStateOf(false) }
 
@@ -156,6 +171,18 @@ fun InlineVideo(
             }
         }
     } else {
+        // Fullscreen video rotates to landscape; back to portrait after.
+        DisposableEffect(Unit) {
+            val a = context.findActivity()
+            Log.i(VIDEO_TAG, "expand: activity=" + (a != null))
+            a?.requestedOrientation =
+                android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            onDispose {
+                Log.i(VIDEO_TAG, "collapse")
+                a?.requestedOrientation =
+                    android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            }
+        }
         Dialog(
             onDismissRequest = { expanded = false },
             properties = DialogProperties(

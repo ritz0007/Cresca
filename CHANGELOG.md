@@ -1,5 +1,18 @@
 # Changelog — Cresca Music
 
+## 0.4.1
+- Instant playback: stream-URL cache, next-track prefetch, tuned buffers, 403 multi-host retry
+- Lyrics: fuzzy multi-variant lookup via lrclib search + lyrics.ovh fallback
+- Rotation fix: no restart on rotate, portrait locked, landscape fullscreen video
+- Video prefetch cache for faster video open
+- Fancy mini-player: equalizer bars, red play button, progress hairline
+- Live Updates provider: Android 16+ chip with live progress ticker
+- PlaybackService media session: background playback + notification/lockscreen controls
+- Embedded session-driven video with expand + quality picker
+- Playlists with artist-based suggestions
+- YouTube login session (encrypted on-device)
+- Downloads via DownloadManager + offline-first playback
+
 ## 0.3.0
 - Cresca rebrand: `com.cresca.app`, Cresca Music label, crescent-note mark,
   adaptive launcher icon, animated splash + Compose intro

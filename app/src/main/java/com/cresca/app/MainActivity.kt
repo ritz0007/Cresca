@@ -7,9 +7,14 @@ import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
@@ -40,6 +45,9 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.core.view.WindowCompat
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.font.FontWeight
@@ -135,11 +143,17 @@ class MainActivity : ComponentActivity() {
             androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
         ) { }
 
+    private var themeMode by mutableStateOf("system")
+
     override fun onCreate(savedInstanceState: Bundle?) {
         val splash = installSplashScreen()
         var uiReady = false
         splash.setKeepOnScreenCondition { !uiReady }
         super.onCreate(savedInstanceState)
+        try {
+            themeMode = getPreferences(MODE_PRIVATE).getString("theme", "system") ?: "system"
+        } catch (e: Exception) {
+        }
         // Media notification needs this on Android 13+.
         try {
             if (android.os.Build.VERSION.SDK_INT >= 33 &&
@@ -150,14 +164,57 @@ class MainActivity : ComponentActivity() {
             }
         } catch (e: Exception) {
         }
-        setContent { AppleMusicTheme { AppleMusicApp(onReady = { uiReady = true }) } }
+        setContent {
+            val dark = when (themeMode) {
+                "light" -> false
+                "dark" -> true
+                else -> isSystemInDarkTheme()
+            }
+            AppleMusicTheme(darkTheme = dark) {
+                SystemBars(dark)
+                AppleMusicApp(
+                    onReady = { uiReady = true },
+                    themeMode = themeMode,
+                    onThemeMode = {
+                        themeMode = it
+                        try {
+                            getPreferences(MODE_PRIVATE).edit().putString("theme", it).apply()
+                        } catch (e: Exception) {
+                        }
+                    }
+                )
+            }
+        }
+    }
+}
+
+/** Status + nav bars follow the theme (fixes white bars in dark mode). */
+@Composable
+private fun SystemBars(dark: Boolean) {
+    val view = LocalView.current
+    DisposableEffect(dark) {
+        try {
+            val window = (view.context as android.app.Activity).window
+            window.statusBarColor = android.graphics.Color.TRANSPARENT
+            window.navigationBarColor = android.graphics.Color.TRANSPARENT
+            WindowCompat.getInsetsController(window, view).apply {
+                isAppearanceLightStatusBars = !dark
+                isAppearanceLightNavigationBars = !dark
+            }
+        } catch (e: Exception) {
+        }
+        onDispose { }
     }
 }
 
 /** Waits for the media session, then hosts the app on the shared player. */
 @OptIn(ExperimentalHazeMaterialsApi::class)
 @Composable
-fun AppleMusicApp(onReady: () -> Unit = {}) {
+fun AppleMusicApp(
+    onReady: () -> Unit = {},
+    themeMode: String = "system",
+    onThemeMode: (String) -> Unit = {}
+) {
     val context = LocalContext.current
     var controller by remember { mutableStateOf<androidx.media3.session.MediaController?>(null) }
     LaunchedEffect(Unit) {
@@ -188,7 +245,7 @@ fun AppleMusicApp(onReady: () -> Unit = {}) {
     if (player == null) {
         IntroScreen()
     } else {
-        AppleMusicAppContent(player, onReady)
+        AppleMusicAppContent(player, onReady, themeMode, onThemeMode)
     }
 }
 
@@ -221,7 +278,12 @@ private suspend fun <T> com.google.common.util.concurrent.ListenableFuture<T>.aw
 
 @OptIn(ExperimentalHazeMaterialsApi::class)
 @Composable
-fun AppleMusicAppContent(player: Player, onReady: () -> Unit = {}) {
+fun AppleMusicAppContent(
+    player: Player,
+    onReady: () -> Unit = {},
+    themeMode: String = "system",
+    onThemeMode: (String) -> Unit = {}
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -337,6 +399,13 @@ fun AppleMusicAppContent(player: Player, onReady: () -> Unit = {}) {
                 pushRecent(t)
                 startPlaybackService()
                 Log.i(TAG, "playing ${t.title}")
+                // Warm the video options so audio->video flips instantly.
+                scope.launch {
+                    try {
+                        YoutubeRepository.videoOptions(t.watchUrl)
+                    } catch (e: Exception) {
+                    }
+                }
                 // New track while watching video: follow it into video mode.
                 if (videoMode) {
                     videoFollowTick++
@@ -667,65 +736,18 @@ fun AppleMusicAppContent(player: Player, onReady: () -> Unit = {}) {
                     .clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp))
             ) {
                 nowPlaying?.let { t ->
-                    Surface(
-                        tonalElevation = 0.dp,
-                        color = Color.Transparent,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 8.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .clickable { showFullPlayer = true }
-                    ) {
-                        Column {
-                            Row(
-                                Modifier.padding(8.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                TrackArt(t.thumbUrl, t.id.hashCode(), 48.dp)
-                                Spacer(Modifier.width(12.dp))
-                                Column(Modifier.weight(1f)) {
-                                    Text(t.title, style = MaterialTheme.typography.bodyMedium,
-                                        maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                    Text(
-                                        when {
-                                            resolving || playerState == Player.STATE_BUFFERING -> "Loading…"
-                                            playerError != null -> playerError!!
-                                            else -> t.artist
-                                        },
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = if (playerError != null)
-                                            MaterialTheme.colorScheme.error
-                                        else MaterialTheme.colorScheme.onSurfaceVariant,
-                                        maxLines = 1, overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                                IconButton(onClick = { queue.previous() }) {
-                                    Icon(Icons.Filled.SkipPrevious, contentDescription = "Previous")
-                                }
-                                if (resolving || playerState == Player.STATE_BUFFERING) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
-                                } else {
-                                    IconButton(onClick = { togglePlay(t) }) {
-                                        Icon(
-                                            if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                                            contentDescription = if (isPlaying) "Pause" else "Play"
-                                        )
-                                    }
-                                }
-                                IconButton(onClick = { queue.next() }) {
-                                    Icon(Icons.Filled.SkipNext, contentDescription = "Next")
-                                }
-                            }
-                            // Thin progress line under mini-player
-                            if (duration > 0) {
-                                LinearProgressIndicator(
-                                    progress = { (position.toFloat() / duration).coerceIn(0f, 1f) },
-                                    modifier = Modifier.fillMaxWidth().height(2.dp)
-                                )
-                            }
-                        }
-                    }
+                    FancyBar(
+                        track = t,
+                        isPlaying = isPlaying,
+                        buffering = resolving || playerState == Player.STATE_BUFFERING,
+                        position = position,
+                        duration = duration,
+                        error = playerError,
+                        onOpen = { showFullPlayer = true },
+                        onPrev = { queue.previous() },
+                        onPlayPause = { togglePlay(t) },
+                        onNext = { queue.next() }
+                    )
                     Spacer(Modifier.height(4.dp))
                 }
                 NavigationBar(containerColor = Color.Transparent) {
@@ -1530,6 +1552,132 @@ private fun IslandPill(
             }
             IconButton(onClick = onNext, modifier = Modifier.size(40.dp)) {
                 Icon(Icons.Filled.SkipNext, contentDescription = "Next", tint = Color.White)
+            }
+        }
+    }
+}
+
+/** Fancy floating music bar: glow card, live equalizer, round red play. */
+@Composable
+private fun FancyBar(
+    track: YtTrack,
+    isPlaying: Boolean,
+    buffering: Boolean,
+    position: Long,
+    duration: Long,
+    error: String?,
+    onOpen: () -> Unit,
+    onPrev: () -> Unit,
+    onPlayPause: () -> Unit,
+    onNext: () -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        tonalElevation = 6.dp,
+        shadowElevation = 10.dp,
+        modifier = Modifier.fillMaxWidth()
+            .padding(horizontal = 10.dp)
+            .clickable { onOpen() }
+    ) {
+        Column(Modifier.padding(start = 10.dp, end = 10.dp, top = 10.dp, bottom = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                TrackArt(track.thumbUrl, track.id.hashCode(), 54.dp, 16.dp)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(track.title,
+                            style = MaterialTheme.typography.bodyMedium.copy(
+                                fontWeight = FontWeight.SemiBold),
+                            maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false))
+                        if (isPlaying) {
+                            Spacer(Modifier.width(6.dp))
+                            EqBars()
+                        }
+                    }
+                    Text(
+                        when {
+                            buffering -> "Loading…"
+                            error != null -> error
+                            else -> track.artist
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (error != null) MaterialTheme.colorScheme.error
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis
+                    )
+                }
+                IconButton(onClick = onPrev, modifier = Modifier.size(40.dp)) {
+                    Icon(Icons.Filled.SkipPrevious, contentDescription = "Previous")
+                }
+                if (buffering) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(24.dp).padding(4.dp), strokeWidth = 2.dp)
+                } else {
+                    Surface(
+                        shape = androidx.compose.foundation.shape.CircleShape,
+                        color = Color(0xFFFA243C),
+                        modifier = Modifier.size(44.dp).clickable { onPlayPause() }
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                                contentDescription = if (isPlaying) "Pause" else "Play",
+                                tint = Color.White,
+                                modifier = Modifier.size(26.dp)
+                            )
+                        }
+                    }
+                }
+                IconButton(onClick = onNext, modifier = Modifier.size(40.dp)) {
+                    Icon(Icons.Filled.SkipNext, contentDescription = "Next")
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            val frac = if (duration > 0) {
+                (position.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
+            } else {
+                0f
+            }
+            Box(
+                Modifier.fillMaxWidth().height(3.dp)
+                    .clip(RoundedCornerShape(2.dp))
+                    .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f))
+            ) {
+                Box(
+                    Modifier.fillMaxHeight().fillMaxWidth(frac)
+                        .background(MaterialTheme.colorScheme.primary)
+                )
+            }
+        }
+    }
+}
+
+/** Tiny animated equalizer shown while music plays. */
+@Composable
+private fun EqBars() {
+    val inf = rememberInfiniteTransition(label = "eq")
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+        verticalAlignment = Alignment.Bottom,
+        modifier = Modifier.height(14.dp)
+    ) {
+        for (i in 0 until 4) {
+            val h by inf.animateFloat(
+                initialValue = 0.25f,
+                targetValue = 1f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(durationMillis = 380 + i * 90, easing = { it }),
+                    repeatMode = RepeatMode.Reverse
+                ),
+                label = "eq$i"
+            )
+            Canvas(Modifier.width(3.dp).fillMaxHeight(h)) {
+                drawRoundRect(
+                    color = Color(0xFFFA243C),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(1.5.dp.toPx())
+                )
             }
         }
     }

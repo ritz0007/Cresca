@@ -71,6 +71,8 @@ object YoutubeRepository {
     // Resolved stream URLs, good for hours. Hits make replays instant.
     private const val URL_TTL_MS = 5 * 60 * 60 * 1000L
     private val urlCache = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Long>>()
+    private val videoOptsCache =
+        java.util.concurrent.ConcurrentHashMap<String, Pair<List<VideoOption>, Long>>()
 
     fun initAppContext(ctx: Context) {
         appContext = ctx.applicationContext
@@ -222,6 +224,15 @@ object YoutubeRepository {
         withContext(Dispatchers.IO) {
             ensureInit()
             try {
+                val hit = videoOptsCache[watchUrl]
+                if (hit != null && System.currentTimeMillis() - hit.second < URL_TTL_MS) {
+                    return@withContext hit.first
+                } else if (hit != null) {
+                    videoOptsCache.remove(watchUrl)
+                }
+            } catch (e: Exception) {
+            }
+            try {
                 val se = YouTube.getStreamExtractor(watchUrl)
                 se.fetchPage()
                 val muxed = se.getVideoStreams().filter { !it.isVideoOnly() }
@@ -245,6 +256,11 @@ object YoutubeRepository {
                         continue
                     }
                     out.add(VideoOption(url, h, h.toString() + "p"))
+                }
+                try {
+                    videoOptsCache[watchUrl] =
+                        Pair(out, System.currentTimeMillis())
+                } catch (e: Exception) {
                 }
                 out
             } catch (e: Exception) {
