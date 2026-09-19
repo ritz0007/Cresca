@@ -48,6 +48,9 @@ dependencies {
     implementation("dev.chrisbanes.haze:haze:1.7.2")
     implementation("dev.chrisbanes.haze:haze-materials:1.7.2")
     debugImplementation("androidx.compose.ui:ui-tooling")
+    testImplementation("junit:junit:4.13.2")
+    // Real org.json for JVM unit tests (Android stub throws "not mocked").
+    testImplementation("org.json:json:20240303")
 }
 
 // Pin activity to SDK-35-compatible line (a transitive wants SDK 36)

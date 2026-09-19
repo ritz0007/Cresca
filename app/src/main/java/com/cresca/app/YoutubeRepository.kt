@@ -125,7 +125,7 @@ object YoutubeRepository {
                     val d = try { item.duration } catch (e: Exception) { 0L }
                     d <= 0L || d <= 600L
                 }
-                .take(max).mapNotNull { item ->
+                .take(max + 10).mapNotNull { item ->
                     try {
                         val id = Regex("[?&]v=([A-Za-z0-9_-]{11})")
                             .find(item.url)?.groupValues?.get(1) ?: return@mapNotNull null
@@ -142,6 +142,9 @@ object YoutubeRepository {
                         null
                     }
                 }
+                // Duplicate ids crash keyed lazy lists: drop them here.
+                .distinctBy { it.id }
+                .take(max)
         }
 
     /** Real YouTube search. Throws on network/parse failure (caller falls back to demo). */
@@ -317,9 +320,10 @@ object YoutubeRepository {
         }
 
     /**
-     * Autoplay pool for a track: related streams first, topped up with an
-     * artist music-search when related extraction comes back thin. Always
-     * returns something playable when the network cooperates.
+     * Vibe-based autoplay (YT Music style): YouTube's related graph is the
+     * vibe signal (co-listened tracks, same mood/tempo — NOT same singer).
+     * Same-artist search is only a last-resort filler, down-ranked, so the
+     * queue matches the song's vibe instead of looping one singer.
      */
     suspend fun autoplayFor(t: YtTrack, max: Int = 20): List<YtTrack> =
         withContext(Dispatchers.IO) {
@@ -329,26 +333,130 @@ object YoutubeRepository {
             } catch (e: Exception) {
                 emptyList()
             }
-            if (rel.size >= max / 2) return@withContext rel
-            try {
-                val low = t.artist.lowercase()
-                val labelish = low.isBlank() || low == "youtube" ||
-                    low.contains("music") || low.contains("official") ||
-                    low.contains("films") || low.contains("records")
-                val q = if (labelish) "${t.title} songs" else "${t.artist} songs"
-                val extra = try {
-                    searchMusic(q, max)
-                } catch (e: Exception) {
-                    emptyList()
-                }
-                (rel + extra).distinctBy { it.id }
-                    .filter { it.id != t.id }
-                    .take(max)
-                    .also { Log.i(TAG, "autoplay ${rel.size} related + ${extra.size} search") }
-            } catch (e: Exception) {
-                rel
+            // Related IS the vibe (YT Music mixes the same way). Enough? Done.
+            if (rel.size >= max / 2) {
+                return@withContext rel.filter { it.id != t.id }.take(max)
             }
+            // Thin related: vibe-search by song keywords (mood/title words),
+            // NOT artist name — artist-only is what caused same-singer loops.
+            val vibeQs = try {
+                vibeQueries(t)
+            } catch (e: Exception) {
+                emptyList()
+            }
+            val pool = ArrayList<YtTrack>(rel)
+            for (q in vibeQs.take(3)) {
+                try {
+                    val hits = searchMusic(q, 12)
+                    for (h in hits) {
+                        if (pool.none { it.id == h.id } && h.id != t.id) pool.add(h)
+                        if (pool.size >= max + 10) break
+                    }
+                } catch (e: Exception) {
+                }
+                if (pool.size >= max + 10) break
+            }
+            // Last resort: a LITTLE same-artist filler (max 25%), clearly last.
+            try {
+                if (pool.size < max) {
+                    val low = t.artist.lowercase()
+                    val labelish = low.isBlank() || low == "youtube" ||
+                        low.contains("music") || low.contains("official") ||
+                        low.contains("films") || low.contains("records")
+                    if (!labelish) {
+                        val extra = searchMusic("${t.artist} songs", 8)
+                        var added = 0
+                        for (h in extra) {
+                            if (pool.none { it.id == h.id } && h.id != t.id && added < max / 4) {
+                                pool.add(h)
+                                added++
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+            }
+            // Vibe-rank: shared title words first, artist overlap penalized
+            // (prevents same-singer clumps), then shuffle within tiers.
+            val ranked = try {
+                rankByVibe(t, pool)
+            } catch (e: Exception) {
+                pool
+            }
+            ranked.distinctBy { it.id }.filter { it.id != t.id }.take(max)
+                .also { Log.i(TAG, "autoplay vibe ${rel.size} related + ${pool.size - rel.size} vibe") }
         }
+
+    /** Vibe queries from a track: title keywords + mood words, no artist. */
+    internal fun vibeQueries(t: YtTrack): List<String> {
+        return try {
+            var title = t.title.lowercase()
+            // Strip video-type noise (official/video/lyric/visualizer/etc).
+            title = title.replace(
+                Regex("""[\(\[].*?(official|video|audio|lyric|visualizer|mv|m\/v|teaser|trailer).*?[\)\]]"""),
+                " "
+            )
+            title = title.replace(Regex("""\s+[|｜].*$"""), " ")
+            val dash = title.indexOf(" - ")
+            if (dash >= 3) title = title.substring(0, dash)
+            title = title.replace(Regex("""[^a-z0-9 ]"""), " ")
+            val words = title.split(Regex("""\s+"""))
+                .map { it.trim() }.filter { it.length > 3 }
+                .filterNot { it in setOf("official", "video", "audio", "lyrics", "song", "songs", "full", "hd", "with") }
+                .distinct().take(4)
+            val mood = detectMood(t.title + " " + t.artist)
+            val out = ArrayList<String>()
+            if (words.size >= 2) out.add((words.take(3) + (mood?.let { listOf(it) } ?: emptyList())).joinToString(" ") + " songs")
+            if (words.isNotEmpty()) out.add(words.take(2).joinToString(" ") + " ${mood ?: "songs"}")
+            if (mood != null) out.add("$mood hindi songs")
+            out.distinct().take(3)
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun detectMood(text: String): String? {
+        return try {
+            val low = text.lowercase()
+            when {
+                low.contains("love") || low.contains("romantic") || low.contains("dil") -> "romantic"
+                low.contains("party") || low.contains("dance") || low.contains("club") -> "party"
+                low.contains("lofi") || low.contains("chill") || low.contains("slow") -> "lofi"
+                low.contains("workout") || low.contains("gym") || low.contains("motivat") -> "workout"
+                low.contains("sad") || low.contains("dard") || low.contains("bewafa") -> "sad"
+                low.contains("punjabi") || low.contains("bhangra") -> "punjabi"
+                else -> null
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** Score pool by vibe: shared words up, same-artist clumps down. */
+    internal fun rankByVibe(seed: YtTrack, pool: List<YtTrack>): List<YtTrack> {
+        return try {
+            val seedWords = (seed.title.lowercase().replace(Regex("""[^a-z0-9 ]"""), " ")
+                .split(Regex("""\s+""")).filter { it.length > 3 } +
+                vibeQueries(seed).flatMap { it.split(" ") }.filter { it.length > 3 })
+                .toSet()
+            val seedArtist = seed.artist.lowercase()
+            val rnd = java.util.Random(System.currentTimeMillis())
+            pool.map { c ->
+                var s = 0
+                val cw = c.title.lowercase().replace(Regex("""[^a-z0-9 ]"""), " ")
+                    .split(Regex("""\s+""")).filter { it.length > 3 }
+                s += cw.count { it in seedWords } * 2
+                // Penalize same-artist (the old bug): vibe variety wins.
+                if (c.artist.lowercase() == seedArtist) s -= 3
+                else if (c.artist.lowercase().contains(seedArtist.take(5)) && seedArtist.length > 5) s -= 2
+                Pair(s, c)
+            }.sortedWith(compareByDescending<Pair<Int, YtTrack>> { it.first }
+                .thenBy { rnd.nextInt() })
+                .map { it.second }
+        } catch (e: Exception) {
+            pool.shuffled()
+        }
+    }
 
     /** Common type for endless See All pagers (search + kiosk). */
     interface EndlessPager {

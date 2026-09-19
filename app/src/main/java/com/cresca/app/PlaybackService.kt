@@ -1,6 +1,7 @@
 package com.cresca.app
 
 import android.content.Intent
+import android.os.Bundle
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.Player
@@ -10,8 +11,11 @@ import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.session.CommandButton
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
+import androidx.media3.session.SessionCommand
+import androidx.media3.session.SessionResult
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -85,7 +89,14 @@ class PlaybackService : MediaSessionService() {
         liveProvider = provider
         setMediaNotificationProvider(provider)
         session = MediaSession.Builder(this, exo)
+            .setCallback(SessionCallback())
             .build()
+        // Like button in the system notification on every API level
+        // (custom layout; handled in SessionCallback + provider).
+        try {
+            session?.setCustomLayout(listOf(likeButton()))
+        } catch (e: Exception) {
+        }
         exo.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 if (isPlaying) {
@@ -131,6 +142,44 @@ class PlaybackService : MediaSessionService() {
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? {
         return session
+    }
+
+    private fun likeButton(): CommandButton {
+        return try {
+            CommandButton.Builder()
+                .setDisplayName("Like")
+                .setIconResId(android.R.drawable.star_big_on)
+                .setSessionCommand(SessionCommand("cresca_like", Bundle.EMPTY))
+                .build()
+        } catch (e: Exception) {
+            CommandButton.Builder()
+                .setDisplayName("Like")
+                .setSessionCommand(SessionCommand("cresca_like", Bundle.EMPTY))
+                .build()
+        }
+    }
+
+    private inner class SessionCallback : MediaSession.Callback {
+        override fun onCustomCommand(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            customCommand: SessionCommand,
+            args: Bundle
+        ): com.google.common.util.concurrent.ListenableFuture<SessionResult> {
+            try {
+                if (customCommand.customAction == "cresca_like") {
+                    try {
+                        NextActionReceiver.onLikeToggle?.invoke()
+                    } catch (e: Exception) {
+                    }
+                    return com.google.common.util.concurrent.Futures.immediateFuture(
+                        SessionResult(SessionResult.RESULT_SUCCESS)
+                    )
+                }
+            } catch (e: Exception) {
+            }
+            return super.onCustomCommand(session, controller, customCommand, args)
+        }
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {

@@ -26,6 +26,8 @@
             android:exported="false">
             <intent-filter>
                 <action android:name="com.cresca.app.NEXT_ACTION" />
+                <action android:name="com.cresca.app.PREV_ACTION" />
+                <action android:name="com.cresca.app.LIKE_ACTION" />
             </intent-filter>
         </receiver>
         <service

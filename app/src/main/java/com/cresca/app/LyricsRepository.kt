@@ -277,7 +277,7 @@ object LyricsRepository {
             LyricsState.NotFound
         }
 
-    private fun parseLrc(lrc: String): List<LyricLine> {
+    internal fun parseLrc(lrc: String): List<LyricLine> {
         // Global offset tag shifts every line ([offset:+500] / [offset:-200]).
         var shift = 0L
         val offMatch = Regex("""\[offset:\s*([+-]?\d+)\]""").find(lrc)

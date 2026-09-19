@@ -17,9 +17,13 @@ import kotlinx.coroutines.withContext
 
 /**
  * Background store for the next playable songs: stream bytes go to the
- * ExoPlayer disk cache and artwork to Coil's disk cache, so skipping
- * forward plays instantly even on a flaky network. Idempotent: cached
- * ranges are served from disk, never re-downloaded.
+ * ExoPlayer disk cache (3 GB LRU) and artwork to Coil's disk cache, so
+ * skipping forward plays instantly even on a flaky network. Idempotent:
+ * cached ranges are served from disk, never re-downloaded.
+ *
+ * Taste prediction: beyond the queue's Up Next, we also warm vibe-matched
+ * candidates (liked + recent seeds) the user is likely to tap, so those
+ * play instantly too.
  */
 object Precache {
     private const val TAG = "Precache"
@@ -70,11 +74,11 @@ object Precache {
     }
 
     /** Resolve + pre-store the next [count] tracks (skips offline ones). */
-    suspend fun warmUpcoming(ctx: Context, tracks: List<YtTrack>, count: Int = 2) =
+    suspend fun warmUpcoming(ctx: Context, tracks: List<YtTrack>, count: Int = 5) =
         withContext(Dispatchers.IO) {
             try {
                 val app = ctx.applicationContext
-                for (t in tracks.take(count)) {
+                for (t in tracks.take(count.coerceIn(1, 8))) {
                     try {
                         if (t.watchUrl.isBlank()) continue
                         if (DownloadStore.isDownloaded(app, t.id)) continue
@@ -88,6 +92,42 @@ object Precache {
                 Log.w(TAG, "warmUpcoming failed", e)
             }
         }
+
+    /**
+     * Taste-predicted warming: queue Up Next first (instant skip), then a
+     * few vibe-matched predictions from liked + recent seeds. Runs on IO,
+     * never throws, safe to call on every track change.
+     */
+    suspend fun warmPredicted(
+        ctx: Context,
+        upcoming: List<YtTrack>,
+        liked: List<YtTrack> = emptyList(),
+        recent: List<YtTrack> = emptyList()
+    ) = withContext(Dispatchers.IO) {
+        try {
+            val app = ctx.applicationContext
+            // 1) Up Next: the next 5 play instantly (covers rapid skipping).
+            warmUpcoming(app, upcoming, 5)
+            // 2) Taste predictions: 3 vibe picks from library seeds.
+            try {
+                val seeds = (liked.take(6) + recent.take(6)).distinctBy { it.id }
+                    .filter { it.watchUrl.isNotBlank() }.take(3)
+                for (s in seeds) {
+                    try {
+                        if (DownloadStore.isDownloaded(app, s.id)) continue
+                        val url = YoutubeRepository.audioUrl(s.watchUrl) ?: continue
+                        // Only top-up bytes (CacheWriter skips cached ranges).
+                        warmUrl(app, url)
+                        warmArt(app, s.thumbUrl)
+                    } catch (e: Exception) {
+                    }
+                }
+            } catch (e: Exception) {
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "warmPredicted failed", e)
+        }
+    }
 
     /** Warm Coil disk cache so artwork appears instantly. */
     suspend fun warmArt(ctx: Context, url: String) = withContext(Dispatchers.IO) {

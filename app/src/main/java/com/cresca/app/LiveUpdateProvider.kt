@@ -68,6 +68,17 @@ class LiveUpdateProvider(ctx: Context) : MediaNotification.Provider {
         action: String,
         extras: Bundle
     ): Boolean {
+        try {
+            // Like custom command from the notification custom layout.
+            if (action == "cresca_like" || action == NextActionReceiver.ACTION_LIKE) {
+                try {
+                    NextActionReceiver.onLikeToggle?.invoke()
+                } catch (e: Exception) {
+                }
+                return true
+            }
+        } catch (e: Exception) {
+        }
         return base.handleCustomCommand(session, action, extras)
     }
 
@@ -189,22 +200,19 @@ class LiveUpdateProvider(ctx: Context) : MediaNotification.Provider {
                     scored.add(Triple(rank, i, Notification.Action.Builder(aicon, atitle, ai).build()))
                 }
             }
-            // Add synthetic Next action if missing (for Live Updates card).
-            if (!hasNext && hasPlay) {
-                // Create a proper PendingIntent for Next that triggers a broadcast
-                // to seek to next via the MediaController.
-                val nextIntent = Intent("com.cresca.app.NEXT_ACTION")
-                    .setPackage(app.packageName)
-                val ai = PendingIntent.getBroadcast(
-                    app,
-                    0,
-                    nextIntent,
-                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-                )
-                val aicon = Icon.createWithResource(app, android.R.drawable.ic_media_next)
-                scored.add(Triple(1, Int.MAX_VALUE, Notification.Action.Builder(aicon, "Next", ai).build()))
+            // Always show Next + Prev + Like on the Live Update card.
+            // Base actions are ranked play/pause first; missing ones are
+            // added as synthetic broadcasts (NextActionReceiver drives the
+            // real queue skip / like toggle in MainActivity).
+            if (!hasNext) {
+                scored.add(Triple(1, Int.MAX_VALUE - 2, nextAction()))
                 hasNext = true
             }
+            if (!hasPrev) {
+                scored.add(Triple(2, Int.MAX_VALUE - 1, prevAction()))
+                hasPrev = true
+            }
+            scored.add(Triple(3, Int.MAX_VALUE, likeAction()))
             scored.sortWith(compareBy({ it.first }, { it.second }))
             for ((_, _, act) in scored) {
                 builder.addAction(act)
@@ -212,5 +220,55 @@ class LiveUpdateProvider(ctx: Context) : MediaNotification.Provider {
         } catch (e: Exception) {
         }
         return builder.build()
+    }
+
+    private fun broadcastFor(action: String, requestCode: Int): PendingIntent {
+        return try {
+            val intent = Intent(action).setPackage(app.packageName)
+            PendingIntent.getBroadcast(
+                app,
+                requestCode,
+                intent,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+        } catch (e: Exception) {
+            throw e
+        }
+    }
+
+    private fun nextAction(): Notification.Action {
+        return try {
+            Notification.Action.Builder(
+                Icon.createWithResource(app, android.R.drawable.ic_media_next),
+                "Next",
+                broadcastFor(NextActionReceiver.ACTION_NEXT, 101)
+            ).build()
+        } catch (e: Exception) {
+            throw e
+        }
+    }
+
+    private fun prevAction(): Notification.Action {
+        return try {
+            Notification.Action.Builder(
+                Icon.createWithResource(app, android.R.drawable.ic_media_previous),
+                "Previous",
+                broadcastFor(NextActionReceiver.ACTION_PREV, 102)
+            ).build()
+        } catch (e: Exception) {
+            throw e
+        }
+    }
+
+    private fun likeAction(): Notification.Action {
+        return try {
+            Notification.Action.Builder(
+                Icon.createWithResource(app, android.R.drawable.star_big_on),
+                "Like",
+                broadcastFor(NextActionReceiver.ACTION_LIKE, 103)
+            ).build()
+        } catch (e: Exception) {
+            throw e
+        }
     }
 }

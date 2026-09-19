@@ -20,6 +20,11 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -33,6 +38,7 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyHorizontalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -196,6 +202,11 @@ class MainActivity : ComponentActivity() {
     private var themeMode by mutableStateOf("system")
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Crash log first so even startup crashes are captured (on-device only).
+        try {
+            CrashLog.install(this)
+        } catch (e: Exception) {
+        }
         val splash = installSplashScreen()
         var uiReady = false
         splash.setKeepOnScreenCondition { !uiReady }
@@ -518,10 +529,16 @@ fun AppleMusicAppContent(
     SystemBars(dark, if (showFullPlayer) playerDom else null)
 
     fun openPlaylist(id: String) {
-        // Store I/O off main (EncryptedSharedPreferences/file JSON ANRs).
+        // Store I/O off main (file JSON ANRs). State assigns on Main
+        // (Compose snapshot crash fix: never set state from IO thread).
         scope.launch(Dispatchers.IO) {
+            val found = try {
+                PlaylistStore.list(context).find { it.id == id }
+            } catch (e: Exception) {
+                null
+            }
             try {
-                showPlaylist = PlaylistStore.list(context).find { it.id == id }
+                withContext(Dispatchers.Main) { showPlaylist = found }
             } catch (e: Exception) {
             }
         }
@@ -529,10 +546,14 @@ fun AppleMusicAppContent(
 
     fun refreshDownloads() {
         scope.launch(Dispatchers.IO) {
-            try {
-                dlItems = DownloadStore.listAll(context)
+            val items = try {
+                DownloadStore.listAll(context)
             } catch (e: Exception) {
-                dlItems = emptyList()
+                emptyList()
+            }
+            try {
+                withContext(Dispatchers.Main) { dlItems = items }
+            } catch (e: Exception) {
             }
         }
     }
@@ -618,12 +639,24 @@ fun AppleMusicAppContent(
                 // Every change tops Up Next back up to ~20 related tracks
                 // (trigger-state: refreshUpcoming is declared below).
                 upcomingTick++
-                // BG store the next playable songs (bytes + artwork) so
+                // BG store next + taste-predicted songs (3 GB cache) so
                 // skipping forward is instant even on flaky networks.
                 scope.launch(Dispatchers.IO) {
                     try {
                         val q = queueHolder[0] ?: return@launch
-                        Precache.warmUpcoming(context, q.upcomingIds(2))
+                        Precache.warmPredicted(
+                            context, q.upcomingIds(5),
+                            try {
+                                liked
+                            } catch (e: Exception) {
+                                emptyList()
+                            },
+                            try {
+                                recent.toList()
+                            } catch (e: Exception) {
+                                emptyList()
+                            }
+                        )
                     } catch (e: Exception) {
                     }
                 }
@@ -895,6 +928,23 @@ fun AppleMusicAppContent(
         }
     }
 
+    // Phone calls win: pause while in a call, resume after (if playing).
+    // Crash-proof via CallGuard (isolates API-31 surface, never throws,
+    // safe to play-while-in-call: pauses cleanly instead of crashing).
+    DisposableEffect(player) {
+        val unregister = try {
+            CallGuard.register(context, player)
+        } catch (e: Exception) {
+            {}
+        }
+        onDispose {
+            try {
+                unregister()
+            } catch (e: Exception) {
+            }
+        }
+    }
+
     // Lyrics follow the current track (duration disambiguates matches).
     var lyrics by remember { mutableStateOf<LyricsState>(LyricsState.NotFound) }
     LaunchedEffect(nowPlaying) {
@@ -1084,6 +1134,101 @@ fun AppleMusicAppContent(
         val i = index.coerceIn(list.indices)
         queue.setQueue(list, i)
         nowPlaying = list[i]
+    }
+
+    // Instant skip: optimistic UI (no missed taps on rapid press) + primed
+    // ExoPlayer item plays immediately while resolve finishes in background.
+    fun skipNext() {
+        try {
+            resolving = true
+            playerError = null
+            queue.next()
+            // Optimistic: show the new current instantly (resolve confirms).
+            try {
+                queue.current?.let { nowPlaying = it }
+            } catch (e: Exception) {
+            }
+            // Top-up predictive cache for the new position.
+            scope.launch(Dispatchers.IO) {
+                try {
+                    val q = queueHolder[0] ?: return@launch
+                    Precache.warmPredicted(
+                        context, q.upcomingIds(5),
+                        try {
+                            liked
+                        } catch (e: Exception) {
+                            emptyList()
+                        },
+                        try {
+                            recent.toList()
+                        } catch (e: Exception) {
+                            emptyList()
+                        }
+                    )
+                } catch (e: Exception) {
+                }
+            }
+        } catch (e: Exception) {
+            try {
+                queue.next()
+            } catch (ignored: Exception) {
+            }
+        }
+    }
+
+    fun skipPrev() {
+        try {
+            resolving = true
+            playerError = null
+            queue.previous()
+            try {
+                queue.current?.let { nowPlaying = it }
+            } catch (e: Exception) {
+            }
+        } catch (e: Exception) {
+            try {
+                queue.previous()
+            } catch (ignored: Exception) {
+            }
+        }
+    }
+
+    // Notification / Live Update actions: Next + Prev + Like must always
+    // work from the shade (wired after skip helpers: no forward refs).
+    DisposableEffect(player) {
+        try {
+            NextActionReceiver.setMediaController(
+                player as? androidx.media3.session.MediaController
+            )
+        } catch (e: Exception) {
+        }
+        try {
+            NextActionReceiver.onNext = {
+                try {
+                    skipNext()
+                } catch (e: Exception) {
+                }
+            }
+            NextActionReceiver.onPrev = {
+                try {
+                    skipPrev()
+                } catch (e: Exception) {
+                }
+            }
+            NextActionReceiver.onLikeToggle = {
+                try {
+                    nowPlaying?.let { toggleLike(it) }
+                } catch (e: Exception) {
+                }
+            }
+        } catch (e: Exception) {
+        }
+        onDispose {
+            try {
+                NextActionReceiver.clear()
+            } catch (e: Exception) {
+            }
+        }
     }
     fun openSeeAll(req: SeeAllRequest) {
         seeAllPage = req
@@ -1645,6 +1790,46 @@ fun AppleMusicAppContent(
         }
     }
 
+    // Top Picks from recent taste: collectively last 10 played -> related
+    // tracks each (vibe, not same-singer), shuffled. Falls back to home.
+    var topVibe by remember { mutableStateOf<List<YtTrack>>(emptyList()) }
+    LaunchedEffect(recent.size, homeTracks.size) {
+        try {
+            val seeds = try {
+                recent.toList().take(10).filter { it.watchUrl.isNotBlank() }
+            } catch (e: Exception) {
+                emptyList()
+            }
+            if (seeds.size < 2) {
+                topVibe = emptyList()
+                return@LaunchedEffect
+            }
+            val pool = ArrayList<YtTrack>()
+            withContext(Dispatchers.IO) {
+                // 3 related per seed max (network-bounded), sequential.
+                for (s in seeds.take(10)) {
+                    try {
+                        val rel = YoutubeRepository.relatedTracks(s.watchUrl, 3)
+                        for (r in rel) {
+                            if (pool.none { it.id == r.id } &&
+                                seeds.none { it.id == r.id }
+                            ) pool.add(r)
+                        }
+                    } catch (e: Exception) {
+                    }
+                    if (pool.size >= 24) break
+                }
+            }
+            val shuffled = try {
+                pool.shuffled().take(12)
+            } catch (e: Exception) {
+                pool.take(12)
+            }
+            if (shuffled.size >= 4) topVibe = shuffled
+        } catch (e: Exception) {
+        }
+    }
+
     Box(Modifier.fillMaxSize()) {
     Scaffold(
         bottomBar = {
@@ -1668,9 +1853,9 @@ fun AppleMusicAppContent(
                         duration = duration,
                         error = playerError,
                         onOpen = { showFullPlayer = true },
-                        onPrev = { queue.previous() },
+                        onPrev = { skipPrev() },
                         onPlayPause = { togglePlay(t) },
-                        onNext = { queue.next() }
+                        onNext = { skipNext() }
                     )
                     Spacer(Modifier.height(4.dp))
                 }
@@ -1702,6 +1887,7 @@ fun AppleMusicAppContent(
                     tracks = homeTracks, recent = recent, fresh = newTracks, live = live,
                     loading = homeLoading, loadError = homeError,
                     sections = homeSections,
+                    topPicks = if (topVibe.size >= 4) topVibe else homeTracks,
                     onRetryLoad = { doRefreshHome() },
                     onRefresh = { doRefreshHome() },
                     refreshing = isRefreshing,
@@ -1816,8 +2002,8 @@ fun AppleMusicAppContent(
                 qualities = qualityLabels(),
                 currentQuality = currentQualityLabel(),
                 onPlayPause = { togglePlay(t) },
-                onPrev = { queue.previous() },
-                onNext = { queue.next() },
+                onPrev = { skipPrev() },
+                onNext = { skipNext() },
                 onShuffle = { cycleShuffleUi() },
                 onRepeat = { queue.cycleRepeat() },
                 onVideoToggle = { on ->
@@ -2012,7 +2198,10 @@ fun AppleMusicAppContent(
                         PlaylistStore.delete(context, pl.id)
                     } catch (e: Exception) {
                     }
-                    showPlaylist = null
+                    try {
+                        withContext(Dispatchers.Main) { showPlaylist = null }
+                    } catch (e: Exception) {
+                    }
                 }
             },
             onDismiss = { showPlaylist = null }
@@ -2145,6 +2334,49 @@ private fun FullPlayerSheet(
                                     )
                                 )
                         )
+                        // Song name + live lyrics ON the thumbnail (bottom
+                        // blacked-out scrim): previously shown only below.
+                        val overlayLyric = try {
+                            if (lyrics is LyricsState.Synced) {
+                                val ls = (lyrics as LyricsState.Synced).lines
+                                ls.indexOfLast { it.ms <= position }
+                                    .takeIf { it >= 0 }?.let { ls[it].text } ?: ""
+                            } else ""
+                        } catch (e: Exception) {
+                            ""
+                        }
+                        Column(
+                            Modifier.align(Alignment.BottomStart)
+                                .fillMaxWidth()
+                                .padding(start = 20.dp, end = 20.dp, bottom = 14.dp),
+                            horizontalAlignment = Alignment.Start
+                        ) {
+                            if (overlayLyric.isNotBlank()) {
+                                Text(
+                                    overlayLyric,
+                                    style = MaterialTheme.typography.bodyMedium.copy(
+                                        fontWeight = FontWeight.SemiBold
+                                    ),
+                                    color = MaterialTheme.colorScheme.primary,
+                                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.padding(bottom = 4.dp)
+                                )
+                            }
+                            Text(
+                                track.title,
+                                style = MaterialTheme.typography.titleLarge.copy(
+                                    fontWeight = FontWeight.Bold
+                                ),
+                                color = Color.White,
+                                maxLines = 2, overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                track.artist,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = Color.White.copy(alpha = 0.75f),
+                                maxLines = 1, overflow = TextOverflow.Ellipsis
+                            )
+                        }
                     }
                 }
             }
@@ -2154,18 +2386,8 @@ private fun FullPlayerSheet(
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Spacer(Modifier.height(16.dp))
-                // Live lyric ticker: one line at a time above the song name.
-                if (lyrics is LyricsState.Synced) {
-                    val lines = (lyrics as LyricsState.Synced).lines
-                    val li = lines.indexOfLast { it.ms <= position }.coerceAtLeast(0)
-                    Text(
-                        lines.getOrNull(li)?.text ?: "",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.primary,
-                        maxLines = 1, overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.padding(bottom = 4.dp)
-                    )
-                }
+                // Title/artist stay here for the scrolled state; the live
+                // lyric ticker lives ON the thumbnail overlay above.
                 Text(track.title, style = MaterialTheme.typography.titleLarge,
                     maxLines = 2, overflow = TextOverflow.Ellipsis)
                 Text(track.artist, style = MaterialTheme.typography.bodyMedium,
@@ -2277,11 +2499,17 @@ private fun FullPlayerSheet(
                 Spacer(Modifier.height(4.dp))
             } // body column
             } // body item
-            // Karaoke visualizer (own scroller inside)
+            // Karaoke visualizer (own scroller inside, tap line to seek).
             item {
                 LyricsView(
                     state = lyrics, positionMs = position, isPlaying = isPlaying,
-                    modifier = Modifier.fillMaxWidth().height(420.dp)
+                    modifier = Modifier.fillMaxWidth().height(420.dp),
+                    onLineClick = { ms ->
+                        try {
+                            onSeek(ms.coerceAtLeast(0L))
+                        } catch (e: Exception) {
+                        }
+                    }
                 )
             }
             // Shazam-like details card.
@@ -2423,7 +2651,7 @@ private fun PlaylistSheet(
                     }
                 }
             }
-            items(playlist.tracks, key = { it.id }) { t ->
+            itemsIndexed(playlist.tracks, key = { i, x -> "$i-${x.id}" }) { _, t ->
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Box(Modifier.weight(1f)) {
                         TrackRow(
@@ -2457,7 +2685,7 @@ private fun PlaylistSheet(
                         modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp))
                 }
             } else {
-                items(sugg, key = { it.id }) { t ->
+                itemsIndexed(sugg, key = { i, x -> "$i-${x.id}" }) { _, t ->
                     ListItem(
                         headlineContent = { Text(t.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                         supportingContent = { Text(t.artist, maxLines = 1) },
@@ -2531,7 +2759,7 @@ private fun PlaylistPickerSheet(
         Text("Add to playlist", style = MaterialTheme.typography.titleLarge,
             modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp))
         LazyColumn(Modifier.fillMaxWidth()) {
-            items(playlists, key = { it.id }) { p ->
+            itemsIndexed(playlists, key = { i, x -> "$i-${x.id}" }) { _, p ->
                 ListItem(
                     headlineContent = { Text(p.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                     supportingContent = { Text("${p.tracks.size} songs") },
@@ -2617,7 +2845,8 @@ private fun IntroScreen() {
     }
 }
 
-/** Fancy floating music bar: glow card, live equalizer, round red play. */
+/** Fancy floating music bar: glow card, live equalizer, round red play.
+ * Swipe left = next, swipe right = prev (no prev/next buttons). */
 @Composable
 private fun FancyBar(
     track: YtTrack,
@@ -2638,6 +2867,31 @@ private fun FancyBar(
         shadowElevation = 10.dp,
         modifier = Modifier.fillMaxWidth()
             .padding(horizontal = 10.dp)
+            .pointerInput(track.id) {
+                var acc = 0f
+                detectHorizontalDragGestures(
+                    onDragStart = { acc = 0f },
+                    onDragEnd = {
+                        try {
+                            if (acc < -80) {
+                                onNext()
+                            } else if (acc > 80) {
+                                onPrev()
+                            }
+                        } catch (e: Exception) {
+                        }
+                        acc = 0f
+                    },
+                    onDragCancel = { acc = 0f },
+                    onHorizontalDrag = { change, dragAmount ->
+                        acc += dragAmount
+                        try {
+                            change.consume()
+                        } catch (e: Exception) {
+                        }
+                    }
+                )
+            }
             .clickable { onOpen() }
     ) {
         Column(Modifier.padding(start = 10.dp, end = 10.dp, top = 10.dp, bottom = 8.dp)) {
@@ -2668,9 +2922,6 @@ private fun FancyBar(
                         maxLines = 1, overflow = TextOverflow.Ellipsis
                     )
                 }
-                IconButton(onClick = onPrev, modifier = Modifier.size(40.dp)) {
-                    Icon(Icons.Filled.SkipPrevious, contentDescription = "Previous")
-                }
                 if (buffering) {
                     CircularProgressIndicator(
                         modifier = Modifier.size(24.dp).padding(4.dp), strokeWidth = 2.dp)
@@ -2693,9 +2944,6 @@ private fun FancyBar(
                             }
                         }
                     }
-                }
-                IconButton(onClick = onNext, modifier = Modifier.size(40.dp)) {
-                    Icon(Icons.Filled.SkipNext, contentDescription = "Next")
                 }
             }
             Spacer(Modifier.height(8.dp))
@@ -3130,8 +3378,19 @@ private fun ProfileSheet(
                 SectionHeader("About")
             }
             item {
+                val pctx = LocalContext.current
+                var hasCrash by remember { mutableStateOf(false) }
+                LaunchedEffect(Unit) {
+                    hasCrash = try {
+                        withContext(Dispatchers.IO) {
+                            CrashLog.latest(pctx) != null
+                        }
+                    } catch (e: Exception) {
+                        false
+                    }
+                }
                 ListItem(
-                    headlineContent = { Text("Cresca Music 0.5.0") },
+                    headlineContent = { Text("Cresca Music 0.8.0") },
                     supportingContent = {
                         Text("Live YouTube audio • karaoke lyrics • offline mode")
                     },
@@ -3139,6 +3398,23 @@ private fun ProfileSheet(
                         Icon(Icons.Filled.Info, contentDescription = null)
                     }
                 )
+                if (hasCrash) {
+                    ListItem(
+                        headlineContent = { Text("Share crash log") },
+                        supportingContent = {
+                            Text("Sends the last crash report (stays on device until you share)")
+                        },
+                        leadingContent = {
+                            Icon(Icons.Filled.BugReport, contentDescription = null)
+                        },
+                        modifier = Modifier.clickable {
+                            try {
+                                CrashLog.shareLatest(pctx)
+                            } catch (e: Exception) {
+                            }
+                        }
+                    )
+                }
                 Spacer(Modifier.height(32.dp))
             }
         }
@@ -3168,30 +3444,93 @@ private fun ListenNowScreen(
     likedOf: (YtTrack) -> Boolean, onToggleLike: (YtTrack) -> Unit,
     updateTag: String? = null, onUpdateTap: () -> Unit = {},
     sections: Map<String, List<YtTrack>> = emptyMap(),
+    topPicks: List<YtTrack> = emptyList(),
     resumeTrack: YtTrack? = null,
     resumePosMs: Long = 0L,
     onResume: (YtTrack) -> Unit = {}
 ) {
+    // Pull-down-to-refresh (hard pull): no refresh button; drag from the top.
+    val listState = rememberLazyListState()
+    var pullPx by remember { mutableFloatStateOf(0f) }
+    LaunchedEffect(refreshing) {
+        if (!refreshing) {
+            try {
+                pullPx = 0f
+            } catch (e: Exception) {
+            }
+        }
+    }
+    val nested = remember(listState, refreshing) {
+        object : NestedScrollConnection {
+            override fun onPreScroll(
+                available: Offset,
+                source: NestedScrollSource
+            ): Offset {
+                try {
+                    val atTop = try {
+                        listState.firstVisibleItemIndex == 0 &&
+                            listState.firstVisibleItemScrollOffset == 0
+                    } catch (e: Exception) {
+                        true
+                    }
+                    if (atTop && source == NestedScrollSource.Drag &&
+                        available.y > 0 && !refreshing && !loading
+                    ) {
+                        pullPx = (pullPx + available.y * 0.45f).coerceIn(0f, 340f)
+                        // Consume so the list stays pinned while pulling.
+                        return available
+                    }
+                    if (pullPx > 0f && available.y < 0) {
+                        val consume = minOf(-available.y, pullPx)
+                        pullPx -= consume
+                        return Offset(0f, -consume)
+                    }
+                } catch (e: Exception) {
+                }
+                return Offset.Zero
+            }
+
+            override suspend fun onPreFling(available: Velocity): Velocity {
+                try {
+                    // Hard pull threshold (~220px): release to refresh.
+                    if (pullPx > 220f && !refreshing && !loading) {
+                        try {
+                            onRefresh()
+                        } catch (e: Exception) {
+                        }
+                    }
+                    pullPx = 0f
+                } catch (e: Exception) {
+                }
+                return super.onPreFling(available)
+            }
+        }
+    }
+    Box(Modifier.fillMaxSize().nestedScroll(nested)) {
     LazyColumn(
-        Modifier.fillMaxSize(),
+        state = listState,
+        modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(bottom = 16.dp)
     ) {
         item {
             Row(
-                Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 8.dp),
+                Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 8.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text("Listen Now", style = MaterialTheme.typography.displaySmall)
-                // Refresh rotates Top Picks seeds: the page always changes.
-                IconButton(onClick = onRefresh, enabled = !refreshing && !loading) {
-                    if (refreshing) {
-                        CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                    } else {
-                        Icon(Icons.Filled.Refresh, contentDescription = "Refresh")
-                    }
+                if (refreshing || loading) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp), strokeWidth = 2.dp
+                    )
                 }
             }
+            Text(
+                "Pull down hard to refresh",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 2.dp)
+            )
             // Empty states: spinner while loading, retry when offline. No demo.
             if (tracks.isEmpty() && loading) {
                 Box(
@@ -3222,23 +3561,30 @@ private fun ListenNowScreen(
             SectionHeader(
                 "Top Picks For You",
                 onSeeAll = {
+                    val picks = if (topPicks.isNotEmpty()) topPicks else tracks
                     onSeeAll(
                         railRequest("Top Picks For You")
-                            ?: SeeAllRequest("Top Picks For You", static = tracks)
+                            ?: SeeAllRequest("Top Picks For You", static = picks)
                     )
                 },
                 trailing = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         IconButton(
-                            onClick = { onPlayList(tracks, 0, false) },
-                            enabled = tracks.isNotEmpty(),
+                            onClick = {
+                                val picks = if (topPicks.isNotEmpty()) topPicks else tracks
+                                if (picks.isNotEmpty()) onPlayList(picks, 0, false)
+                            },
+                            enabled = (if (topPicks.isNotEmpty()) topPicks else tracks).isNotEmpty(),
                             modifier = Modifier.size(36.dp)
                         ) {
                             Icon(Icons.Filled.PlayArrow, contentDescription = "Play all")
                         }
                         IconButton(
-                            onClick = { onPlayList(tracks, 0, true) },
-                            enabled = tracks.isNotEmpty(),
+                            onClick = {
+                                val picks = if (topPicks.isNotEmpty()) topPicks else tracks
+                                if (picks.isNotEmpty()) onPlayList(picks, 0, true)
+                            },
+                            enabled = (if (topPicks.isNotEmpty()) topPicks else tracks).isNotEmpty(),
                             modifier = Modifier.size(36.dp)
                         ) {
                             Icon(Icons.Filled.Shuffle, contentDescription = "Shuffle")
@@ -3278,9 +3624,10 @@ private fun ListenNowScreen(
                 }
             }
         }
-        // Top Picks: 2-row wide grid (YT Music quick-picks style).
+        // Top Picks: recent-taste vibe (last 10 related, shuffled), 2X grid.
         item {
-            TopPicksGrid(tracks = tracks.take(12), onPlay = onPlay)
+            val picks = if (topPicks.isNotEmpty()) topPicks else tracks
+            TopPicksGrid(tracks = picks.take(12), onPlay = onPlay)
             SectionHeader(
                 "Recently Played",
                 onSeeAll = {
@@ -3289,7 +3636,7 @@ private fun ListenNowScreen(
             )
         }
         val recentShown = recent.ifEmpty { tracks.take(6) }
-        items(recentShown, key = { it.id }) { t ->
+        itemsIndexed(recentShown, key = { i, x -> "$i-${x.id}" }) { _, t ->
             TrackRow(
                 track = t, isCurrent = false, liked = likedOf(t),
                 onPlay = { onPlay(t) },
@@ -3409,6 +3756,51 @@ private fun ListenNowScreen(
             }
         }
     }
+    // Pull indicator: grows with the hard pull, spins while refreshing.
+    if (pullPx > 8f || refreshing) {
+        val p = try {
+            (pullPx / 220f).coerceIn(0f, 1f)
+        } catch (e: Exception) {
+            0f
+        }
+        Box(
+            Modifier.fillMaxWidth().padding(top = 10.dp),
+            contentAlignment = Alignment.TopCenter
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.graphicsLayer {
+                    translationY = -40f * (1f - p) - 10f
+                    alpha = 0.4f + 0.6f * p
+                }
+            ) {
+                if (refreshing) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(22.dp), strokeWidth = 2.5.dp
+                    )
+                    Text(
+                        "Refreshing…",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else if (pullPx > 220f) {
+                    Text(
+                        "Release to refresh",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                } else {
+                    Text(
+                        "Pull harder to refresh",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+    }
+    } // pull-to-refresh Box
 }
 
 /** Song row with a working overflow menu. Used everywhere lists appear. */
@@ -3494,8 +3886,10 @@ private fun TrackMenu(
                         } catch (e: Exception) {
                             emptyList()
                         }
-                        plists = loaded
-                        showPicker = true
+                        withContext(Dispatchers.Main) {
+                            plists = loaded
+                            showPicker = true
+                        }
                     }
                 }
             )
@@ -3538,10 +3932,16 @@ private fun TrackMenu(
                 dlscope.launch(Dispatchers.IO) {
                     try {
                         PlaylistStore.add(context, id, track)
-                        plists = PlaylistStore.list(context)
+                        val reloaded = PlaylistStore.list(context)
+                        withContext(Dispatchers.Main) {
+                            plists = reloaded
+                            showPicker = false
+                        }
                     } catch (e: Exception) {
+                        withContext(Dispatchers.Main) {
+                            showPicker = false
+                        }
                     }
-                    showPicker = false
                 }
             },
             onNew = { name ->
@@ -3549,10 +3949,16 @@ private fun TrackMenu(
                     try {
                         val p = PlaylistStore.create(context, name)
                         PlaylistStore.add(context, p.id, track)
-                        plists = PlaylistStore.list(context)
+                        val reloaded = PlaylistStore.list(context)
+                        withContext(Dispatchers.Main) {
+                            plists = reloaded
+                            showPicker = false
+                        }
                     } catch (e: Exception) {
+                        withContext(Dispatchers.Main) {
+                            showPicker = false
+                        }
                     }
-                    showPicker = false
                 }
             },
             onDismiss = { showPicker = false }
@@ -3900,7 +4306,7 @@ private fun SeeAllScreen(
                 modifier = Modifier.fillMaxSize().padding(pad),
                 contentPadding = PaddingValues(bottom = 16.dp)
             ) {
-                items(items, key = { it.id }) { t ->
+                itemsIndexed(items, key = { i, x -> "$i-${x.id}" }) { _, t ->
                     TrackRow(
                         track = t, isCurrent = false, liked = likedOf(t),
                         onPlay = { onPlay(t) },
@@ -4004,7 +4410,7 @@ private fun BrowseScreen(
                     onSeeAll(SeeAllRequest("New Releases", static = newTracks))
                 }
             }
-            items(newTracks.take(8), key = { it.id }) { t ->
+            itemsIndexed(newTracks.take(8), key = { i, x -> "$i-${x.id}" }) { _, t ->
                 TrackRow(
                     track = t, isCurrent = false, liked = likedOf(t),
                     onPlay = { onPlay(t) },
@@ -4076,6 +4482,7 @@ private fun LibraryScreen(
     val libScope = rememberCoroutineScope()
     var lists by remember { mutableStateOf<List<Playlist>>(emptyList()) }
     var showNew by remember { mutableStateOf(false) }
+    var showLikedFolder by remember { mutableStateOf(false) }
     // Reload every time the tab is visited (menus edit the store directly).
     LaunchedEffect(active) {
         if (active) {
@@ -4191,22 +4598,35 @@ private fun LibraryScreen(
                 }
             }
         }
-        item { SectionHeader("Liked Songs") }
-        if (liked.isEmpty()) {
+        item { SectionHeader("Recently Played") }
+        if (recent.isEmpty()) {
             item {
-                Text("Nothing liked yet — tap the heart on any song.",
+                Text("Play something and it shows up here.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp))
             }
         } else {
-            items(liked, key = { it.id }) { t ->
-                TrackRow(
-                    track = t, isCurrent = false, liked = true,
-                    onPlay = { onPlay(t) },
-                    onPlayNext = { onPlayNext(t) },
-                    onAddQueue = { onAddQueue(t) },
-                    onToggleLike = { onToggleLike(t) }
+            // Top, one per row, playlist-style big rows (2.5x art).
+            itemsIndexed(recent, key = { i, x -> "$i-${x.id}" }) { _, t ->
+                ListItem(
+                    headlineContent = {
+                        Text(t.title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    },
+                    supportingContent = {
+                        Text(t.artist, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    },
+                    leadingContent = { TrackArt(t.thumbUrl, t.id.hashCode(), 84.dp, 16.dp) },
+                    trailingContent = {
+                        TrackMenu(
+                            track = t, liked = likedOf(t),
+                            onPlay = { onPlay(t) },
+                            onPlayNext = { onPlayNext(t) },
+                            onAddQueue = { onAddQueue(t) },
+                            onToggleLike = { onToggleLike(t) }
+                        )
+                    },
+                    modifier = Modifier.clickable { onPlay(t) }
                 )
             }
         }
@@ -4225,45 +4645,86 @@ private fun LibraryScreen(
                 }
             }
         }
-        if (lists.isEmpty()) {
-            item {
-                Text("No playlists yet — make one, or add songs from any menu.",
+        // Liked Songs folder + user playlists: 2 in a row, 2.5x art (130dp).
+        item {
+            val allFolders = ArrayList<Playlist>()
+            try {
+                allFolders.add(
+                    Playlist(
+                        id = "__liked__",
+                        name = "Liked Songs",
+                        tracks = try {
+                            liked
+                        } catch (e: Exception) {
+                            emptyList()
+                        },
+                        createdAt = 0L
+                    )
+                )
+            } catch (e: Exception) {
+            }
+            try {
+                allFolders.addAll(lists)
+            } catch (e: Exception) {
+            }
+            if (allFolders.size <= 1 && lists.isEmpty()) {
+                Text(
+                    "No playlists yet — make one, or add songs from any menu.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp))
-            }
-        } else {
-            items(lists, key = { it.id }) { p ->
-                ListItem(
-                    headlineContent = { Text(p.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                    supportingContent = { Text("${p.tracks.size} songs") },
-                    leadingContent = { MosaicArt(p.tracks, 52.dp, 8.dp) },
-                    trailingContent = {
-                        IconButton(onClick = { onOpenPlaylist(p.id) }) {
-                            Icon(Icons.Filled.ChevronRight, contentDescription = "Open")
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)
+                )
+            } else {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+                    allFolders.chunked(2).forEach { row ->
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            row.forEach { p ->
+                                val isLikedFolder = p.id == "__liked__"
+                                Column(
+                                    Modifier.weight(1f)
+                                        .clip(RoundedCornerShape(16.dp))
+                                        .clickable {
+                                            try {
+                                                if (isLikedFolder) {
+                                                    showLikedFolder = true
+                                                } else {
+                                                    onOpenPlaylist(p.id)
+                                                }
+                                            } catch (e: Exception) {
+                                            }
+                                        }
+                                ) {
+                                    if (isLikedFolder) {
+                                        LikedFolderArt(
+                                            count = p.tracks.size,
+                                            size = 130.dp
+                                        )
+                                    } else {
+                                        MosaicArt(p.tracks, 130.dp, 16.dp)
+                                    }
+                                    Spacer(Modifier.height(8.dp))
+                                    Text(
+                                        p.name,
+                                        style = MaterialTheme.typography.titleMedium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        "${p.tracks.size} songs",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1
+                                    )
+                                    Spacer(Modifier.height(12.dp))
+                                }
+                            }
+                            if (row.size == 1) Spacer(Modifier.weight(1f))
                         }
-                    },
-                    modifier = Modifier.clickable { onOpenPlaylist(p.id) }
-                )
-            }
-        }
-        item { SectionHeader("Recently Played") }
-        if (recent.isEmpty()) {
-            item {
-                Text("Play something and it shows up here.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp))
-            }
-        } else {
-            items(recent, key = { it.id }) { t ->
-                TrackRow(
-                    track = t, isCurrent = false, liked = likedOf(t),
-                    onPlay = { onPlay(t) },
-                    onPlayNext = { onPlayNext(t) },
-                    onAddQueue = { onAddQueue(t) },
-                    onToggleLike = { onToggleLike(t) }
-                )
+                    }
+                }
             }
         }
     }
@@ -4271,16 +4732,97 @@ private fun LibraryScreen(
         NewPlaylistSheet(
             onCreate = { n ->
                 libScope.launch(Dispatchers.IO) {
-                    try {
+                    val reloaded = try {
                         PlaylistStore.create(ctx, n)
-                        lists = PlaylistStore.list(ctx)
+                        PlaylistStore.list(ctx)
+                    } catch (e: Exception) {
+                        try {
+                            PlaylistStore.list(ctx)
+                        } catch (ignored: Exception) {
+                            emptyList()
+                        }
+                    }
+                    try {
+                        withContext(Dispatchers.Main) {
+                            lists = reloaded
+                            showNew = false
+                        }
                     } catch (e: Exception) {
                     }
-                    showNew = false
                 }
             },
             onDismiss = { showNew = false }
         )
+    }
+    // Liked Songs folder (virtual playlist, not in PlaylistStore).
+    if (showLikedFolder) {
+        val likedPl = try {
+            Playlist(
+                id = "__liked__",
+                name = "Liked Songs",
+                tracks = liked,
+                createdAt = 0L
+            )
+        } catch (e: Exception) {
+            Playlist("__liked__", "Liked Songs", emptyList(), 0L)
+        }
+        PlaylistSheet(
+            playlist = likedPl,
+            isCurrentId = { false },
+            likedOf = { true },
+            onPlayList = { list, idx, _ ->
+                try {
+                    if (list.isNotEmpty()) onPlay(list[idx.coerceIn(list.indices)])
+                } catch (e: Exception) {
+                }
+            },
+            onPlayNext = onPlayNext,
+            onAddQueue = onAddQueue,
+            onToggleLike = onToggleLike,
+            onRemove = { t ->
+                try {
+                    onToggleLike(t)
+                } catch (e: Exception) {
+                }
+            },
+            onAddSuggested = { t ->
+                try {
+                    onPlay(t)
+                } catch (e: Exception) {
+                }
+            },
+            onDeletePlaylist = {},
+            onDismiss = { showLikedFolder = false }
+        )
+    }
+}
+
+/** Big heart-gradient art for the Liked Songs folder (130dp, 2.5x). */
+@Composable
+private fun LikedFolderArt(count: Int, size: Dp) {
+    Box(
+        Modifier.size(size).clip(RoundedCornerShape(16.dp))
+            .background(
+                Brush.linearGradient(
+                    listOf(Color(0xFFFA243C), Color(0xFF7D0018))
+                )
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Icon(
+                Icons.Filled.Favorite,
+                contentDescription = null,
+                tint = Color.White.copy(alpha = 0.95f),
+                modifier = Modifier.size(size * 0.34f)
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "$count",
+                style = MaterialTheme.typography.titleMedium,
+                color = Color.White.copy(alpha = 0.9f)
+            )
+        }
     }
 }
 
@@ -4435,7 +4977,7 @@ private fun SearchScreen(
             }
             Spacer(Modifier.height(8.dp))
         }
-        items(results, key = { it.id }) { t ->
+        itemsIndexed(results, key = { i, x -> "$i-${x.id}" }) { _, t ->
             TrackRow(
                 track = t, isCurrent = false, liked = likedOf(t),
                 onPlay = { onPlay(t) },
@@ -4483,7 +5025,7 @@ private fun SectionHeader(
     }
 }
 
-/** Top Picks 2-row wide grid (YT Music quick-picks style). */
+/** Top Picks 2-row wide grid (YT Music quick-picks style), 2X sized. */
 @Composable
 private fun TopPicksGrid(
     tracks: List<YtTrack>,
@@ -4493,21 +5035,22 @@ private fun TopPicksGrid(
     LazyHorizontalGrid(
         rows = GridCells.Fixed(2),
         contentPadding = PaddingValues(horizontal = 16.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-        modifier = Modifier.height(152.dp).fillMaxWidth()
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+        modifier = Modifier.height(304.dp).fillMaxWidth()
     ) {
-        items(tracks, key = { it.id }) { t ->
+        itemsIndexed(tracks, key = { i, x -> "$i-${x.id}" }) { _, t ->
             Row(
-                Modifier.width(240.dp).clickable { onPlay(t) },
+                Modifier.width(320.dp).clickable { onPlay(t) },
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                TrackArt(t.thumbUrl, t.id.hashCode(), 64.dp, 8.dp)
-                Spacer(Modifier.width(10.dp))
+                TrackArt(t.thumbUrl, t.id.hashCode(), 128.dp, 16.dp)
+                Spacer(Modifier.width(14.dp))
                 Column(Modifier.weight(1f)) {
-                    Text(t.title, style = MaterialTheme.typography.bodyMedium,
-                        maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text(t.artist, style = MaterialTheme.typography.bodySmall,
+                    Text(t.title, style = MaterialTheme.typography.titleMedium,
+                        maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    Spacer(Modifier.height(4.dp))
+                    Text(t.artist, style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }

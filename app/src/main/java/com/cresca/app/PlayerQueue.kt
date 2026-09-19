@@ -339,22 +339,52 @@ class PlayerQueue(
             .build()
     }
 
-    // Buffer the upcoming track behind the current one: ExoPlayer then
-    // flips gaplessly on auto-advance, and manual next() is instant.
+    // Buffer upcoming tracks behind current: ExoPlayer flips gaplessly on
+    // auto-advance, and manual next() is instant (even 2 rapid skips).
+    // Keeps up to 2 primed ahead: [current, next, next+1].
     suspend fun primeNext() {
         if (items.isEmpty() || currentIndex == -1) return
         if (repeatModeState == Player.REPEAT_MODE_ONE) return
-        if (player.mediaItemCount != 1) return
-        val idx = peekNextIndex() ?: return
-        val t = items.getOrNull(idx) ?: return
-        if (t.watchUrl.isBlank()) return
         try {
-            val url = YoutubeRepository.audioUrl(t.watchUrl)
-            if (url == null) return
-            if (player.mediaItemCount != 1) return
-            if (peekNextIndex() != idx) return
-            player.addMediaItem(mediaItemFor(t, url))
+            // Prime while fewer than 3 buffered (covers double-skip).
+            while (player.mediaItemCount < 3) {
+                val idx = peekIndexAhead(player.mediaItemCount - 1) ?: return
+                val t = items.getOrNull(idx) ?: return
+                if (t.watchUrl.isBlank()) return
+                val url = try {
+                    YoutubeRepository.audioUrl(t.watchUrl)
+                } catch (e: Exception) {
+                    null
+                } ?: return
+                // Race guard: queue moved while resolving.
+                if (peekIndexAhead(player.mediaItemCount - 1) != idx) return
+                try {
+                    player.addMediaItem(mediaItemFor(t, url))
+                } catch (e: Exception) {
+                    return
+                }
+            }
         } catch (e: Exception) {
+        }
+    }
+
+    /** Index N steps ahead in play order (0 = immediate next). */
+    private fun peekIndexAhead(ahead: Int): Int? {
+        try {
+            if (items.isEmpty() || currentIndex == -1) return null
+            if (repeatModeState == Player.REPEAT_MODE_ONE) {
+                return if (ahead == 0) currentIndex else null
+            }
+            val pos = order.indexOf(currentIndex)
+            if (pos == -1) return null
+            val target = pos + 1 + ahead
+            if (target <= order.lastIndex) return order[target]
+            if (repeatModeState == Player.REPEAT_MODE_ALL && order.isNotEmpty()) {
+                return order[target % order.size]
+            }
+            return null
+        } catch (e: Exception) {
+            return null
         }
     }
 

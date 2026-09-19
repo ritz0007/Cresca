@@ -8,10 +8,11 @@ import androidx.media3.datasource.cache.SimpleCache
 import java.io.File
 
 /**
- * On-disk ExoPlayer cache (SimpMusic pattern, simplified):
+ * On-disk ExoPlayer cache:
  * streamed audio bytes are reused on replay / prefetch / offline-ish
  * replay, so playback is smooth and non-stop even on flaky networks.
- * 300 MB LRU in cacheDir/exoplayer.
+ * 3 GB LRU in cacheDir/exoplayer (strong cache: upcoming + taste-
+ * predicted songs live here, skip feels instant).
  */
 object ExoCache {
     private const val TAG = "ExoCache"
@@ -33,7 +34,7 @@ object ExoCache {
             StandaloneDatabaseProvider(ctx.applicationContext)
         }
         val cache = SimpleCache(
-            dir, LeastRecentlyUsedCacheEvictor(300L * 1024L * 1024L), db
+            dir, LeastRecentlyUsedCacheEvictor(3L * 1024L * 1024L * 1024L), db
         )
         instance = cache
         return cache
