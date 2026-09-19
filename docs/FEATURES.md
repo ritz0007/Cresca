@@ -16,20 +16,25 @@ Play, Play next, Add to queue, Add to playlist, Download, Like, Share
 (system sheet), Open in YouTube.
 
 ## Full player
-Artwork, seek bar with times, shuffle / prev / play / next / repeat
- (off/all/one), Video toggle, Like, Queue, Download, karaoke lyrics with
-auto-scroll. Mini-player shows equalizer bars, red play button and progress
-hairline, mirrors honest ExoPlayer state (loading spinner, error text) and
-opens the sheet on tap.
+Artwork merged into a blurred dominant-color lava background, karaoke
+ticker above the title, sleek glowing seek bar (tap or drag), credits card
+(plays/likes/release/duration/source), shuffle / prev / play / next /
+repeat (off/all/one), Video toggle, Like, Queue, Download, karaoke lyrics
+with auto-scroll. Mini-player shows equalizer bars, red play button and
+progress bar, mirrors honest ExoPlayer state (loading spinner, error text)
+and opens the sheet on tap.
 
 ## Up Next queue
 Shuffle keeps the current song first; repeat one replays; repeat all wraps;
-auto-advance on track end; tap-to-play; remove per row.
+gapless auto-advance onto the pre-buffered next track (instant manual skip
+too); tap-to-play; remove per row.
 
 ## Video
-Embedded video driven by the music session (same transport), with expand to
-fullscreen + quality picker. Video options prefetched/cached for instant open.
-Audio pauses underneath in fullscreen.
+Embedded video driven by the music session (same transport: pause/seek/
+prev/next all move the picture), with expand to fullscreen (landscape) +
+quality picker. 1080p via DASH adaptive manifest with caps, muxed fallback
+with per-height options. Audio and video URLs prefetched/cached for
+instant switching.
 
 ## Orientation
 Portrait locked everywhere with no restart on rotate; landscape opens
@@ -47,13 +52,18 @@ delete playlist, and **Suggested** at the bottom computed from the
 playlist's own artists (tap + to add, tap row to preview).
 
 ## Downloads
-Row menu / player button enqueues via system DownloadManager into
-`Music/Cresca`. Library shows the count; Downloads sheet lists size,
-plays offline (no network), deletes cleanly. Replay prefers the file.
+Row menu / player button enqueues via system DownloadManager as
+"Artist - Title" files, into the in-app folder or the device Music folder
+(switchable in Profile). Library shows the count; Downloads sheet lists
+size, plays offline (no network), deletes cleanly. Replay prefers the file.
 
 ## Library
-YouTube session card (sign in/out), Downloads entry, Playlists, Liked Songs
-(heart anywhere), Recently Played. Liked + recents persist on device.
+Profile page (account sign in/out, light/dark/system theme, downloads
+entry, song-cache clear, about), YouTube session card, Playlists, Liked
+Songs (heart anywhere), Recently Played. Liked + recents persist on device.
+Update banner appears here and on home when a newer GitHub release exists.
+Home never shows demo data: loading spinner first, honest offline error
+with Retry, silent refresh when the device regains connectivity.
 
 ## YouTube login
 In-app WebView sign-in; session (cookies + visitor data) stored encrypted;

@@ -34,12 +34,19 @@ Get the APK from [**Releases**](https://github.com/ritz0007/Cresca/releases)
 
 - **Listen Now home** — live song rails, New Releases, Moods, instant cache loads
 - **Real YouTube audio** — search + signature-deciphered streams, Media3 playback
-- **Full player** — shuffle, repeat (off/all/one), queue, seek, like, video toggle
-- **Up Next queue** — shuffle-aware order, auto-advance, tap-to-play, remove
-- **Music videos** — embedded player driven by the music transport, expand + quality
-- **Karaoke lyrics** — synced line highlighting + auto-scroll (lrclib + lyrics.ovh)
+- **Full player** — blurred artwork + dominant-color lava wash, karaoke
+  ticker above the title, sleek glowing seek bar, credits card, shuffle,
+  repeat (off/all/one), queue, seek, like, video toggle
+- **Up Next queue** — shuffle-aware order, gapless auto-advance, tap-to-play
+- **Music videos** — embedded player driven by the music transport, expand +
+  quality (1080p DASH adaptive, muxed fallback)
+- **Karaoke lyrics** — fuzzy multi-source search, synced highlighting +
+  auto-scroll
 - **Playlists** — create, add, remove, Spotify-style screen, smart suggestions
-- **Downloads** — system downloader, offline library, offline-first playback
+- **Downloads** — "Artist - Title" files, in-app or device Music folder,
+  offline library, offline-first playback
+- **Library** — profile page (account, light/dark/system theme, downloads,
+  clear cache), update checker banner, liked, recents
 - **YouTube login** — in-app sign-in, encrypted on-device session
 - **System integration** — media notification with artwork/controls, lockscreen
   controls, Android 16+ Live Updates chip with live progress
@@ -84,6 +91,7 @@ app/src/main/java/com/cresca/app/
   PlaylistStore.kt       user playlists store
   SongCache.kt           home/search disk cache
   LikedStore.kt          liked songs store
+  UpdateCheck.kt         daily GitHub release poll + update banner
   ui/theme/              palette, type, theme
 ```
 
