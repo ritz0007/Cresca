@@ -45,9 +45,9 @@ class LyricsGapsTest {
         assertEquals(3, rows.size)
         val dots = rows[1] as LyricRow.Dots
         assertEquals(1, dots.dotCount)
-        // 1s darkening hold: dots start 1s after prev line.
+        // 1s darkening hold + 1s bright-hold: [1000, 2000).
         assertEquals(1000L, dots.fromMs)
-        assertEquals(3000L, dots.toMs)
+        assertEquals(2000L, dots.toMs)
     }
 
     @Test
@@ -56,10 +56,10 @@ class LyricsGapsTest {
         val dots = rows[1] as LyricRow.Dots
         assertEquals(2, dots.dotCount)
         assertEquals(1000L, dots.fromMs)
-        assertEquals(5000L, dots.toMs)
-        // Split: each dot owns half the window (2000ms each).
+        assertEquals(4000L, dots.toMs)
+        // Split: each dot owns half the window (1500ms each).
         val span = dots.toMs - dots.fromMs
-        assertEquals(4000L, span)
+        assertEquals(3000L, span)
     }
 
     @Test
@@ -67,6 +67,8 @@ class LyricsGapsTest {
         val rows = buildLyricRows(listOf(line(0, "a"), line(8000, "b")))
         val dots = rows[1] as LyricRow.Dots
         assertEquals(3, dots.dotCount)
+        assertEquals(1000L, dots.fromMs)
+        assertEquals(7000L, dots.toMs)
     }
 
     @Test
@@ -74,11 +76,12 @@ class LyricsGapsTest {
         val rows = buildLyricRows(listOf(line(0, "a"), line(8000, "b")))
         // Line a active in [0,1000).
         assertTrue(activeRowIndex(rows, 0, 500).let { rows[it] is LyricRow.Line })
-        // Dots active in [1000,8000).
+        // Dots fill in [1000,7000), bright-hold [7000,8000).
         val dotsIdx = activeRowIndex(rows, 0, 2000)
         assertTrue(rows[dotsIdx] is LyricRow.Dots)
-        assertTrue(rows[activeRowIndex(rows, 0, 7999)] is LyricRow.Dots)
-        // Next line exactly at its timestamp (after dots).
+        assertTrue(rows[activeRowIndex(rows, 0, 6999)] is LyricRow.Dots)
+        assertTrue(rows[activeRowIndex(rows, 0, 7500)] is LyricRow.Dots)
+        // Next line exactly at its timestamp (after the 1s hold).
         val nextIdx = activeRowIndex(rows, 1, 8000)
         assertTrue(rows[nextIdx] is LyricRow.Line)
         assertEquals(1, (rows[nextIdx] as LyricRow.Line).index)
@@ -91,23 +94,24 @@ class LyricsGapsTest {
         assertFalse(isDotsActiveAfter(rows, 0, 500))
         // At 1500ms: dots took over -> line should dim.
         assertTrue(isDotsActiveAfter(rows, 0, 1500))
-        // After dots: no longer dots-active.
+        // Bright-hold second still dots-active; lyric only at 8000.
+        assertTrue(isDotsActiveAfter(rows, 0, 7500))
         assertFalse(isDotsActiveAfter(rows, 0, 8000))
     }
 
     @Test
     fun dotsFill_splitsEvenly() {
-        // 2 dots over [1000,5000): dot0 fills at 3000, dot1 at 5000.
+        // 2 dots over [1000,4000): dot0 fills at 2500, dot1 at 4000.
         val from = 1000L
-        val to = 5000L
+        val to = 4000L
         val total = 2
         fun filledAt(pos: Long): Int {
             val frac = ((pos - from).toFloat() / (to - from).toFloat()).coerceIn(0f, 1f)
             return (frac * total).toInt().coerceIn(0, total)
         }
         assertEquals(0, filledAt(1000))
-        assertEquals(1, filledAt(3000))
-        assertEquals(2, filledAt(5000))
+        assertEquals(1, filledAt(2500))
+        assertEquals(2, filledAt(4000))
     }
 
     @Test

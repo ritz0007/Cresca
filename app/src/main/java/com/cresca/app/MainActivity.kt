@@ -67,6 +67,7 @@ import androidx.core.view.WindowCompat
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.Dp
@@ -215,13 +216,26 @@ class MainActivity : ComponentActivity() {
             themeMode = getPreferences(MODE_PRIVATE).getString("theme", "system") ?: "system"
         } catch (e: Exception) {
         }
-        // Media notification needs this on Android 13+.
+        // Media notification needs this on Android 13+; Live Updates chip
+        // needs the promoted permission on Android 16+ (else the card
+        // never promotes and actions stay hidden in the drawer).
         try {
             if (android.os.Build.VERSION.SDK_INT >= 33 &&
                 checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
                 android.content.pm.PackageManager.PERMISSION_GRANTED
             ) {
                 notifPerm.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+            }
+        } catch (e: Exception) {
+        }
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= 36) {
+                val promoted = "android.permission.POST_PROMOTED_NOTIFICATIONS"
+                if (checkSelfPermission(promoted) !=
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                ) {
+                    notifPerm.launch(promoted)
+                }
             }
         } catch (e: Exception) {
         }
@@ -1743,7 +1757,8 @@ fun AppleMusicAppContent(
         }
     }
 
-    // Update check: once a day, silent unless a newer release exists.
+    // Update check: once a day — in-app banner AND system notification
+    // (the old flow was banner-only and easily missed).
     var update by remember { mutableStateOf<UpdateCheck.Update?>(null) }
     LaunchedEffect(Unit) {
         try {
@@ -1756,6 +1771,10 @@ fun AppleMusicAppContent(
                 UpdateCheck.isNewer(UpdateCheck.currentVersion(context), latest.tag)
             ) {
                 update = latest
+                try {
+                    UpdateNotify.notifyIfNewer(context, latest)
+                } catch (e: Exception) {
+                }
             }
         } catch (e: Exception) {
         }
@@ -2209,6 +2228,56 @@ fun AppleMusicAppContent(
     }
 }
 
+/** Single source for song name + live lyric, overlaid on art AND video. */
+@Composable
+private fun androidx.compose.foundation.layout.BoxScope.ThumbnailOverlay(
+    track: YtTrack,
+    lyrics: LyricsState,
+    position: Long
+) {
+    val line = try {
+        if (lyrics is LyricsState.Synced) {
+            val ls = lyrics.lines
+            ls.indexOfLast { it.ms <= position }
+                .takeIf { it >= 0 }?.let { ls[it].text } ?: ""
+        } else ""
+    } catch (e: Exception) {
+        ""
+    }
+    Column(
+        Modifier.align(Alignment.BottomStart)
+            .fillMaxWidth()
+            .padding(start = 20.dp, end = 20.dp, bottom = 14.dp),
+        horizontalAlignment = Alignment.Start
+    ) {
+        if (line.isNotBlank()) {
+            Text(
+                line,
+                style = MaterialTheme.typography.bodyMedium.copy(
+                    fontWeight = FontWeight.SemiBold
+                ),
+                color = MaterialTheme.colorScheme.primary,
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(bottom = 4.dp)
+            )
+        }
+        Text(
+            track.title,
+            style = MaterialTheme.typography.titleLarge.copy(
+                fontWeight = FontWeight.Bold
+            ),
+            color = Color.White,
+            maxLines = 2, overflow = TextOverflow.Ellipsis
+        )
+        Text(
+            track.artist,
+            style = MaterialTheme.typography.bodyMedium,
+            color = Color.White.copy(alpha = 0.75f),
+            maxLines = 1, overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalHazeMaterialsApi::class)
 @Composable
 private fun FullPlayerSheet(
@@ -2293,6 +2362,23 @@ private fun FullPlayerSheet(
                             onQuality = onQuality,
                             modifier = Modifier.fillMaxSize()
                         )
+                        // Same song name + live lyrics overlay as artwork mode
+                        // (scrim behind for readability over video frames).
+                        Box(
+                            Modifier.fillMaxSize()
+                                .background(
+                                    Brush.verticalGradient(
+                                        0f to Color.Transparent,
+                                        0.55f to Color.Transparent,
+                                        1f to Color(0xFF121212)
+                                    )
+                                )
+                        )
+                        ThumbnailOverlay(
+                            track = track,
+                            lyrics = lyrics,
+                            position = position
+                        )
                     }
                 } else {
                     val actx = LocalContext.current
@@ -2335,48 +2421,12 @@ private fun FullPlayerSheet(
                                 )
                         )
                         // Song name + live lyrics ON the thumbnail (bottom
-                        // blacked-out scrim): previously shown only below.
-                        val overlayLyric = try {
-                            if (lyrics is LyricsState.Synced) {
-                                val ls = (lyrics as LyricsState.Synced).lines
-                                ls.indexOfLast { it.ms <= position }
-                                    .takeIf { it >= 0 }?.let { ls[it].text } ?: ""
-                            } else ""
-                        } catch (e: Exception) {
-                            ""
-                        }
-                        Column(
-                            Modifier.align(Alignment.BottomStart)
-                                .fillMaxWidth()
-                                .padding(start = 20.dp, end = 20.dp, bottom = 14.dp),
-                            horizontalAlignment = Alignment.Start
-                        ) {
-                            if (overlayLyric.isNotBlank()) {
-                                Text(
-                                    overlayLyric,
-                                    style = MaterialTheme.typography.bodyMedium.copy(
-                                        fontWeight = FontWeight.SemiBold
-                                    ),
-                                    color = MaterialTheme.colorScheme.primary,
-                                    maxLines = 1, overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.padding(bottom = 4.dp)
-                                )
-                            }
-                            Text(
-                                track.title,
-                                style = MaterialTheme.typography.titleLarge.copy(
-                                    fontWeight = FontWeight.Bold
-                                ),
-                                color = Color.White,
-                                maxLines = 2, overflow = TextOverflow.Ellipsis
-                            )
-                            Text(
-                                track.artist,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = Color.White.copy(alpha = 0.75f),
-                                maxLines = 1, overflow = TextOverflow.Ellipsis
-                            )
-                        }
+                        // blacked-out scrim): single source of truth.
+                        ThumbnailOverlay(
+                            track = track,
+                            lyrics = lyrics,
+                            position = position
+                        )
                     }
                 }
             }
@@ -2386,13 +2436,8 @@ private fun FullPlayerSheet(
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Spacer(Modifier.height(16.dp))
-                // Title/artist stay here for the scrolled state; the live
-                // lyric ticker lives ON the thumbnail overlay above.
-                Text(track.title, style = MaterialTheme.typography.titleLarge,
-                    maxLines = 2, overflow = TextOverflow.Ellipsis)
-                Text(track.artist, style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Spacer(Modifier.height(8.dp))
+                // Song name + live lyric live ONLY on the thumbnail/video
+                // overlay above (single source, no duplicates below).
                 SleekBar(positionMs = position, durationMs = duration, onSeek = onSeek)
                 if (error != null) {
                     Text(error, style = MaterialTheme.typography.bodySmall,
@@ -3460,7 +3505,17 @@ private fun ListenNowScreen(
             }
         }
     }
-    val nested = remember(listState, refreshing) {
+    // Slow release without fling: finger lifts past threshold -> refresh.
+    LaunchedEffect(listState.isScrollInProgress, pullPx) {
+        try {
+            if (!listState.isScrollInProgress && pullPx > 200f && !refreshing && !loading) {
+                pullPx = 0f
+                onRefresh()
+            }
+        } catch (e: Exception) {
+        }
+    }
+    val nested = remember(listState, refreshing, loading) {
         object : NestedScrollConnection {
             override fun onPreScroll(
                 available: Offset,
@@ -3473,10 +3528,10 @@ private fun ListenNowScreen(
                     } catch (e: Exception) {
                         true
                     }
-                    if (atTop && source == NestedScrollSource.Drag &&
-                        available.y > 0 && !refreshing && !loading
-                    ) {
-                        pullPx = (pullPx + available.y * 0.45f).coerceIn(0f, 340f)
+                    // Accept every input source (Drag is deprecated alias of
+                    // UserInput on newer Compose; old check never matched).
+                    if (atTop && available.y > 0 && !refreshing && !loading) {
+                        pullPx = (pullPx + available.y * 0.6f).coerceIn(0f, 340f)
                         // Consume so the list stays pinned while pulling.
                         return available
                     }
@@ -3492,17 +3547,36 @@ private fun ListenNowScreen(
 
             override suspend fun onPreFling(available: Velocity): Velocity {
                 try {
-                    // Hard pull threshold (~220px): release to refresh.
-                    if (pullPx > 220f && !refreshing && !loading) {
+                    // Hard pull threshold (~200px): release to refresh.
+                    if (pullPx > 200f && !refreshing && !loading) {
+                        pullPx = 0f
+                        try {
+                            onRefresh()
+                        } catch (e: Exception) {
+                        }
+                    } else {
+                        pullPx = 0f
+                    }
+                } catch (e: Exception) {
+                }
+                return super.onPreFling(available)
+            }
+
+            override suspend fun onPostFling(
+                consumed: Velocity,
+                available: Velocity
+            ): Velocity {
+                try {
+                    if (pullPx > 200f && !refreshing && !loading) {
+                        pullPx = 0f
                         try {
                             onRefresh()
                         } catch (e: Exception) {
                         }
                     }
-                    pullPx = 0f
                 } catch (e: Exception) {
                 }
-                return super.onPreFling(available)
+                return super.onPostFling(consumed, available)
             }
         }
     }
@@ -3635,14 +3709,16 @@ private fun ListenNowScreen(
                 }
             )
         }
-        val recentShown = recent.ifEmpty { tracks.take(6) }
-        itemsIndexed(recentShown, key = { i, x -> "$i-${x.id}" }) { _, t ->
-            TrackRow(
-                track = t, isCurrent = false, liked = likedOf(t),
-                onPlay = { onPlay(t) },
-                onPlayNext = { onPlayNext(t) },
-                onAddQueue = { onAddQueue(t) },
-                onToggleLike = { onToggleLike(t) }
+        // Recently Played cascade: 4 songs per column, new columns
+        // scroll horizontally (never long vertical rows).
+        item {
+            RecentCascade(
+                tracks = recent.ifEmpty { tracks }.take(16),
+                likedOf = likedOf,
+                onPlay = onPlay,
+                onPlayNext = onPlayNext,
+                onAddQueue = onAddQueue,
+                onToggleLike = onToggleLike
             )
         }
         if (fresh.isNotEmpty()) {
@@ -3759,7 +3835,7 @@ private fun ListenNowScreen(
     // Pull indicator: grows with the hard pull, spins while refreshing.
     if (pullPx > 8f || refreshing) {
         val p = try {
-            (pullPx / 220f).coerceIn(0f, 1f)
+            (pullPx / 200f).coerceIn(0f, 1f)
         } catch (e: Exception) {
             0f
         }
@@ -3784,7 +3860,7 @@ private fun ListenNowScreen(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                } else if (pullPx > 220f) {
+                } else if (pullPx > 200f) {
                     Text(
                         "Release to refresh",
                         style = MaterialTheme.typography.bodySmall,
@@ -3812,7 +3888,9 @@ private fun TrackRow(
     onPlay: () -> Unit,
     onPlayNext: () -> Unit,
     onAddQueue: () -> Unit,
-    onToggleLike: () -> Unit
+    onToggleLike: () -> Unit,
+    compact: Boolean = false,
+    modifier: Modifier = Modifier
 ) {
     ListItem(
         headlineContent = {
@@ -3820,8 +3898,13 @@ private fun TrackRow(
                 color = if (isCurrent) MaterialTheme.colorScheme.primary
                 else MaterialTheme.colorScheme.onSurface)
         },
-        supportingContent = { Text(track.artist) },
-        leadingContent = { TrackArt(track.thumbUrl, track.id.hashCode(), 52.dp, 8.dp) },
+        supportingContent = { Text(track.artist, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+        leadingContent = {
+            TrackArt(
+                track.thumbUrl, track.id.hashCode(),
+                if (compact) 44.dp else 52.dp, 8.dp
+            )
+        },
         trailingContent = {
             TrackMenu(
                 track = track, liked = liked, onPlay = onPlay,
@@ -3829,7 +3912,7 @@ private fun TrackRow(
                 onToggleLike = onToggleLike
             )
         },
-        modifier = Modifier.clickable { onPlay() }
+        modifier = modifier.clickable { onPlay() }
     )
 }
 
@@ -5025,7 +5108,47 @@ private fun SectionHeader(
     }
 }
 
-/** Top Picks 2-row wide grid (YT Music quick-picks style), 2X sized. */
+/** Recently Played cascade: 4 songs per column, horizontal columns. */
+@Composable
+private fun RecentCascade(
+    tracks: List<YtTrack>,
+    likedOf: (YtTrack) -> Boolean,
+    onPlay: (YtTrack) -> Unit,
+    onPlayNext: (YtTrack) -> Unit,
+    onAddQueue: (YtTrack) -> Unit,
+    onToggleLike: (YtTrack) -> Unit
+) {
+    if (tracks.isEmpty()) {
+        Text(
+            "Play something and it shows up here.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)
+        )
+        return
+    }
+    LazyHorizontalGrid(
+        rows = GridCells.Fixed(4),
+        contentPadding = PaddingValues(horizontal = 16.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+        modifier = Modifier.height(320.dp).fillMaxWidth()
+    ) {
+        itemsIndexed(tracks, key = { i, x -> "$i-${x.id}" }) { _, t ->
+            TrackRow(
+                track = t, isCurrent = false, liked = likedOf(t),
+                onPlay = { onPlay(t) },
+                onPlayNext = { onPlayNext(t) },
+                onAddQueue = { onAddQueue(t) },
+                onToggleLike = { onToggleLike(t) },
+                compact = true,
+                modifier = Modifier.width(320.dp)
+            )
+        }
+    }
+}
+
+/** Top Picks 2-row grid: album art only + short song name below. */
 @Composable
 private fun TopPicksGrid(
     tracks: List<YtTrack>,
@@ -5036,24 +5159,24 @@ private fun TopPicksGrid(
         rows = GridCells.Fixed(2),
         contentPadding = PaddingValues(horizontal = 16.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-        modifier = Modifier.height(304.dp).fillMaxWidth()
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+        modifier = Modifier.height(420.dp).fillMaxWidth()
     ) {
         itemsIndexed(tracks, key = { i, x -> "$i-${x.id}" }) { _, t ->
-            Row(
-                Modifier.width(320.dp).clickable { onPlay(t) },
-                verticalAlignment = Alignment.CenterVertically
+            Column(
+                Modifier.width(160.dp).clickable { onPlay(t) },
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                TrackArt(t.thumbUrl, t.id.hashCode(), 128.dp, 16.dp)
-                Spacer(Modifier.width(14.dp))
-                Column(Modifier.weight(1f)) {
-                    Text(t.title, style = MaterialTheme.typography.titleMedium,
-                        maxLines = 2, overflow = TextOverflow.Ellipsis)
-                    Spacer(Modifier.height(4.dp))
-                    Text(t.artist, style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }
+                TrackArt(t.thumbUrl, t.id.hashCode(), 160.dp, 20.dp)
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    t.title.take(22),
+                    style = MaterialTheme.typography.bodyMedium.copy(
+                        fontWeight = FontWeight.SemiBold
+                    ),
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center
+                )
             }
         }
     }

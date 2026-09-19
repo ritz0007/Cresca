@@ -69,13 +69,28 @@ class LiveUpdateProvider(ctx: Context) : MediaNotification.Provider {
         extras: Bundle
     ): Boolean {
         try {
-            // Like custom command from the notification custom layout.
-            if (action == "cresca_like" || action == NextActionReceiver.ACTION_LIKE) {
-                try {
-                    NextActionReceiver.onLikeToggle?.invoke()
-                } catch (e: Exception) {
+            when (action) {
+                "cresca_like", NextActionReceiver.ACTION_LIKE -> {
+                    try {
+                        NextActionReceiver.onLikeToggle?.invoke()
+                    } catch (e: Exception) {
+                    }
+                    return true
                 }
-                return true
+                "cresca_next", NextActionReceiver.ACTION_NEXT -> {
+                    try {
+                        NextActionReceiver.onNext?.invoke()
+                    } catch (e: Exception) {
+                    }
+                    return true
+                }
+                "cresca_prev", NextActionReceiver.ACTION_PREV -> {
+                    try {
+                        NextActionReceiver.onPrev?.invoke()
+                    } catch (e: Exception) {
+                    }
+                    return true
+                }
             }
         } catch (e: Exception) {
         }
@@ -162,6 +177,7 @@ class LiveUpdateProvider(ctx: Context) : MediaNotification.Provider {
             val scored = ArrayList<Triple<Int, Int, Notification.Action>>()
             var hasNext = false
             var hasPrev = false
+            var hasLike = false
             var hasPlay = false
             if (actions != null) {
                 for (i in 0 until actions.size) {
@@ -190,12 +206,14 @@ class LiveUpdateProvider(ctx: Context) : MediaNotification.Provider {
                     val low = atitle.toString().lowercase()
                     if (low.contains("next")) hasNext = true
                     if (low.contains("prev")) hasPrev = true
+                    if (low.contains("like")) hasLike = true
                     if (low.startsWith("play") || low.startsWith("pause")) hasPlay = true
                     val rank = when {
                         low.startsWith("play") || low.startsWith("pause") -> 0
                         low.contains("next") -> 1
                         low.contains("prev") -> 2
-                        else -> 3
+                        low.contains("like") -> 3
+                        else -> 4
                     }
                     scored.add(Triple(rank, i, Notification.Action.Builder(aicon, atitle, ai).build()))
                 }
@@ -212,7 +230,9 @@ class LiveUpdateProvider(ctx: Context) : MediaNotification.Provider {
                 scored.add(Triple(2, Int.MAX_VALUE - 1, prevAction()))
                 hasPrev = true
             }
-            scored.add(Triple(3, Int.MAX_VALUE, likeAction()))
+            if (!hasLike) {
+                scored.add(Triple(3, Int.MAX_VALUE, likeAction()))
+            }
             scored.sortWith(compareBy({ it.first }, { it.second }))
             for ((_, _, act) in scored) {
                 builder.addAction(act)

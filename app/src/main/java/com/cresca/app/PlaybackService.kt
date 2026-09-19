@@ -91,10 +91,11 @@ class PlaybackService : MediaSessionService() {
         session = MediaSession.Builder(this, exo)
             .setCallback(SessionCallback())
             .build()
-        // Like button in the system notification on every API level
-        // (custom layout; handled in SessionCallback + provider).
+        // Prev + Like + Next custom buttons: ALWAYS visible in the system
+        // notification on every API level (standard prev/next only appear
+        // when the player buffer holds them; ours resolve via the queue).
         try {
-            session?.setCustomLayout(listOf(likeButton()))
+            session?.setCustomLayout(listOf(prevButton(), likeButton(), nextButton()))
         } catch (e: Exception) {
         }
         exo.addListener(object : Player.Listener {
@@ -159,6 +160,36 @@ class PlaybackService : MediaSessionService() {
         }
     }
 
+    private fun nextButton(): CommandButton {
+        return try {
+            CommandButton.Builder()
+                .setDisplayName("Next")
+                .setIconResId(android.R.drawable.ic_media_next)
+                .setSessionCommand(SessionCommand("cresca_next", Bundle.EMPTY))
+                .build()
+        } catch (e: Exception) {
+            CommandButton.Builder()
+                .setDisplayName("Next")
+                .setSessionCommand(SessionCommand("cresca_next", Bundle.EMPTY))
+                .build()
+        }
+    }
+
+    private fun prevButton(): CommandButton {
+        return try {
+            CommandButton.Builder()
+                .setDisplayName("Previous")
+                .setIconResId(android.R.drawable.ic_media_previous)
+                .setSessionCommand(SessionCommand("cresca_prev", Bundle.EMPTY))
+                .build()
+        } catch (e: Exception) {
+            CommandButton.Builder()
+                .setDisplayName("Previous")
+                .setSessionCommand(SessionCommand("cresca_prev", Bundle.EMPTY))
+                .build()
+        }
+    }
+
     private inner class SessionCallback : MediaSession.Callback {
         override fun onCustomCommand(
             session: MediaSession,
@@ -167,14 +198,34 @@ class PlaybackService : MediaSessionService() {
             args: Bundle
         ): com.google.common.util.concurrent.ListenableFuture<SessionResult> {
             try {
-                if (customCommand.customAction == "cresca_like") {
-                    try {
-                        NextActionReceiver.onLikeToggle?.invoke()
-                    } catch (e: Exception) {
+                when (customCommand.customAction) {
+                    "cresca_like" -> {
+                        try {
+                            NextActionReceiver.onLikeToggle?.invoke()
+                        } catch (e: Exception) {
+                        }
+                        return com.google.common.util.concurrent.Futures.immediateFuture(
+                            SessionResult(SessionResult.RESULT_SUCCESS)
+                        )
                     }
-                    return com.google.common.util.concurrent.Futures.immediateFuture(
-                        SessionResult(SessionResult.RESULT_SUCCESS)
-                    )
+                    "cresca_next" -> {
+                        try {
+                            NextActionReceiver.onNext?.invoke()
+                        } catch (e: Exception) {
+                        }
+                        return com.google.common.util.concurrent.Futures.immediateFuture(
+                            SessionResult(SessionResult.RESULT_SUCCESS)
+                        )
+                    }
+                    "cresca_prev" -> {
+                        try {
+                            NextActionReceiver.onPrev?.invoke()
+                        } catch (e: Exception) {
+                        }
+                        return com.google.common.util.concurrent.Futures.immediateFuture(
+                            SessionResult(SessionResult.RESULT_SUCCESS)
+                        )
+                    }
                 }
             } catch (e: Exception) {
             }

@@ -347,7 +347,7 @@ private fun SyncedLyrics(
                     val filled = (frac * dotsTotal).toInt().coerceIn(0, dotsTotal)
                     val isActiveDots = rows.getOrNull(activeRow) == row
                     val isPastDots = try {
-                        safePos >= row.toMs
+                        safePos >= (row.toMs + LYRIC_HOLD_MS)
                     } catch (e: Exception) {
                         false
                     }
@@ -387,7 +387,7 @@ private fun SyncedLyrics(
                         .padding(vertical = 14.dp)
                         .graphicsLayer(scaleX = dotsScale, scaleY = dotsScale)
                         .alpha(rowAlpha)
-                    if ((isPastDots || isFutureDots) && !manualMode) {
+                    if ((isPastDots || isFutureDots) && !isActiveDots && !manualMode) {
                         rowMod = rowMod.blur(3.dp)
                     }
                     Row(
@@ -461,9 +461,9 @@ internal sealed interface LyricRow {
 }
 
 // Long instrumental gaps become a countdown row between the lines.
-// Dots live in [line.ms + 1s, next.ms) so the sung line darkens 1s after
-// its timestamp, the wait fills dot-by-dot, and the next line fires
-// exactly on time (after the dots).
+// Dots live in [line.ms + 1s, next.ms - 1s): the sung line darkens 1s
+// after its timestamp, the wait fills dot-by-dot, then all dots hold
+// bright for 1 more second before the next line fires.
 internal fun buildLyricRows(lines: List<LyricLine>): List<LyricRow> {
     if (lines.isEmpty()) {
         return emptyList()
@@ -487,7 +487,7 @@ internal fun buildLyricRows(lines: List<LyricLine>): List<LyricRow> {
             val n = dotCountForGap(gap)
             if (n > 0) {
                 val from = ms + LYRIC_HOLD_MS
-                val to = nextMs
+                val to = nextMs - LYRIC_HOLD_MS
                 if (to > from) {
                     out.add(LyricRow.Dots(from, to, n))
                 }
@@ -497,12 +497,15 @@ internal fun buildLyricRows(lines: List<LyricLine>): List<LyricRow> {
     return out
 }
 
-/** Active row: dots win while the position sits inside their window. */
+/**
+ * Active row: dots win while the position sits inside their window PLUS
+ * the 1s bright-hold after the last dot ([from, to + 1s)).
+ */
 internal fun activeRowIndex(rows: List<LyricRow>, activeLineIdx: Int, positionMs: Long): Int {
     if (rows.isEmpty()) return 0
     try {
         rows.forEachIndexed { i, r ->
-            if (r is LyricRow.Dots && positionMs in r.fromMs until r.toMs) return i
+            if (r is LyricRow.Dots && positionMs in r.fromMs until (r.toMs + LYRIC_HOLD_MS)) return i
         }
         rows.forEachIndexed { i, r ->
             if (r is LyricRow.Line && r.index == activeLineIdx) return i
@@ -519,13 +522,14 @@ internal fun activeRowIndex(rows: List<LyricRow>, activeLineIdx: Int, positionMs
     }
 }
 
-/** True when a dots row has taken over after [lineIdx] (line should dim). */
+/** True when a dots row has taken over after [lineIdx] (line should dim).
+ * Covers the fill window plus the 1s bright-hold before the next line. */
 internal fun isDotsActiveAfter(rows: List<LyricRow>, lineIdx: Int, positionMs: Long): Boolean {
     return try {
         val li = rows.indexOfFirst { it is LyricRow.Line && it.index == lineIdx }
         if (li < 0) return false
         val dots = rows.getOrNull(li + 1)
-        dots is LyricRow.Dots && positionMs >= dots.fromMs && positionMs < dots.toMs
+        dots is LyricRow.Dots && positionMs >= dots.fromMs && positionMs < (dots.toMs + LYRIC_HOLD_MS)
     } catch (e: Exception) {
         false
     }
