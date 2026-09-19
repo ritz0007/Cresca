@@ -1476,6 +1476,13 @@ fun AppleMusicAppContent(
                     }
                     Log.i(TAG, "top picks loaded ${res.size} (${seed.query})")
                     loaded = true
+                    // Breathe: let input/anim run between the big first
+                    // composition and the rails burst (software renderers
+                    // can take seconds on 25 fresh images; never hold input).
+                    try {
+                        delay(200)
+                    } catch (e: Exception) {
+                    }
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "top picks failed (attempt $attempt)", e)
@@ -2338,10 +2345,15 @@ private fun FullPlayerSheet(
             targetValue = domColor, animationSpec = tween(800), label = "dom")
         AppleMusicTheme(darkTheme = true) {
         Box(Modifier.fillMaxWidth()) {
-            // Smooth ambience: dominant-color gradient + one slow blob.
+            // Smooth ambience: dominant-color gradient + roaming lava blobs
+            // + bokeh layer. Clean black behind video (no orbs over picture).
             // (The old full-bleed 70dp artwork blur re-rendered every frame
             // and made the sheet feel clingy, especially on weak GPUs.)
-            LavaBackground(base = domAnimated, modifier = Modifier.fillMaxSize())
+            LavaBackground(
+                base = domAnimated,
+                modifier = Modifier.fillMaxSize(),
+                ambient = !videoMode
+            )
             Surface(
                 color = Color.Transparent,
                 contentColor = Color.White,
@@ -2403,8 +2415,9 @@ private fun FullPlayerSheet(
                             onError = { hdOk = false },
                             modifier = Modifier.fillMaxWidth().aspectRatio(1f)
                         )
-                        // Frosted veil above the art: guaranteed blur so the
-                        // name + lyrics stay readable over any artwork.
+                        // Light frosted veil above the art: just enough for the
+                        // overlay text to read over any artwork (dreaminess
+                        // dialled way down from the old heavy blur).
                         AsyncImage(
                             model = coil.request.ImageRequest.Builder(actx)
                                 .data(if (hdOk) hd else thumbUrl)
@@ -2414,8 +2427,8 @@ private fun FullPlayerSheet(
                             contentScale = ContentScale.Crop,
                             onError = { hdOk = false },
                             modifier = Modifier.fillMaxWidth().aspectRatio(1f)
-                                .blur(26.dp),
-                            alpha = 0.5f
+                                .blur(12.dp),
+                            alpha = 0.18f
                         )
                         // Dark scrim melting art into the page.
                         Box(
@@ -3468,12 +3481,18 @@ private suspend fun dominantColor(ctx: android.content.Context, url: String): Co
         }
     }
 
-// One slow drifting blob over the base color: cheap ambient wash.
+// Ambient wash: dominant-color gradient + free-roaming lava blobs +
+// a soft bokeh orb layer floating just above them. Blobs wander the full
+// backdrop on mixed-period x/y drifts (painterly, never robotic); bokeh
+// orbs use radial-gradient discs so they read as blurred light with no
+// blur pass. Behind artwork AND body — never behind video (video mode
+// passes ambient=false for a clean black backdrop).
 @Composable
-private fun LavaBackground(base: Color, modifier: Modifier = Modifier) {
-    val inf = rememberInfiniteTransition(label = "lava")
-    val x1 by inf.animateFloat(0f, 1f,
-        infiniteRepeatable(tween(16000), RepeatMode.Reverse), label = "lx1")
+private fun LavaBackground(
+    base: Color,
+    modifier: Modifier = Modifier,
+    ambient: Boolean = true
+) {
     Box(
         modifier.background(
             Brush.verticalGradient(
@@ -3484,15 +3503,87 @@ private fun LavaBackground(base: Color, modifier: Modifier = Modifier) {
             )
         )
     ) {
+        if (!ambient) return@Box
+        val inf = rememberInfiniteTransition(label = "lava")
+        // 3 lava blobs, full-screen wander (x and y on mismatched periods).
+        val ax by inf.animateFloat(0.05f, 0.95f,
+            infiniteRepeatable(tween(17000), RepeatMode.Reverse), label = "lax")
+        val ay by inf.animateFloat(0.08f, 0.85f,
+            infiniteRepeatable(tween(23000), RepeatMode.Reverse), label = "lay")
+        val bx by inf.animateFloat(0.95f, 0.05f,
+            infiniteRepeatable(tween(21000), RepeatMode.Reverse), label = "lbx")
+        val by by inf.animateFloat(0.15f, 0.90f,
+            infiniteRepeatable(tween(19000), RepeatMode.Reverse), label = "lby")
+        val cx by inf.animateFloat(0.15f, 0.85f,
+            infiniteRepeatable(tween(26000), RepeatMode.Reverse), label = "lcx")
+        val cy by inf.animateFloat(0.80f, 0.10f,
+            infiniteRepeatable(tween(15000), RepeatMode.Reverse), label = "lcy")
+        // 8 bokeh orbs, each on its own wander (small x/y ranges offset so
+        // they scatter everywhere instead of marching together).
+        val bokeh = remember {
+            val rnd = kotlin.random.Random(7)
+            List(8) { i ->
+                val x0 = rnd.nextFloat() * 0.7f
+                val y0 = rnd.nextFloat() * 0.7f
+                BokehSeed(
+                    x0 = x0, x1 = (x0 + 0.25f + rnd.nextFloat() * 0.2f).coerceAtMost(1f),
+                    y0 = y0, y1 = (y0 + 0.25f + rnd.nextFloat() * 0.2f).coerceAtMost(1f),
+                    xDur = 12000 + rnd.nextInt(9000),
+                    yDur = 14000 + rnd.nextInt(9000),
+                    rDp = 9 + rnd.nextInt(26),
+                    white = i % 3 != 0,
+                    alpha = 0.07f + rnd.nextFloat() * 0.08f
+                )
+            }
+        }
+        // animateFloat calls must be unconditional: one per orb axis.
+        val bokehXY = bokeh.mapIndexed { i, s ->
+            val x by inf.animateFloat(s.x0, s.x1,
+                infiniteRepeatable(tween(s.xDur), RepeatMode.Reverse), label = "bx$i")
+            val y by inf.animateFloat(s.y0, s.y1,
+                infiniteRepeatable(tween(s.yDur), RepeatMode.Reverse), label = "by$i")
+            Triple(x, y, s)
+        }
         Canvas(Modifier.fillMaxSize()) {
             val r = size.minDimension * 0.32f
-            drawCircle(base.copy(alpha = 0.45f), r,
-                androidx.compose.ui.geometry.Offset(size.width * x1, size.height * 0.45f))
+                        drawCircle(base.copy(alpha = 0.45f), r,
+                androidx.compose.ui.geometry.Offset(size.width * ax, size.height * ay))
             drawCircle(Color.White.copy(alpha = 0.05f), r * 0.7f,
-                androidx.compose.ui.geometry.Offset(size.width * (1f - x1), size.height * 0.8f))
+                androidx.compose.ui.geometry.Offset(size.width * bx, size.height * by))
+            drawCircle(base.copy(alpha = 0.30f), r * 0.55f,
+                androidx.compose.ui.geometry.Offset(size.width * cx, size.height * cy))
+            // Bokeh layer above the blobs: soft radial discs.
+            for ((fx, fy, s) in bokehXY) {
+                try {
+                    val rad = s.rDp.dp.toPx()
+                    val col = if (s.white) Color.White else base
+                    drawCircle(
+                        brush = Brush.radialGradient(
+                            listOf(col.copy(alpha = s.alpha), col.copy(alpha = 0f)),
+                            center = androidx.compose.ui.geometry.Offset(size.width * fx, size.height * fy),
+                            radius = rad
+                        ),
+                        radius = rad,
+                        center = androidx.compose.ui.geometry.Offset(size.width * fx, size.height * fy)
+                    )
+                } catch (e: Exception) {
+                }
+            }
         }
     }
 }
+
+private data class BokehSeed(
+    val x0: Float,
+    val x1: Float,
+    val y0: Float,
+    val y1: Float,
+    val xDur: Int,
+    val yDur: Int,
+    val rDp: Int,
+    val white: Boolean,
+    val alpha: Float
+)
 
 /** Shazam-like credits card. */
 @Composable
@@ -5532,6 +5623,7 @@ private fun TrackArt(thumbUrl: String, seed: Int, size: Dp, corner: Dp = 8.dp) {
         AsyncImage(
             model = coil.request.ImageRequest.Builder(ctx)
                 .data(thumbUrl)
+                .size(320)
                 .crossfade(true)
                 .build(),
             contentDescription = null,
