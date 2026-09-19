@@ -19,15 +19,13 @@ class LyricsGapsTest {
     fun dotCount_thresholds() {
         assertEquals(0, dotCountForGap(0))
         assertEquals(0, dotCountForGap(2999))
-        assertEquals(1, dotCountForGap(3000))
-        assertEquals(1, dotCountForGap(3500))
-        assertEquals(1, dotCountForGap(3999))
-        assertEquals(2, dotCountForGap(4000))
-        assertEquals(2, dotCountForGap(5000))
+        assertEquals(0, dotCountForGap(3000))
+        assertEquals(0, dotCountForGap(4999))
+        assertEquals(1, dotCountForGap(5000))
+        assertEquals(1, dotCountForGap(5999))
         assertEquals(2, dotCountForGap(6000))
-        assertEquals(2, dotCountForGap(6999))
-        assertEquals(2, dotCountForGap(7000))
-        assertEquals(3, dotCountForGap(7001))
+        assertEquals(2, dotCountForGap(9000))
+        assertEquals(3, dotCountForGap(9001))
         assertEquals(3, dotCountForGap(10000))
         assertEquals(3, dotCountForGap(15000))
         assertEquals(3, dotCountForGap(120000))
@@ -36,78 +34,78 @@ class LyricsGapsTest {
 
     @Test
     fun buildRows_noDotsForShortGaps() {
-        // Every gap < 3s: no dots anywhere (intro/outro need duration).
+        // Normal line gaps (< 5s) stay clean: no dots anywhere.
         val rows = buildLyricRows(
-            listOf(line(0, "a"), line(2000, "b"), line(4000, "c")),
-            6000L
+            listOf(line(0, "a"), line(2000, "b"), line(4000, "c"), line(7000, "d")),
+            9000L
         )
         assertTrue(rows.all { it is LyricRow.Line })
-        assertEquals(3, rows.size)
+        assertEquals(4, rows.size)
     }
 
     @Test
-    fun buildRows_oneDotFor3s() {
-        val rows = buildLyricRows(listOf(line(0, "a"), line(3000, "b")))
+    fun buildRows_oneDotFor5s() {
+        val rows = buildLyricRows(listOf(line(0, "a"), line(5000, "b")))
         assertEquals(3, rows.size)
         val dots = rows[1] as LyricRow.Dots
         assertEquals(1, dots.dotCount)
-        // Fill over [0, 2000): dot completes in 2s, 1s hold, then lyric.
+        // Fill over [0, 4000): dot completes in 4s, 1s hold, then lyric.
         assertEquals(0L, dots.fromMs)
-        assertEquals(2000L, dots.toMs)
+        assertEquals(4000L, dots.toMs)
     }
 
     @Test
-    fun buildRows_twoDotsFor5s_split() {
-        val rows = buildLyricRows(listOf(line(0, "a"), line(5000, "b")))
+    fun buildRows_twoDotsFor7s_split() {
+        val rows = buildLyricRows(listOf(line(0, "a"), line(7000, "b")))
         val dots = rows[1] as LyricRow.Dots
         assertEquals(2, dots.dotCount)
         assertEquals(0L, dots.fromMs)
-        assertEquals(4000L, dots.toMs)
-        // Split: each dot owns half the window (2000ms each).
+        assertEquals(6000L, dots.toMs)
+        // Split: each dot owns half the window (3000ms each).
         val span = dots.toMs - dots.fromMs
-        assertEquals(4000L, span)
+        assertEquals(6000L, span)
     }
 
     @Test
-    fun buildRows_threeDotsFor8s() {
-        val rows = buildLyricRows(listOf(line(0, "a"), line(8000, "b")))
+    fun buildRows_threeDotsAbove9s() {
+        val rows = buildLyricRows(listOf(line(0, "a"), line(10000, "b")))
         val dots = rows[1] as LyricRow.Dots
         assertEquals(3, dots.dotCount)
         assertEquals(0L, dots.fromMs)
-        assertEquals(7000L, dots.toMs)
+        assertEquals(9000L, dots.toMs)
     }
 
     @Test
     fun buildRows_bands() {
-        // 1 dot: 3s..4s, 2 dots: up to 7s, 3 dots: up to 10s+.
-        assertEquals(0, dotCountForGap(2999))
-        assertEquals(1, dotCountForGap(3000))
-        assertEquals(1, dotCountForGap(3999))
-        assertEquals(2, dotCountForGap(4000))
-        assertEquals(2, dotCountForGap(7000))
-        assertEquals(3, dotCountForGap(7001))
+        // 1 dot ~5s, 2 dots up to 9s, 3 dots above 9s.
+        assertEquals(0, dotCountForGap(4999))
+        assertEquals(1, dotCountForGap(5000))
+        assertEquals(1, dotCountForGap(5999))
+        assertEquals(2, dotCountForGap(6000))
+        assertEquals(2, dotCountForGap(9000))
+        assertEquals(3, dotCountForGap(9001))
         assertEquals(3, dotCountForGap(10000))
         assertEquals(3, dotCountForGap(60000))
     }
 
     @Test
     fun buildRows_introOutro() {
-        // Lead-in: first line at 8s -> dots before it.
-        val intro = buildLyricRows(listOf(line(8000, "a"), line(9000, "b")))
+        // Lead-in: first line at 10s -> dots before it.
+        val intro = buildLyricRows(listOf(line(10000, "a"), line(11000, "b")))
         assertTrue(intro.first() is LyricRow.Dots)
         val lead = intro.first() as LyricRow.Dots
         assertEquals(0L, lead.fromMs)
-        assertEquals(7000L, lead.toMs)
+        assertEquals(9000L, lead.toMs)
         assertEquals(3, lead.dotCount)
         // No lead-in when the song starts singing immediately.
         val noIntro = buildLyricRows(listOf(line(500, "a"), line(1500, "b")))
         assertTrue(noIntro.first() is LyricRow.Line)
-        // Outro: 5s tail after the last line -> dots at the end.
-        val outro = buildLyricRows(listOf(line(0, "a"), line(2000, "b")), 8000L)
+        // Outro: 7s tail after the last line -> dots at the end.
+        val outro = buildLyricRows(listOf(line(0, "a"), line(2000, "b")), 9000L)
         assertTrue(outro.last() is LyricRow.Dots)
         val tail = outro.last() as LyricRow.Dots
         assertEquals(2000L, tail.fromMs)
-        assertEquals(7000L, tail.toMs)
+        assertEquals(8000L, tail.toMs)
         assertEquals(2, tail.dotCount)
         // Short tail: no outro dots.
         val noOutro = buildLyricRows(listOf(line(0, "a"), line(2000, "b")), 4000L)
@@ -116,59 +114,60 @@ class LyricsGapsTest {
 
     @Test
     fun activeRow_handoffUntilFirstDot() {
-        // 3s gap, 1 dot: line lit [0,2000), dot pops at 2000, holds to 3000.
-        val rows = buildLyricRows(listOf(line(0, "a"), line(3000, "b")))
+        // 5s gap, 1 dot over [0,4000): line lit [0,4000), dot pops at
+        // 4000, holds to 5000, lyric fires at 5000.
+        val rows = buildLyricRows(listOf(line(0, "a"), line(5000, "b")))
         assertTrue(rows[activeRowIndex(rows, 0, 500)] is LyricRow.Line)
-        assertTrue(rows[activeRowIndex(rows, 0, 1999)] is LyricRow.Line)
-        assertTrue(rows[activeRowIndex(rows, 0, 2000)] is LyricRow.Dots)
-        assertTrue(rows[activeRowIndex(rows, 0, 2999)] is LyricRow.Dots)
-        val nextIdx = activeRowIndex(rows, 1, 3000)
+        assertTrue(rows[activeRowIndex(rows, 0, 3999)] is LyricRow.Line)
+        assertTrue(rows[activeRowIndex(rows, 0, 4000)] is LyricRow.Dots)
+        assertTrue(rows[activeRowIndex(rows, 0, 4999)] is LyricRow.Dots)
+        val nextIdx = activeRowIndex(rows, 1, 5000)
         assertTrue(rows[nextIdx] is LyricRow.Line)
         assertEquals(1, (rows[nextIdx] as LyricRow.Line).index)
-        assertFalse(isDotsActiveAfter(rows, 0, 1999))
-        assertTrue(isDotsActiveAfter(rows, 0, 2000))
-        assertFalse(isDotsActiveAfter(rows, 0, 3000))
+        assertFalse(isDotsActiveAfter(rows, 0, 3999))
+        assertTrue(isDotsActiveAfter(rows, 0, 4000))
+        assertFalse(isDotsActiveAfter(rows, 0, 5000))
     }
 
     @Test
     fun activeRow_dotsWinDuringWait() {
-        // 8s gap, 3 dots over [0,7000): handoff at 7000/3 ≈ 2333.
-        val rows = buildLyricRows(listOf(line(0, "a"), line(8000, "b")))
+        // 10s gap, 3 dots over [0,9000): handoff at 9000/3 = 3000.
+        val rows = buildLyricRows(listOf(line(0, "a"), line(10000, "b")))
         assertTrue(activeRowIndex(rows, 0, 500).let { rows[it] is LyricRow.Line })
-        assertTrue(rows[activeRowIndex(rows, 0, 2333)] is LyricRow.Dots)
-        assertTrue(rows[activeRowIndex(rows, 0, 6999)] is LyricRow.Dots)
-        // Bright-hold second still dots; lyric exactly at 8000.
-        assertTrue(rows[activeRowIndex(rows, 0, 7500)] is LyricRow.Dots)
-        val nextIdx = activeRowIndex(rows, 1, 8000)
+        assertTrue(rows[activeRowIndex(rows, 0, 3000)] is LyricRow.Dots)
+        assertTrue(rows[activeRowIndex(rows, 0, 8999)] is LyricRow.Dots)
+        // Bright-hold second still dots; lyric exactly at 10000.
+        assertTrue(rows[activeRowIndex(rows, 0, 9500)] is LyricRow.Dots)
+        val nextIdx = activeRowIndex(rows, 1, 10000)
         assertTrue(rows[nextIdx] is LyricRow.Line)
         assertEquals(1, (rows[nextIdx] as LyricRow.Line).index)
     }
 
     @Test
     fun activeRow_lineDarkensAfter1s() {
-        val rows = buildLyricRows(listOf(line(0, "a"), line(8000, "b")))
-        // Line owns the handoff window (first dot at ~2333).
+        val rows = buildLyricRows(listOf(line(0, "a"), line(10000, "b")))
+        // Line owns the handoff window (first dot at ~3000).
         assertFalse(isDotsActiveAfter(rows, 0, 500))
         assertFalse(isDotsActiveAfter(rows, 0, 2000))
-        assertTrue(isDotsActiveAfter(rows, 0, 3000))
-        // Bright-hold second still dots-active; lyric only at 8000.
-        assertTrue(isDotsActiveAfter(rows, 0, 7500))
-        assertFalse(isDotsActiveAfter(rows, 0, 8000))
+        assertTrue(isDotsActiveAfter(rows, 0, 4000))
+        // Bright-hold second still dots-active; lyric only at 10000.
+        assertTrue(isDotsActiveAfter(rows, 0, 9500))
+        assertFalse(isDotsActiveAfter(rows, 0, 10000))
     }
 
     @Test
     fun dotsFill_splitsEvenly() {
-        // 2 dots over [0,4000): dot0 fills at 2000, dot1 at 4000.
+        // 2 dots over [0,8000): dot0 fills at 4000, dot1 at 8000.
         val from = 0L
-        val to = 4000L
+        val to = 8000L
         val total = 2
         fun filledAt(pos: Long): Int {
             val frac = ((pos - from).toFloat() / (to - from).toFloat()).coerceIn(0f, 1f)
             return (frac * total).toInt().coerceIn(0, total)
         }
         assertEquals(0, filledAt(0))
-        assertEquals(1, filledAt(2000))
-        assertEquals(2, filledAt(4000))
+        assertEquals(1, filledAt(4000))
+        assertEquals(2, filledAt(8000))
     }
 
     @Test
@@ -235,7 +234,7 @@ class LyricsGapsTest {
         assertEquals(3, rows.size)
         assertEquals(0L, (rows[0] as LyricRow.Line).ms)
         assertTrue(rows[1] is LyricRow.Dots)
-        assertEquals(3, (rows[1] as LyricRow.Dots).dotCount)
+        assertEquals(2, (rows[1] as LyricRow.Dots).dotCount)
         // Blank lines dropped, never crash.
         val blanks = buildLyricRows(listOf(line(0, ""), line(1000, "  "), line(9000, "ok")))
         assertTrue(blanks.isNotEmpty())

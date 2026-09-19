@@ -2922,20 +2922,9 @@ private fun FancyBar(
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
         tonalElevation = 6.dp,
         shadowElevation = 10.dp,
+        // Card stays pinned: only the inner content glides (see Row below).
         modifier = Modifier.fillMaxWidth()
             .padding(horizontal = 10.dp)
-            .graphicsLayer {
-                translationX = try {
-                    offsetX.value
-                } catch (e: Exception) {
-                    0f
-                }
-                alpha = try {
-                    (1f - kotlin.math.abs(offsetX.value) / 700f).coerceIn(0.55f, 1f)
-                } catch (e: Exception) {
-                    1f
-                }
-            }
             .pointerInput(track.id) {
                 var acc = 0f
                 detectHorizontalDragGestures(
@@ -3052,7 +3041,22 @@ private fun FancyBar(
                 }
             }
         Column(Modifier.padding(start = 10.dp, end = 10.dp, top = 10.dp, bottom = 8.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            // Only this row glides with the finger; the card + progress stay put.
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.graphicsLayer {
+                    translationX = try {
+                        offsetX.value
+                    } catch (e: Exception) {
+                        0f
+                    }
+                    alpha = try {
+                        (1f - kotlin.math.abs(offsetX.value) / 500f).coerceIn(0.45f, 1f)
+                    } catch (e: Exception) {
+                        1f
+                    }
+                }
+            ) {
                 TrackArt(track.thumbUrl, track.id.hashCode(), 54.dp, 16.dp)
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {

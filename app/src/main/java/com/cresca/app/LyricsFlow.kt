@@ -51,13 +51,12 @@ import kotlinx.coroutines.delay
  * caller's own position updates.
  *
  * Waiting-dots contract (user spec):
- * - dots ONLY when the wait is more than 3s (gap >= 3000ms)
- * - 3s wait = 1 dot, up to 7s = 2 dots, up to 10s = 3 dots
+ * - dots ONLY for real breaks: waits under 5s show lines back-to-back
+ * - 5s wait = 1 dot, up to 9s = 2 dots, above 9s = 3 dots
  * - dots also wrap the song: lead-in before the first line and outro
  *   after the last line (needs [durationMs], 0 = skip outro dots)
  * - the dots segment always ends a full 1s BEFORE the next line: the
  *   fill completes, dots hold bright 1s, then the lyric fires.
- *   e.g. 3s wait = dot lights over 2s + 1s hold, then transition.
  * - past dots dim like past lyrics (never stay shiny white).
  */
 @Composable
@@ -399,44 +398,31 @@ private fun SyncedLyrics(
                             .padding(vertical = 14.dp)
                             .alpha(rowAlpha),
                         horizontalArrangement = Arrangement.spacedBy(
-                            12.dp, Alignment.CenterHorizontally
+                            8.dp, Alignment.CenterHorizontally
                         ),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         for (d in 0 until dotsTotal) {
                             val on = d < filled && isActiveDots
-                            // Fixed 24dp cell: the halo lives INSIDE it, so lit
-                            // dots never re-lay-out the row (that was the crack).
+                            // Fixed size + scale pop (scale never re-lays-out,
+                            // so no cracking); glow carried by brightness.
                             Box(
-                                modifier = Modifier.size(24.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                if (on) {
-                                    // Red halo behind the dot (cheap glow: two
-                                    // flat circles, no shadowElevation pass).
-                                    Box(
-                                        modifier = Modifier
-                                            .size(20.dp)
-                                            .background(
-                                                color = Color(0xFFFA243C).copy(alpha = 0.35f * glow),
-                                                shape = androidx.compose.foundation.shape.CircleShape
-                                            )
+                                modifier = Modifier
+                                    .size(10.dp)
+                                    .graphicsLayer(
+                                        scaleX = if (on) 1.3f else 1f,
+                                        scaleY = if (on) 1.3f else 1f
                                     )
-                                }
-                                Box(
-                                    modifier = Modifier
-                                        .size(if (on) 11.dp else 8.dp)
-                                        .background(
-                                            color = when {
-                                                on -> Color.White.copy(alpha = 0.60f + 0.40f * glow)
-                                                isPastDots -> Color.White.copy(alpha = 0.30f)
-                                                isFutureDots -> Color.White.copy(alpha = 0.30f)
-                                                else -> Color.White.copy(alpha = 0.22f)
-                                            },
-                                            shape = androidx.compose.foundation.shape.CircleShape
-                                        )
-                                )
-                            }
+                                    .background(
+                                        color = when {
+                                            on -> Color.White.copy(alpha = 0.60f + 0.40f * glow)
+                                            isPastDots -> Color.White.copy(alpha = 0.30f)
+                                            isFutureDots -> Color.White.copy(alpha = 0.30f)
+                                            else -> Color.White.copy(alpha = 0.22f)
+                                        },
+                                        shape = androidx.compose.foundation.shape.CircleShape
+                                    )
+                            )
                         }
                     }
                 }
@@ -449,15 +435,15 @@ private fun SyncedLyrics(
 // Pure helpers (internal for unit/stress tests — no Compose/Android needed).
 // ---------------------------------------------------------------------------
 
-internal const val DOTS_MIN_GAP_MS = 3000L
-internal const val DOTS_ONE_MAX_MS = 4000L
-internal const val DOTS_TWO_MAX_MS = 7000L
+internal const val DOTS_MIN_GAP_MS = 5000L
+internal const val DOTS_ONE_MAX_MS = 6000L
+internal const val DOTS_TWO_MAX_MS = 9000L
 internal const val LYRIC_HOLD_MS = 1000L
 
 /**
- * Dots for a wait gap: 0 below 3s, 1 dot for a 3s wait, 2 dots up to 7s,
- * 3 dots up to 10s and beyond (capped at 3).
- * Boundaries: [3000,4000)=1, [4000,7000]=2, (7000,inf)=3.
+ * Dots for a wait gap: none under 5s (normal line gaps stay clean),
+ * 1 dot for a ~5s wait, 2 dots up to 9s, 3 dots above 9s.
+ * Boundaries: [5000,6000)=1, [6000,9000]=2, (9000,inf)=3.
  */
 internal fun dotCountForGap(gapMs: Long): Int {
     return try {
