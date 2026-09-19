@@ -918,7 +918,8 @@ fun AppleMusicAppContent(
         onDispose { player.removeListener(listener) }
     }
 
-    // Position clock for seek bar + synced lyrics
+    // Position clock for seek bar + synced lyrics (150ms: karaoke needs
+    // tight sync; reads are cheap binder calls, no work when idle).
     var position by remember { mutableLongStateOf(0L) }
     var duration by remember { mutableLongStateOf(0L) }
     LaunchedEffect(Unit) {
@@ -938,7 +939,7 @@ fun AppleMusicAppContent(
                 // Controller released (config change / dispose): stop the clock.
                 break
             }
-            delay(500)
+            delay(150)
         }
     }
 

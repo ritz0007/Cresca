@@ -209,6 +209,11 @@ private fun SyncedLyrics(
     }
     val manualMode = userHold || listState.isScrollInProgress
 
+    // Blur is the expensive effect here: while the list is moving we render
+    // alpha-only (same layout, no offscreen passes); the frosted look
+    // returns the moment scrolling settles. Beauty in stills, 60fps in motion.
+    val scrolling = listState.isScrollInProgress
+
     LaunchedEffect(activeRow) {
         if (manualMode) return@LaunchedEffect
         try {
@@ -257,58 +262,42 @@ private fun SyncedLyrics(
                             row.index < activeIdx
                         }
                     }
-                    // Smooth pan + zoom: springy scale, eased alpha/offset.
+                    // Gentle zoom: soft spring, runs only when the active line
+                    // changes (every few seconds), never per-frame.
                     val targetScale = when {
-                        isActive && isPlaying -> 1.09f
-                        isActive -> 1.05f
+                        isActive && isPlaying -> 1.07f
+                        isActive -> 1.04f
                         isAdjacent -> 1.0f
-                        else -> 0.97f
+                        else -> 0.98f
                     }
                     val scale by animateFloatAsState(
                         targetValue = targetScale,
-                        animationSpec = spring(dampingRatio = 0.72f, stiffness = 320f),
+                        animationSpec = spring(dampingRatio = 0.85f, stiffness = 400f),
                         label = "lyricScale"
                     )
                     val targetAlpha = when {
                         manualMode -> 1f
                         isActive -> 1f
-                        isAdjacent -> 0.92f
-                        isPast -> 0.62f
-                        else -> 0.78f
+                        isAdjacent -> 0.95f
+                        isPast -> 0.60f
+                        else -> 0.80f
                     }
                     val alphaAnim by animateFloatAsState(
                         targetValue = targetAlpha,
-                        animationSpec = tween(380),
+                        animationSpec = tween(300),
                         label = "lyricAlpha"
                     )
-                    val targetShift = when {
-                        isActive -> 0f
-                        isPast -> -6f
-                        else -> 6f
-                    }
-                    val shift by animateFloatAsState(
-                        targetValue = targetShift,
-                        animationSpec = spring(dampingRatio = 0.8f, stiffness = 300f),
-                        label = "lyricPan"
-                    )
-                    // Brighter base so lyrics read over artwork; prev/next crisp.
-                    val baseColor = when {
-                        isActive -> Color.White
-                        isPast -> Color.White.copy(alpha = 0.68f)
-                        isAdjacent -> Color.White.copy(alpha = 0.88f)
-                        else -> Color.White.copy(alpha = 0.72f)
-                    }
+                    // Frosted depth for far lines, crisp prev/next. Blur is
+                    // skipped while scrolling (perf) — alpha carries it.
                     val blurDp = when {
-                        manualMode -> 0.dp
-                        isActive -> 0.dp
-                        isAdjacent -> 1.dp
+                        manualMode || scrolling || isActive || isAdjacent -> 0.dp
                         dist == 2 -> 2.dp
-                        else -> 3.dp
+                        else -> 4.dp
                     }
                     var mod = Modifier
                         .fillMaxWidth()
                         .padding(vertical = 12.dp)
-                        .graphicsLayer(scaleX = scale, scaleY = scale, translationY = shift)
+                        .graphicsLayer(scaleX = scale, scaleY = scale)
                         .alpha(alphaAnim)
                     if (blurDp.value > 0.01f) mod = mod.blur(blurDp)
                     if (onLineClick != null) {
@@ -325,6 +314,8 @@ private fun SyncedLyrics(
                         fontSize = if (isActive) 24.sp else if (isAdjacent) 21.sp else 20.sp,
                         lineHeight = 30.sp,
                         fontWeight = if (isActive) FontWeight.Bold else if (isAdjacent) FontWeight.SemiBold else FontWeight.Normal,
+                        // Neon glow on the sung line only (one shadowed layer
+                        // at a time — cheap; per-line shadows were the jank).
                         style = if (isActive) TextStyle(
                             shadow = Shadow(
                                 color = Color(0xFFFA243C).copy(alpha = 0.85f),
@@ -332,18 +323,30 @@ private fun SyncedLyrics(
                                 blurRadius = 18f
                             )
                         ) else TextStyle.Default,
-                        color = baseColor,
+                        color = when {
+                            isActive -> Color.White
+                            isPast -> Color.White.copy(alpha = 0.62f)
+                            isAdjacent -> Color.White.copy(alpha = 0.90f)
+                            else -> Color.White.copy(alpha = 0.72f)
+                        },
                         modifier = mod
                     )
                 }
                 is LyricRow.Dots -> {
                     val dotsTotal = row.dotCount.coerceAtLeast(1)
                     val span = (row.toMs - row.fromMs).coerceAtLeast(1)
-                    val frac = try {
+                    val rawFrac = try {
                         ((safePos - row.fromMs).toFloat() / span.toFloat()).coerceIn(0f, 1f)
                     } catch (e: Exception) {
                         0f
                     }
+                    // Eased fill: position polls discretely, so animate the
+                    // fraction itself — dots glide instead of jumping.
+                    val frac by animateFloatAsState(
+                        targetValue = rawFrac,
+                        animationSpec = tween(220),
+                        label = "dotsFrac"
+                    )
                     val filled = (frac * dotsTotal).toInt().coerceIn(0, dotsTotal)
                     val isActiveDots = rows.getOrNull(activeRow) == row
                     val isPastDots = try {
@@ -356,66 +359,70 @@ private fun SyncedLyrics(
                     } catch (e: Exception) {
                         false
                     }
-                    // Past/future dots behave like past/future lyrics:
-                    // dimmed + frosted, never shiny white after passing.
+                    // Past/future dots dim like past/future lyrics — never
+                    // shiny white after passing.
                     val rowAlphaTarget = when {
                         manualMode -> 1f
                         isActiveDots -> 1f
                         isPastDots -> 0.55f
-                        isFutureDots -> 0.7f
+                        isFutureDots -> 0.70f
                         else -> 0.8f
                     }
                     val rowAlpha by animateFloatAsState(
-                        targetValue = rowAlphaTarget, animationSpec = tween(350), label = "dotsAlpha"
+                        targetValue = rowAlphaTarget, animationSpec = tween(300), label = "dotsAlpha"
                     )
                     val glowTarget = when {
-                        !isPlaying -> 0.4f
+                        !isPlaying -> 0.45f
                         isActiveDots -> 1f
-                        else -> 0.25f
+                        else -> 0.3f
                     }
                     val glow by animateFloatAsState(
-                        targetValue = glowTarget, label = "dotsGlow",
-                        animationSpec = tween(350)
+                        targetValue = glowTarget, animationSpec = tween(300), label = "dotsGlow"
                     )
-                    val dotsScale by animateFloatAsState(
-                        targetValue = if (isActiveDots) 1.06f else 0.96f,
-                        animationSpec = spring(dampingRatio = 0.7f, stiffness = 300f),
-                        label = "dotsScale"
-                    )
-                    var rowMod = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 14.dp)
-                        .graphicsLayer(scaleX = dotsScale, scaleY = dotsScale)
-                        .alpha(rowAlpha)
-                    if ((isPastDots || isFutureDots) && !isActiveDots && !manualMode) {
-                        rowMod = rowMod.blur(3.dp)
-                    }
                     Row(
-                        modifier = rowMod,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 14.dp)
+                            .alpha(rowAlpha),
                         horizontalArrangement = Arrangement.spacedBy(
-                            10.dp, Alignment.CenterHorizontally
+                            12.dp, Alignment.CenterHorizontally
                         ),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         for (d in 0 until dotsTotal) {
                             val on = d < filled && isActiveDots
+                            // Fixed 24dp cell: the halo lives INSIDE it, so lit
+                            // dots never re-lay-out the row (that was the crack).
                             Box(
-                                modifier = Modifier
-                                    .size(if (on) 11.dp else 9.dp)
-                                    .graphicsLayer {
-                                        shadowElevation = if (on) 12f * glow else 0f
-                                        spotShadowColor = Color(0xFFFA243C)
-                                    }
-                                    .background(
-                                        color = when {
-                                            on -> Color.White.copy(alpha = 0.55f + 0.45f * glow)
-                                            isPastDots -> Color.White.copy(alpha = 0.28f)
-                                            isFutureDots -> Color.White.copy(alpha = 0.30f)
-                                            else -> Color.White.copy(alpha = 0.22f)
-                                        },
-                                        shape = androidx.compose.foundation.shape.CircleShape
+                                modifier = Modifier.size(24.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (on) {
+                                    // Red halo behind the dot (cheap glow: two
+                                    // flat circles, no shadowElevation pass).
+                                    Box(
+                                        modifier = Modifier
+                                            .size(20.dp)
+                                            .background(
+                                                color = Color(0xFFFA243C).copy(alpha = 0.35f * glow),
+                                                shape = androidx.compose.foundation.shape.CircleShape
+                                            )
                                     )
-                            )
+                                }
+                                Box(
+                                    modifier = Modifier
+                                        .size(if (on) 11.dp else 8.dp)
+                                        .background(
+                                            color = when {
+                                                on -> Color.White.copy(alpha = 0.60f + 0.40f * glow)
+                                                isPastDots -> Color.White.copy(alpha = 0.30f)
+                                                isFutureDots -> Color.White.copy(alpha = 0.30f)
+                                                else -> Color.White.copy(alpha = 0.22f)
+                                            },
+                                            shape = androidx.compose.foundation.shape.CircleShape
+                                        )
+                                )
+                            }
                         }
                     }
                 }
