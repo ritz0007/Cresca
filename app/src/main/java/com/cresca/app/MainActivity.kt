@@ -1872,10 +1872,12 @@ fun AppleMusicAppContent(
                         position = position,
                         duration = duration,
                         error = playerError,
+                        liked = isLiked(t),
                         onOpen = { showFullPlayer = true },
                         onPrev = { skipPrev() },
                         onPlayPause = { togglePlay(t) },
-                        onNext = { skipNext() }
+                        onNext = { skipNext() },
+                        onLike = { toggleLike(t) }
                     )
                     Spacer(Modifier.height(4.dp))
                 }
@@ -2555,7 +2557,8 @@ private fun FullPlayerSheet(
                             onSeek(ms.coerceAtLeast(0L))
                         } catch (e: Exception) {
                         }
-                    }
+                    },
+                    durationMs = duration
                 )
             }
             // Shazam-like details card.
@@ -2892,7 +2895,7 @@ private fun IntroScreen() {
 }
 
 /** Fancy floating music bar: glow card, live equalizer, round red play.
- * Swipe left = next, swipe right = prev (no prev/next buttons). */
+ * Swipe left = next, swipe right = prev (animated glide + snap-back). */
 @Composable
 private fun FancyBar(
     track: YtTrack,
@@ -2901,11 +2904,19 @@ private fun FancyBar(
     position: Long,
     duration: Long,
     error: String?,
+    liked: Boolean = false,
     onOpen: () -> Unit,
     onPrev: () -> Unit,
     onPlayPause: () -> Unit,
-    onNext: () -> Unit
+    onNext: () -> Unit,
+    onLike: () -> Unit = {}
 ) {
+    val swipeScope = rememberCoroutineScope()
+    // Glide offset follows the finger; snaps back with an ease on release.
+    val offsetX = remember(track.id) {
+        androidx.compose.animation.core.Animatable(0f)
+    }
+    var dragDir by remember(track.id) { mutableIntStateOf(0) }
     Surface(
         shape = RoundedCornerShape(24.dp),
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
@@ -2913,24 +2924,101 @@ private fun FancyBar(
         shadowElevation = 10.dp,
         modifier = Modifier.fillMaxWidth()
             .padding(horizontal = 10.dp)
+            .graphicsLayer {
+                translationX = try {
+                    offsetX.value
+                } catch (e: Exception) {
+                    0f
+                }
+                alpha = try {
+                    (1f - kotlin.math.abs(offsetX.value) / 700f).coerceIn(0.55f, 1f)
+                } catch (e: Exception) {
+                    1f
+                }
+            }
             .pointerInput(track.id) {
                 var acc = 0f
                 detectHorizontalDragGestures(
-                    onDragStart = { acc = 0f },
+                    onDragStart = {
+                        acc = 0f
+                        dragDir = 0
+                    },
                     onDragEnd = {
-                        try {
-                            if (acc < -80) {
-                                onNext()
-                            } else if (acc > 80) {
-                                onPrev()
+                        val fire: (() -> Unit)? = try {
+                            when {
+                                acc < -80 -> onNext
+                                acc > 80 -> onPrev
+                                else -> null
                             }
                         } catch (e: Exception) {
+                            null
+                        }
+                        try {
+                            // Snap back smoothly, then fire (feels physical).
+                            swipeScope.launch {
+                                try {
+                                    offsetX.animateTo(
+                                        0f,
+                                        androidx.compose.animation.core.tween(260)
+                                    )
+                                } catch (e: Exception) {
+                                    try {
+                                        offsetX.snapTo(0f)
+                                    } catch (ignored: Exception) {
+                                    }
+                                }
+                                try {
+                                    dragDir = 0
+                                } catch (e: Exception) {
+                                }
+                                try {
+                                    fire?.invoke()
+                                } catch (e: Exception) {
+                                }
+                            }
+                        } catch (e: Exception) {
+                            try {
+                                fire?.invoke()
+                            } catch (ignored: Exception) {
+                            }
+                            acc = 0f
                         }
                         acc = 0f
                     },
-                    onDragCancel = { acc = 0f },
+                    onDragCancel = {
+                        acc = 0f
+                        dragDir = 0
+                        swipeScope.launch {
+                            try {
+                                offsetX.animateTo(
+                                    0f, androidx.compose.animation.core.tween(260)
+                                )
+                            } catch (e: Exception) {
+                                try {
+                                    offsetX.snapTo(0f)
+                                } catch (ignored: Exception) {
+                                }
+                            }
+                        }
+                    },
                     onHorizontalDrag = { change, dragAmount ->
                         acc += dragAmount
+                        try {
+                            dragDir = when {
+                                acc < -24 -> -1
+                                acc > 24 -> 1
+                                else -> 0
+                            }
+                        } catch (e: Exception) {
+                        }
+                        swipeScope.launch {
+                            try {
+                                offsetX.snapTo(
+                                    (offsetX.value + dragAmount).coerceIn(-220f, 220f)
+                                )
+                            } catch (e: Exception) {
+                            }
+                        }
                         try {
                             change.consume()
                         } catch (e: Exception) {
@@ -2940,6 +3028,29 @@ private fun FancyBar(
             }
             .clickable { onOpen() }
     ) {
+        Box {
+            // Direction peek: chevrons fade in as you drag.
+            if (dragDir != 0) {
+                val peekAlpha = try {
+                    (kotlin.math.abs(offsetX.value) / 80f).coerceIn(0f, 1f)
+                } catch (e: Exception) {
+                    0f
+                }
+                Box(
+                    Modifier.fillMaxWidth().align(Alignment.Center)
+                        .padding(horizontal = 18.dp),
+                    contentAlignment = if (dragDir < 0) Alignment.CenterEnd
+                    else Alignment.CenterStart
+                ) {
+                    Icon(
+                        if (dragDir < 0) Icons.Filled.SkipNext
+                        else Icons.Filled.SkipPrevious,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary.copy(alpha = peekAlpha),
+                        modifier = Modifier.size(30.dp)
+                    )
+                }
+            }
         Column(Modifier.padding(start = 10.dp, end = 10.dp, top = 10.dp, bottom = 8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 TrackArt(track.thumbUrl, track.id.hashCode(), 54.dp, 16.dp)
@@ -2966,6 +3077,16 @@ private fun FancyBar(
                         color = if (error != null) MaterialTheme.colorScheme.error
                         else MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1, overflow = TextOverflow.Ellipsis
+                    )
+                }
+                // Mini-player like shortcut (no need to open the sheet).
+                IconButton(onClick = onLike, modifier = Modifier.size(40.dp)) {
+                    Icon(
+                        if (liked) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
+                        contentDescription = if (liked) "Unlike" else "Like",
+                        tint = if (liked) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(24.dp)
                     )
                 }
                 if (buffering) {
@@ -3009,6 +3130,7 @@ private fun FancyBar(
                 )
             }
         }
+        } // direction-peek Box
     }
 }
 

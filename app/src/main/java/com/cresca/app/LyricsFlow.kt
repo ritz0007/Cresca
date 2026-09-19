@@ -51,13 +51,14 @@ import kotlinx.coroutines.delay
  * caller's own position updates.
  *
  * Waiting-dots contract (user spec):
- * - dots only when gap > 3s (>= 3000ms)
- * - 3000..3999ms = 1 dot, 4000..6999ms = 2 dots, >= 7000ms = 3 dots
- * - wait is split evenly among the dots (sequential fill)
- * - dots occupy [line.ms + 1000, next.ms): the previous line stays
- *   highlighted for 1s then darkens, dots take over, next line activates
- *   exactly at its timestamp (after the dots).
- * - past dots dim + blur like past lyrics (never stay shiny white).
+ * - dots ONLY when the wait is more than 3s (gap >= 3000ms)
+ * - 3s wait = 1 dot, up to 7s = 2 dots, up to 10s = 3 dots
+ * - dots also wrap the song: lead-in before the first line and outro
+ *   after the last line (needs [durationMs], 0 = skip outro dots)
+ * - the dots segment always ends a full 1s BEFORE the next line: the
+ *   fill completes, dots hold bright 1s, then the lyric fires.
+ *   e.g. 3s wait = dot lights over 2s + 1s hold, then transition.
+ * - past dots dim like past lyrics (never stay shiny white).
  */
 @Composable
 fun LyricsView(
@@ -65,7 +66,8 @@ fun LyricsView(
     positionMs: Long,
     isPlaying: Boolean,
     modifier: Modifier = Modifier,
-    onLineClick: ((Long) -> Unit)? = null
+    onLineClick: ((Long) -> Unit)? = null,
+    durationMs: Long = 0L
 ) {
     when (state) {
         is LyricsState.Loading -> {
@@ -127,7 +129,8 @@ fun LyricsView(
                     positionMs = positionMs,
                     isPlaying = isPlaying,
                     modifier = modifier,
-                    onLineClick = onLineClick
+                    onLineClick = onLineClick,
+                    durationMs = durationMs
                 )
             }
         }
@@ -140,26 +143,37 @@ private fun SyncedLyrics(
     positionMs: Long,
     isPlaying: Boolean,
     modifier: Modifier = Modifier,
-    onLineClick: ((Long) -> Unit)? = null
+    onLineClick: ((Long) -> Unit)? = null,
+    durationMs: Long = 0L
 ) {
     val listState = rememberLazyListState()
+    // Canonical order: extractor files are occasionally unsorted, and the
+    // active-line index must address the SAME order the rows are built in
+    // (unsorted input used to highlight the wrong line + dots in gaps).
+    val sorted = remember(lines) {
+        try {
+            lines.filter { it.text.isNotBlank() }.sortedBy { it.ms.coerceAtLeast(0L) }
+        } catch (e: Exception) {
+            lines
+        }
+    }
     val safePos = try {
         positionMs.coerceAtLeast(0L)
     } catch (e: Exception) {
         0L
     }
     val activeIdx = try {
-        lines.indexOfLast { it.ms <= safePos }
+        sorted.indexOfLast { it.ms <= safePos }
     } catch (e: Exception) {
         -1
     }
 
     // Display model: lyric rows + silence-dot rows for long gaps.
-    val rows = remember(lines) {
+    val rows = remember(sorted, durationMs) {
         try {
-            buildLyricRows(lines)
+            buildLyricRows(sorted, durationMs)
         } catch (e: Exception) {
-            lines.mapIndexed { i, l -> LyricRow.Line(i, l.text, l.ms) }
+            sorted.mapIndexed { i, l -> LyricRow.Line(i, l.text, l.ms) }
         }
     }
     val activeRow = remember(rows, activeIdx, safePos) {
@@ -441,14 +455,15 @@ internal const val DOTS_TWO_MAX_MS = 7000L
 internal const val LYRIC_HOLD_MS = 1000L
 
 /**
- * Dots for a wait gap: 0 when <= 3s, 1 for 3s, 2 for 4-6s, 3 for 7s+.
- * Boundaries: [3000,4000)=1, [4000,7000)=2, [7000,inf)=3.
+ * Dots for a wait gap: 0 below 3s, 1 dot for a 3s wait, 2 dots up to 7s,
+ * 3 dots up to 10s and beyond (capped at 3).
+ * Boundaries: [3000,4000)=1, [4000,7000]=2, (7000,inf)=3.
  */
 internal fun dotCountForGap(gapMs: Long): Int {
     return try {
         if (gapMs < DOTS_MIN_GAP_MS) 0
         else if (gapMs < DOTS_ONE_MAX_MS) 1
-        else if (gapMs < DOTS_TWO_MAX_MS) 2
+        else if (gapMs <= DOTS_TWO_MAX_MS) 2
         else 3
     } catch (e: Exception) {
         0
@@ -467,11 +482,14 @@ internal sealed interface LyricRow {
     }
 }
 
-// Long instrumental gaps become a countdown row between the lines.
-// Dots live in [line.ms + 1s, next.ms - 1s): the sung line darkens 1s
-// after its timestamp, the wait fills dot-by-dot, then all dots hold
-// bright for 1 more second before the next line fires.
-internal fun buildLyricRows(lines: List<LyricLine>): List<LyricRow> {
+// Long waits become countdown dots between the lines — plus a lead-in
+// before the first line and an outro after the last one (same rules).
+// A dots segment [start, end) always ends a full 1s BEFORE the next line:
+// the fill completes over [start, end - 1s], dots hold bright 1s, then the
+// lyric fires. e.g. 3s wait = dot lights over 2s + 1s hold + transition.
+// The sung line stays lit until the FIRST dot lights (handoff), so short
+// waits still show the lyric first and dots never steal its moment.
+internal fun buildLyricRows(lines: List<LyricLine>, durationMs: Long = 0L): List<LyricRow> {
     if (lines.isEmpty()) {
         return emptyList()
     }
@@ -484,7 +502,21 @@ internal fun buildLyricRows(lines: List<LyricLine>): List<LyricRow> {
     } catch (e: Exception) {
         return lines.mapIndexed { i, l -> LyricRow.Line(i, l.text, l.ms) }
     }
-    val out = ArrayList<LyricRow>(sorted.size + 2)
+    val out = ArrayList<LyricRow>(sorted.size + 4)
+
+    // Lead-in: song starts but the first line waits more than 3s.
+    try {
+        val firstMs = sorted.first().second
+        val leadN = dotCountForGap(firstMs)
+        if (leadN > 0) {
+            val to = firstMs - LYRIC_HOLD_MS
+            if (to > 0L) {
+                out.add(LyricRow.Dots(0L, to, leadN))
+            }
+        }
+    } catch (e: Exception) {
+    }
+
     for (i in sorted.indices) {
         val (_, ms, text) = sorted[i]
         out.add(LyricRow.Line(i, text, ms))
@@ -493,7 +525,7 @@ internal fun buildLyricRows(lines: List<LyricLine>): List<LyricRow> {
             val gap = nextMs - ms
             val n = dotCountForGap(gap)
             if (n > 0) {
-                val from = ms + LYRIC_HOLD_MS
+                val from = ms
                 val to = nextMs - LYRIC_HOLD_MS
                 if (to > from) {
                     out.add(LyricRow.Dots(from, to, n))
@@ -501,18 +533,49 @@ internal fun buildLyricRows(lines: List<LyricLine>): List<LyricRow> {
             }
         }
     }
+
+    // Outro: song plays on more than 3s after the last line.
+    try {
+        if (durationMs > 0L) {
+            val lastMs = sorted.last().second
+            val tail = durationMs - lastMs
+            val tailN = dotCountForGap(tail)
+            if (tailN > 0) {
+                val to = durationMs - LYRIC_HOLD_MS
+                if (to > lastMs) {
+                    out.add(LyricRow.Dots(lastMs, to, tailN))
+                }
+            }
+        }
+    } catch (e: Exception) {
+    }
     return out
 }
 
 /**
- * Active row: dots win while the position sits inside their window PLUS
- * the 1s bright-hold after the last dot ([from, to + 1s)).
+ * Position where the dots take over from the line before them: the sung
+ * line stays lit until the FIRST dot lights (fill split evenly).
+ */
+internal fun dotsTakeoverMs(dots: LyricRow.Dots): Long {
+    return try {
+        val span = (dots.toMs - dots.fromMs).coerceAtLeast(1L)
+        dots.fromMs + span / dots.dotCount.coerceAtLeast(1)
+    } catch (e: Exception) {
+        dots.fromMs
+    }
+}
+
+/**
+ * Active row: dots win from the moment their first dot lights through the
+ * 1s bright-hold ([takeover, to + 1s)). Before that the sung line owns it.
  */
 internal fun activeRowIndex(rows: List<LyricRow>, activeLineIdx: Int, positionMs: Long): Int {
     if (rows.isEmpty()) return 0
     try {
         rows.forEachIndexed { i, r ->
-            if (r is LyricRow.Dots && positionMs in r.fromMs until (r.toMs + LYRIC_HOLD_MS)) return i
+            if (r is LyricRow.Dots &&
+                positionMs >= dotsTakeoverMs(r) && positionMs < (r.toMs + LYRIC_HOLD_MS)
+            ) return i
         }
         rows.forEachIndexed { i, r ->
             if (r is LyricRow.Line && r.index == activeLineIdx) return i
@@ -530,13 +593,19 @@ internal fun activeRowIndex(rows: List<LyricRow>, activeLineIdx: Int, positionMs
 }
 
 /** True when a dots row has taken over after [lineIdx] (line should dim).
- * Covers the fill window plus the 1s bright-hold before the next line. */
+ * Covers first-dot light through the 1s bright-hold before the next line. */
 internal fun isDotsActiveAfter(rows: List<LyricRow>, lineIdx: Int, positionMs: Long): Boolean {
     return try {
         val li = rows.indexOfFirst { it is LyricRow.Line && it.index == lineIdx }
         if (li < 0) return false
+        // Dots directly after the line (skipping nothing: rows are built
+        // line,dots,line — but lead-in dots precede line 0, so check first).
         val dots = rows.getOrNull(li + 1)
-        dots is LyricRow.Dots && positionMs >= dots.fromMs && positionMs < (dots.toMs + LYRIC_HOLD_MS)
+        if (dots is LyricRow.Dots) {
+            return positionMs >= dotsTakeoverMs(dots) &&
+                positionMs < (dots.toMs + LYRIC_HOLD_MS)
+        }
+        false
     } catch (e: Exception) {
         false
     }
