@@ -263,7 +263,8 @@ class MainActivity : ComponentActivity() {
 }
 
 /** Status + nav bars follow the page: artwork-dominant color inside the
- * player, transparent glass everywhere else. */
+ * player, solid app surface everywhere else (never transparent glass the
+ * status icons can't read against). */
 @Composable
 private fun SystemBars(dark: Boolean, barColor: Color? = null) {
     val view = LocalView.current
@@ -540,7 +541,7 @@ fun AppleMusicAppContent(
             Color(0xFF3A0A12)
         }
     }
-    SystemBars(dark, if (showFullPlayer) playerDom else null)
+    SystemBars(dark, if (showFullPlayer) playerDom else MaterialTheme.colorScheme.background)
 
     fun openPlaylist(id: String) {
         // Store I/O off main (file JSON ANRs). State assigns on Main
@@ -2038,6 +2039,8 @@ fun AppleMusicAppContent(
                 onQuality = { pickQuality(it) },
                 onLike = { toggleLike(t) },
                 onQueue = { showQueue = true },
+                onPlayNext = { queue.playNext(t) },
+                onAddQueue = { queue.addToQueue(t) },
                 onSeek = { player.seekTo(it) },
                 domColor = playerDom,
                 onDismiss = {
@@ -2310,6 +2313,8 @@ private fun FullPlayerSheet(
     onQuality: (String) -> Unit,
     onLike: () -> Unit,
     onQueue: () -> Unit,
+    onPlayNext: () -> Unit = {},
+    onAddQueue: () -> Unit = {},
     onSeek: (Long) -> Unit,
     onDismiss: () -> Unit,
     domColor: Color = Color(0xFF3A0A12)
@@ -2502,7 +2507,7 @@ private fun FullPlayerSheet(
                             modifier = Modifier.size(26.dp))
                     }
                 }
-                // Actions: video toggle + like + queue
+                // Actions: video toggle + like + download + queue + more.
                 Row(
                     Modifier.fillMaxWidth().padding(vertical = 4.dp),
                     horizontalArrangement = Arrangement.SpaceEvenly,
@@ -2535,6 +2540,156 @@ private fun FullPlayerSheet(
                             modifier = Modifier.size(20.dp))
                         Spacer(Modifier.width(6.dp))
                         Text("Queue")
+                    }
+                    // 3-dot overflow: share, playlist, queue, video-site.
+                    var moreOpen by remember { mutableStateOf(false) }
+                    var showPlPicker by remember { mutableStateOf(false) }
+                    var plLists by remember { mutableStateOf<List<Playlist>>(emptyList()) }
+                    Box {
+                        IconButton(onClick = { moreOpen = true }) {
+                            Icon(
+                                Icons.Filled.MoreVert, contentDescription = "More options",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        DropdownMenu(expanded = moreOpen, onDismissRequest = { moreOpen = false }) {
+                            DropdownMenuItem(
+                                text = { Text(if (liked) "Unlike" else "Like") },
+                                leadingIcon = {
+                                    Icon(
+                                        if (liked) Icons.Filled.Favorite
+                                        else Icons.Filled.FavoriteBorder,
+                                        contentDescription = null
+                                    )
+                                },
+                                onClick = { moreOpen = false; onLike() }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Add to playlist") },
+                                leadingIcon = {
+                                    Icon(Icons.Filled.PlaylistAdd, contentDescription = null)
+                                },
+                                onClick = {
+                                    moreOpen = false
+                                    dlscope.launch(Dispatchers.IO) {
+                                        val loaded = try {
+                                            PlaylistStore.list(dlctx)
+                                        } catch (e: Exception) {
+                                            emptyList()
+                                        }
+                                        withContext(Dispatchers.Main) {
+                                            plLists = loaded
+                                            showPlPicker = true
+                                        }
+                                    }
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Play next") },
+                                leadingIcon = {
+                                    Icon(Icons.Filled.SkipNext, contentDescription = null)
+                                },
+                                onClick = { moreOpen = false; onPlayNext() }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Add to queue") },
+                                leadingIcon = {
+                                    Icon(Icons.Filled.QueueMusic, contentDescription = null)
+                                },
+                                onClick = { moreOpen = false; onAddQueue() }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Download") },
+                                leadingIcon = {
+                                    Icon(Icons.Filled.Download, contentDescription = null)
+                                },
+                                onClick = {
+                                    moreOpen = false
+                                    dlscope.enqueueDownload(dlctx, track)
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Share") },
+                                leadingIcon = {
+                                    Icon(Icons.Filled.Share, contentDescription = null)
+                                },
+                                onClick = {
+                                    moreOpen = false
+                                    try {
+                                        val send = Intent(Intent.ACTION_SEND).apply {
+                                            type = "text/plain"
+                                            putExtra(
+                                                Intent.EXTRA_TEXT,
+                                                "${track.title} - ${track.artist}\n" +
+                                                    "https://music.youtube.com/watch?v=${track.id}"
+                                            )
+                                        }
+                                        dlctx.startActivity(
+                                            Intent.createChooser(send, "Share song")
+                                        )
+                                    } catch (e: Exception) {
+                                    }
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Open in YouTube") },
+                                leadingIcon = {
+                                    Icon(Icons.Filled.OpenInNew, contentDescription = null)
+                                },
+                                onClick = {
+                                    moreOpen = false
+                                    try {
+                                        val url = track.watchUrl.ifBlank {
+                                            "https://music.youtube.com/watch?v=${track.id}"
+                                        }
+                                        dlctx.startActivity(
+                                            Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                                        )
+                                    } catch (e: Exception) {
+                                    }
+                                }
+                            )
+                        }
+                    }
+                    if (showPlPicker) {
+                        PlaylistPickerSheet(
+                            track = track,
+                            playlists = plLists,
+                            onPick = { id ->
+                                dlscope.launch(Dispatchers.IO) {
+                                    try {
+                                        PlaylistStore.add(dlctx, id, track)
+                                        val reloaded = PlaylistStore.list(dlctx)
+                                        withContext(Dispatchers.Main) {
+                                            plLists = reloaded
+                                            showPlPicker = false
+                                        }
+                                    } catch (e: Exception) {
+                                        withContext(Dispatchers.Main) {
+                                            showPlPicker = false
+                                        }
+                                    }
+                                }
+                            },
+                            onNew = { name ->
+                                dlscope.launch(Dispatchers.IO) {
+                                    try {
+                                        val p = PlaylistStore.create(dlctx, name)
+                                        PlaylistStore.add(dlctx, p.id, track)
+                                        val reloaded = PlaylistStore.list(dlctx)
+                                        withContext(Dispatchers.Main) {
+                                            plLists = reloaded
+                                            showPlPicker = false
+                                        }
+                                    } catch (e: Exception) {
+                                        withContext(Dispatchers.Main) {
+                                            showPlPicker = false
+                                        }
+                                    }
+                                }
+                            },
+                            onDismiss = { showPlPicker = false }
+                        )
                     }
                 }
                 Divider(Modifier.padding(vertical = 8.dp))
@@ -4693,6 +4848,7 @@ private fun LibraryScreen(
     var lists by remember { mutableStateOf<List<Playlist>>(emptyList()) }
     var showNew by remember { mutableStateOf(false) }
     var showLikedFolder by remember { mutableStateOf(false) }
+    var showRecentFolder by remember { mutableStateOf(false) }
     // Reload every time the tab is visited (menus edit the store directly).
     LaunchedEffect(active) {
         if (active) {
@@ -4808,38 +4964,6 @@ private fun LibraryScreen(
                 }
             }
         }
-        item { SectionHeader("Recently Played") }
-        if (recent.isEmpty()) {
-            item {
-                Text("Play something and it shows up here.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp))
-            }
-        } else {
-            // Top, one per row, playlist-style big rows (2.5x art).
-            itemsIndexed(recent, key = { i, x -> "$i-${x.id}" }) { _, t ->
-                ListItem(
-                    headlineContent = {
-                        Text(t.title, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    },
-                    supportingContent = {
-                        Text(t.artist, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    },
-                    leadingContent = { TrackArt(t.thumbUrl, t.id.hashCode(), 84.dp, 16.dp) },
-                    trailingContent = {
-                        TrackMenu(
-                            track = t, liked = likedOf(t),
-                            onPlay = { onPlay(t) },
-                            onPlayNext = { onPlayNext(t) },
-                            onAddQueue = { onAddQueue(t) },
-                            onToggleLike = { onToggleLike(t) }
-                        )
-                    },
-                    modifier = Modifier.clickable { onPlay(t) }
-                )
-            }
-        }
         item {
             Row(
                 Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 8.dp),
@@ -4855,7 +4979,8 @@ private fun LibraryScreen(
                 }
             }
         }
-        // Liked Songs folder + user playlists: 2 in a row, 2.5x art (130dp).
+        // Liked + Recently Played folders + user playlists: 2 in a row,
+        // 2.5x art (130dp). History lives ONLY in its folder (no rows).
         item {
             val allFolders = ArrayList<Playlist>()
             try {
@@ -4865,6 +4990,21 @@ private fun LibraryScreen(
                         name = "Liked Songs",
                         tracks = try {
                             liked
+                        } catch (e: Exception) {
+                            emptyList()
+                        },
+                        createdAt = 0L
+                    )
+                )
+            } catch (e: Exception) {
+            }
+            try {
+                allFolders.add(
+                    Playlist(
+                        id = "__recent__",
+                        name = "Recently Played",
+                        tracks = try {
+                            recent
                         } catch (e: Exception) {
                             emptyList()
                         },
@@ -4893,6 +5033,7 @@ private fun LibraryScreen(
                         ) {
                             row.forEach { p ->
                                 val isLikedFolder = p.id == "__liked__"
+                                val isRecentFolder = p.id == "__recent__"
                                 Column(
                                     Modifier.weight(1f)
                                         .clip(RoundedCornerShape(16.dp))
@@ -4900,6 +5041,8 @@ private fun LibraryScreen(
                                             try {
                                                 if (isLikedFolder) {
                                                     showLikedFolder = true
+                                                } else if (isRecentFolder) {
+                                                    showRecentFolder = true
                                                 } else {
                                                     onOpenPlaylist(p.id)
                                                 }
@@ -4910,6 +5053,11 @@ private fun LibraryScreen(
                                     if (isLikedFolder) {
                                         LikedFolderArt(
                                             count = p.tracks.size,
+                                            size = 130.dp
+                                        )
+                                    } else if (isRecentFolder) {
+                                        RecentFolderArt(
+                                            tracks = p.tracks,
                                             size = 130.dp
                                         )
                                     } else {
@@ -5005,6 +5153,48 @@ private fun LibraryScreen(
             onDismiss = { showLikedFolder = false }
         )
     }
+    // Recently Played folder (virtual playlist: whole history in one place).
+    if (showRecentFolder) {
+        val recentPl = try {
+            Playlist(
+                id = "__recent__",
+                name = "Recently Played",
+                tracks = recent,
+                createdAt = 0L
+            )
+        } catch (e: Exception) {
+            Playlist("__recent__", "Recently Played", emptyList(), 0L)
+        }
+        PlaylistSheet(
+            playlist = recentPl,
+            isCurrentId = { false },
+            likedOf = { t ->
+                try {
+                    likedOf(t)
+                } catch (e: Exception) {
+                    false
+                }
+            },
+            onPlayList = { list, idx, _ ->
+                try {
+                    if (list.isNotEmpty()) onPlay(list[idx.coerceIn(list.indices)])
+                } catch (e: Exception) {
+                }
+            },
+            onPlayNext = onPlayNext,
+            onAddQueue = onAddQueue,
+            onToggleLike = onToggleLike,
+            onRemove = { },
+            onAddSuggested = { t ->
+                try {
+                    onPlay(t)
+                } catch (e: Exception) {
+                }
+            },
+            onDeletePlaylist = {},
+            onDismiss = { showRecentFolder = false }
+        )
+    }
 }
 
 /** Big heart-gradient art for the Liked Songs folder (130dp, 2.5x). */
@@ -5033,6 +5223,31 @@ private fun LikedFolderArt(count: Int, size: Dp) {
                 color = Color.White.copy(alpha = 0.9f)
             )
         }
+    }
+}
+
+/** Big history-gradient art for the Recently Played folder (130dp). */
+@Composable
+private fun RecentFolderArt(tracks: List<YtTrack>, size: Dp) {
+    if (tracks.isNotEmpty()) {
+        MosaicArt(tracks, size, 16.dp)
+        return
+    }
+    Box(
+        Modifier.size(size).clip(RoundedCornerShape(16.dp))
+            .background(
+                Brush.linearGradient(
+                    listOf(Color(0xFF5E5CE6), Color(0xFF1B1B6B))
+                )
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(
+            Icons.Filled.History,
+            contentDescription = null,
+            tint = Color.White.copy(alpha = 0.95f),
+            modifier = Modifier.size(size * 0.34f)
+        )
     }
 }
 
