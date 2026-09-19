@@ -11,8 +11,8 @@ android {
         applicationId = "com.cresca.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 6
-        versionName = "0.6.0"
+        versionCode = 8
+        versionName = "0.8.0"
     }
     buildFeatures { compose = true }
     compileOptions {

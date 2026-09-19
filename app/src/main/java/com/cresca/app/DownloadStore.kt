@@ -103,6 +103,12 @@ object DownloadStore {
         }
     }
 
+    fun downloadIdFor(ctx: Context, trackId: String): Long? {
+        // Fast path: in-memory map, else persisted row (survives restart).
+        memIds[trackId]?.let { return it }
+        return downloadIdForInternal(ctx, trackId)
+    }
+
     fun downloadIdFor(trackId: String): Long? {
         // Fast path: in-memory map.
         memIds[trackId]?.let { return it }
@@ -110,7 +116,7 @@ object DownloadStore {
     }
 
     // Private helper that also consults disk when memory misses.
-    private fun downloadIdFor(ctx: Context, trackId: String): Long? {
+    private fun downloadIdForInternal(ctx: Context, trackId: String): Long? {
         memIds[trackId]?.let { return it }
         val row = readRow(ctx, trackId) ?: return null
         return try {

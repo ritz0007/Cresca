@@ -1,9 +1,15 @@
 package com.cresca.app
 
 import android.content.Intent
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
 import androidx.media3.common.Player
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import kotlinx.coroutines.CoroutineScope
@@ -30,18 +36,55 @@ class PlaybackService : MediaSessionService() {
 
     override fun onCreate() {
         super.onCreate()
-        // Small initial buffer = audible audio faster.
+        // Smooth + non-stop: cached datasource reuses streamed bytes on
+        // replay/prefetch (SimpMusic pattern), bigger buffers survive
+        // network dips, audio attributes keep focus handling sane.
         val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(1500, 12000, 700, 1500)
+            .setBufferDurationsMs(2000, 30000, 1000, 2000)
+            .setTargetBufferBytes(C.LENGTH_UNSET)
+            .setPrioritizeTimeOverSizeThresholds(true)
             .build()
+        val httpFactory = DefaultHttpDataSource.Factory()
+            .setConnectTimeoutMs(25000)
+            .setReadTimeoutMs(25000)
+            .setAllowCrossProtocolRedirects(true)
+            .setUserAgent("Cresca/1.0 (Android)")
+        val cacheSource = try {
+            val cache = ExoCache.get(this)
+            CacheDataSource.Factory()
+                .setCache(cache)
+                .setUpstreamDataSourceFactory(
+                    DefaultDataSource.Factory(this, httpFactory)
+                )
+                .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+        } catch (e: Exception) {
+            null
+        }
+        val mediaSourceFactory = if (cacheSource != null) {
+            DefaultMediaSourceFactory(this).setDataSourceFactory(cacheSource)
+        } else {
+            DefaultMediaSourceFactory(this)
+        }
         val exo = ExoPlayer.Builder(this)
             .setLoadControl(loadControl)
+            .setMediaSourceFactory(mediaSourceFactory)
+            .setHandleAudioBecomingNoisy(true)
             .build()
+        try {
+            exo.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(C.USAGE_MEDIA)
+                    .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+                    .build(),
+                true
+            )
+            exo.setWakeMode(C.WAKE_MODE_NETWORK)
+        } catch (e: Exception) {
+        }
         val provider = LiveUpdateProvider(this)
         liveProvider = provider
         setMediaNotificationProvider(provider)
         session = MediaSession.Builder(this, exo)
-            .setCallback(Callback())
             .build()
         exo.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -111,5 +154,4 @@ class PlaybackService : MediaSessionService() {
         super.onDestroy()
     }
 
-    private inner class Callback : MediaSession.Callback
-}
+    }

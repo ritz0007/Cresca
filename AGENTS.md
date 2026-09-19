@@ -24,8 +24,11 @@ ViewModels, no backend. Everything on-device.
 - `android.suppressUnsupportedCompileSdk=36` is set (AGP 8.7.3 tested to 35).
 - JDK 17 (`Microsoft\jdk-17.0.20.101-hotspot`), SDK at
   `%LOCALAPPDATA%\Android\Sdk`, `local.properties` points there.
-- Emulator: `Pixel6_API34`, WHPX acceleration. **No audio out** — verify
-  playback via UI state + logcat, never sound.
+- Emulator: `Pixel_API36` (Android 16, API 36), WHPX acceleration.
+  **No audio out** — verify playback via UI state + logcat, never sound.
+  Emulator DNS breaks often (`unknown host` — reboot does NOT fix it):
+  `adb shell settings put global private_dns_mode hostname` +
+  `settings put global private_dns_specifier dns.google`, then relaunch.
 
 ## File map (`app/src/main/java/com/cresca/app/`)
 
@@ -35,6 +38,8 @@ ViewModels, no backend. Everything on-device.
 | `YoutubeRepository.kt` | Extractor facade. `searchSongs` (StreamInfoItem, duration ≤ 600 s), `audioUrl(s)` (5 h cache, ranked hosts), `videoOptions`/`videoUrl` (muxed ≤720p, 5 h cache), `videoDetails` (credits + DASH url), `dropCachedUrl`. Custom OkHttp downloader (25 s timeouts) attaches login cookies. |
 | `PlayerQueue.kt` | Queue engine. `order` list (identity/shuffled), manual repeat (player stays un-looped), `resolveAndPlay`, `primeNext` (buffers N+1 behind current), `confirmAdvanced` (adopts gapless flip), `retryWithNextUrl` (403 fallback). |
 | `PlaybackService.kt` | MediaSessionService. Owns audio ExoPlayer (1.5 s start buffer). Foregrounds **only when playback starts** (eager foreground = ANR). 10 s progress ticker for Live Updates. |
+| `Precache.kt` | BG store for next songs: CacheWriter audio bytes (10 MB cap) into ExoCache + Coil disk-cache artwork warm. Called on every track change for the next 2. |
+| `ExoCache.kt` | 300 MB SimpleCache singleton backing the player datasource. |
 | `LiveUpdateProvider.kt` | Delegates to Media3 default provider, rebuilds as promoted `ProgressStyle` on API 36+ (`android.requestPromotedOngoing` extra). Fallback elsewhere. |
 | `LyricsRepository.kt` | lrclib fuzzy `/api/search` with artist/title cleaning (channel blobs + label blocklist dropped) and scored candidates → `lyrics.ovh` → `NotFound`. |
 | `LyricsFlow.kt` | Karaoke view (active red/bold/scaled, auto-scroll). |
@@ -115,8 +120,9 @@ Start-Process C:\Gradle\gradle-8.9\bin\gradle.bat `
 - Precise taps: `adb shell uiautomator dump`, parse per-`<node>` bounds
   (dumps are single-line XML — regex per node, not per line), tap centers.
 - Screenshots: `screencap -p`, `adb pull`, downscale with PIL for reading.
-- Emulator loses DNS sometimes (`unknown host`): reboot it; don't chase
-  it as an app bug. System-UI ANRs under host load are environmental.
+- Emulator losing DNS (`unknown host`) is environmental — see toolchain note
+  above, don't chase it as an app bug. System-UI ANRs under host load are
+  environmental.
 - Playback proof on emulator: logcat `playing <title>`, ⏸ icons,
   advancing seek positions, Opus decoder lines. Media notification:
   expand shade. Media session: `dumpsys media_session`.

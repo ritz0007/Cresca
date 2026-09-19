@@ -87,8 +87,9 @@ object LyricsRepository {
     }
 
     // Fuzzy lrclib search: full records come back, synced lyrics included.
-    // Returns null when nothing matches well enough.
-    private fun searchLrclib(query: String): LyricsState? {
+    // durationMs (track length, 0 when unknown) disambiguates covers and
+    // wrong songs sharing a title. Returns null when nothing matches well.
+    private fun searchLrclib(query: String, durationMs: Long): LyricsState? {
         try {
             val body = get(
                 "https://lrclib.net/api/search?q=" + URLEncoder.encode(query, "UTF-8")
@@ -97,10 +98,12 @@ object LyricsRepository {
             if (arr.length() == 0) {
                 return null
             }
-            var bestScore = -1
+            var bestScore = -1000
             var bestSynced = ""
             var bestPlain = ""
+            var bestLabel = ""
             val ql = query.lowercase()
+            val qwords = ql.split(Regex("""\s+""")).filter { it.length > 3 }
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
                 val tn = o.optString("trackName", "")
@@ -108,52 +111,80 @@ object LyricsRepository {
                 if (tn.isBlank()) {
                     continue
                 }
-                var score = 0
                 val synced = o.optString("syncedLyrics", "")
                 val plain = o.optString("plainLyrics", "")
-                if (synced.isNotBlank()) {
-                    score += 3
-                } else if (plain.isNotBlank()) {
-                    score += 1
-                } else {
+                val durSec = o.optDouble("duration", Double.NaN)
+                if (synced.isBlank() && plain.isBlank()) {
                     continue
                 }
                 val tl = tn.lowercase()
                 val al = an.lowercase()
-                // Title word overlap required: kills unrelated hits.
-                val qwords = ql.split(Regex("""\s+""")).filter { it.length > 3 }
-                var overlap = false
-                for (w in qwords) {
-                    if (tl.contains(w)) {
-                        overlap = true
-                        break
-                    }
-                }
-                if (!overlap) {
+                // Strong title gate: need exact normalized equality, a
+                // start-match, or 2+ significant shared words.
+                val normQ = ql.replace(Regex("""[^a-z0-9 ]"""), " ")
+                    .split(Regex("""\s+""")).filter { it.length > 2 }
+                val normT = tl.replace(Regex("""[^a-z0-9 ]"""), " ")
+                    .split(Regex("""\s+""")).filter { it.length > 2 }
+                val shared = normQ.count { it in normT }
+                val exactTitle = normQ.isNotEmpty() && normQ == normT
+                val startMatch = normQ.isNotEmpty() && normT.isNotEmpty() &&
+                    (normT.take(normQ.size) == normQ || normQ.take(normT.size) == normT)
+                if (!exactTitle && !startMatch && shared < 2) {
                     continue
                 }
-                if (tl.startsWith(qwords.firstOrNull() ?: "@@@")) {
+                var score = 0
+                if (synced.isNotBlank()) {
+                    score += 4
+                } else {
                     score += 1
                 }
-                if (al.isNotBlank() && ql.contains(al.split(" ").firstOrNull() ?: "@@@")) {
-                    score += 1
+                if (exactTitle) {
+                    score += 4
+                } else if (startMatch) {
+                    score += 2
+                } else {
+                    score += shared
+                }
+                if (al.isNotBlank()) {
+                    val aw = al.split(Regex("""\s+""")).filter { it.length > 2 }
+                    if (aw.isNotEmpty() && aw.all { ql.contains(it) }) {
+                        score += 4
+                    } else if (aw.any { ql.contains(it) }) {
+                        score += 1
+                    } else {
+                        // Confident wrong artist: penalize hard.
+                        score -= 4
+                    }
+                }
+                // Duration proximity: official audio vs lyric video/covers.
+                if (durationMs > 0 && !durSec.isNaN() && durSec > 0) {
+                    val diff = kotlin.math.abs(durSec * 1000 - durationMs)
+                    when {
+                        diff <= 10000 -> score += 4
+                        diff <= 25000 -> score += 1
+                        diff > 60000 -> score -= 6
+                        else -> score -= 2
+                    }
                 }
                 if (score > bestScore) {
                     bestScore = score
                     bestSynced = synced
                     bestPlain = plain
+                    bestLabel = "$tn - $an"
                 }
             }
-            if (bestScore < 0) {
+            if (bestScore < 4) {
                 return null
             }
             if (bestSynced.isNotBlank()) {
                 val lines = parseLrc(bestSynced)
                 if (lines.isNotEmpty()) {
+                    Log.i(TAG, "lyrics lrclib-search: $bestLabel (score $bestScore)")
                     return LyricsState.Synced(lines)
                 }
             }
             if (bestPlain.isNotBlank()) {
+                Log.i(TAG, "lyrics lrclib-search-plain: $bestLabel (score $bestScore)")
                 return LyricsState.Plain(bestPlain)
             }
             return null
@@ -163,13 +194,57 @@ object LyricsRepository {
         }
     }
 
-    /** Free sources, no keys. Tries fuzzy variants before giving up. */
-    suspend fun fetch(artist: String, title: String): LyricsState =
+    // Exact lrclib endpoint: precise artist+title hit when cleaning worked.
+    private fun getLrclibExact(artist: String, title: String, durationMs: Long): LyricsState? {
+        try {
+            if (artist.isBlank() || title.isBlank()) {
+                return null
+            }
+            val url = "https://lrclib.net/api/get?artist_name=" +
+                URLEncoder.encode(artist, "UTF-8") + "&track_name=" +
+                URLEncoder.encode(title, "UTF-8")
+            val body = get(url) ?: return null
+            val o = JSONObject(body)
+            val synced = o.optString("syncedLyrics", "")
+            val plain = o.optString("plainLyrics", "")
+            if (synced.isBlank() && plain.isBlank()) {
+                return null
+            }
+            val durSec = o.optDouble("duration", Double.NaN)
+            if (durationMs > 0 && !durSec.isNaN() && durSec > 0 &&
+                kotlin.math.abs(durSec * 1000 - durationMs) > 45000
+            ) {
+                Log.i(TAG, "lyrics exact rejected on duration")
+                return null
+            }
+            if (synced.isNotBlank()) {
+                val lines = parseLrc(synced)
+                if (lines.isNotEmpty()) {
+                    Log.i(TAG, "lyrics lrclib-exact: $title - $artist")
+                    return LyricsState.Synced(lines)
+                }
+            }
+            if (plain.isNotBlank()) {
+                Log.i(TAG, "lyrics lrclib-exact-plain: $title - $artist")
+                return LyricsState.Plain(plain)
+            }
+            return null
+        } catch (e: Exception) {
+            return null
+        }
+    }
+
+    /** Free sources, no keys. Exact first, fuzzy variants, then plain. */
+    suspend fun fetch(artist: String, title: String, durationMs: Long = 0L): LyricsState =
         withContext(Dispatchers.IO) {
             val a = cleanArtist(artist)
             val t = cleanTitle(title)
             if (t.length < 2) {
                 return@withContext LyricsState.NotFound
+            }
+            try {
+                getLrclibExact(a, t, durationMs)?.let { return@withContext it }
+            } catch (e: Exception) {
             }
             val queries = ArrayList<String>()
             if (a.isNotBlank()) {
@@ -178,7 +253,7 @@ object LyricsRepository {
             queries.add(t)
             for (q in queries) {
                 try {
-                    searchLrclib(q)?.let { return@withContext it }
+                    searchLrclib(q, durationMs)?.let { return@withContext it }
                 } catch (e: Exception) {
                 }
             }
@@ -192,6 +267,7 @@ object LyricsRepository {
                 if (body != null) {
                     val txt = JSONObject(body).optString("lyrics", "").trim()
                     if (txt.isNotBlank()) {
+                        Log.i(TAG, "lyrics ovh-plain: $t")
                         return@withContext LyricsState.Plain(txt)
                     }
                 }
@@ -201,8 +277,17 @@ object LyricsRepository {
             LyricsState.NotFound
         }
 
-    private fun parseLrc(lrc: String): List<LyricLine> =
-        lrc.lineSequence().mapNotNull { raw ->
+    private fun parseLrc(lrc: String): List<LyricLine> {
+        // Global offset tag shifts every line ([offset:+500] / [offset:-200]).
+        var shift = 0L
+        val offMatch = Regex("""\[offset:\s*([+-]?\d+)\]""").find(lrc)
+        if (offMatch != null) {
+            try {
+                shift = offMatch.groupValues[1].toLong()
+            } catch (e: Exception) {
+            }
+        }
+        return lrc.lineSequence().mapNotNull { raw ->
             val m = lrcLine.find(raw.trim()) ?: return@mapNotNull null
             val text = m.groupValues[4].trim()
             if (text.isEmpty()) return@mapNotNull null
@@ -217,6 +302,9 @@ object LyricsRepository {
                     frac.toLong()
                 }
             }
-            LyricLine((min * 60 + sec) * 1000 + ms, text)
+            val at = (min * 60 + sec) * 1000 + ms + shift
+            if (at < 0) return@mapNotNull null
+            LyricLine(at, text)
         }.toList()
+    }
 }

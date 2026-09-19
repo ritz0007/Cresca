@@ -24,11 +24,15 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyHorizontalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -46,6 +50,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.platform.LocalContext
@@ -75,6 +80,9 @@ import dev.chrisbanes.haze.materials.ExperimentalHazeMaterialsApi
 import dev.chrisbanes.haze.materials.HazeMaterials
 import dev.chrisbanes.haze.rememberHazeState
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -84,11 +92,23 @@ import kotlin.coroutines.resumeWithException
 import java.io.File
 
 private const val TAG = "Cresca"
-private const val HOME_QUERY = "latest hindi songs"
 private const val HOME_CACHE_TTL = 12 * 60 * 60 * 1000L
 private const val SEARCH_CACHE_TTL = 30 * 60 * 1000L
 
 private data class Tab(val label: String, val icon: ImageVector)
+
+/**
+ * See All opens a full page (not a sheet). Query/kiosk kinds paginate
+ * endlessly via extractor continuations; static kind shows a fixed list.
+ */
+private data class SeeAllRequest(
+    val title: String,
+    val subtitle: String = "",
+    val query: String = "",
+    val music: Boolean = true,
+    val kiosk: Boolean = false,
+    val static: List<YtTrack> = emptyList()
+)
 
 private val tabs = listOf(
     Tab("Listen Now", Icons.Filled.Home),
@@ -102,6 +122,21 @@ private fun fmtMs(ms: Long): String {
     if (ms <= 0) return "0:00"
     val s = ms / 1000
     return "${s / 60}:${String.format("%02d", s % 60)}"
+}
+
+// HD artwork: maxres for YouTube ids (falls back to the thumb when
+// missing), untouched otherwise.
+private fun hdThumb(t: YtTrack): String {
+    try {
+        if (t.id.length == 11 && t.id.all {
+                it.isLetterOrDigit() || it == '-' || it == '_'
+            }
+        ) {
+            return "https://i.ytimg.com/vi/${t.id}/maxresdefault.jpg"
+        }
+    } catch (e: Exception) {
+    }
+    return t.thumbUrl
 }
 
 // Shared track metadata for audio/video media items (top-level: usable anywhere).
@@ -186,7 +221,6 @@ class MainActivity : ComponentActivity() {
                 else -> isSystemInDarkTheme()
             }
             AppleMusicTheme(darkTheme = dark) {
-                SystemBars(dark)
                 AppleMusicApp(
                     onReady = { uiReady = true },
                     themeMode = themeMode,
@@ -203,18 +237,38 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-/** Status + nav bars follow the theme (fixes white bars in dark mode). */
+/** Status + nav bars follow the page: artwork-dominant color inside the
+ * player, transparent glass everywhere else. */
 @Composable
-private fun SystemBars(dark: Boolean) {
+private fun SystemBars(dark: Boolean, barColor: Color? = null) {
     val view = LocalView.current
-    DisposableEffect(dark) {
+    DisposableEffect(dark, barColor) {
         try {
             val window = (view.context as android.app.Activity).window
-            window.statusBarColor = android.graphics.Color.TRANSPARENT
-            window.navigationBarColor = android.graphics.Color.TRANSPARENT
-            WindowCompat.getInsetsController(window, view).apply {
-                isAppearanceLightStatusBars = !dark
-                isAppearanceLightNavigationBars = !dark
+            if (barColor != null) {
+                val argb = android.graphics.Color.argb(
+                    255,
+                    (barColor.red * 255).toInt().coerceIn(0, 255),
+                    (barColor.green * 255).toInt().coerceIn(0, 255),
+                    (barColor.blue * 255).toInt().coerceIn(0, 255)
+                )
+                window.statusBarColor = argb
+                window.navigationBarColor = argb
+                // Dark artwork -> light icons.
+                val lightBars = (barColor.red * 0.2126 + barColor.green * 0.7152 + barColor.blue * 0.0722) > 0.45f
+                WindowCompat.getInsetsController(window, view).apply {
+                    isAppearanceLightStatusBars = lightBars
+                    isAppearanceLightNavigationBars = lightBars
+                }
+            } else {
+                window.statusBarColor = android.graphics.Color.TRANSPARENT
+                window.navigationBarColor = android.graphics.Color.TRANSPARENT
+                WindowCompat.getInsetsController(window, view).apply {
+                    // Fallback theme color: dark = light icons, light = dark icons
+                    val lightBars = !dark
+                    isAppearanceLightStatusBars = lightBars
+                    isAppearanceLightNavigationBars = lightBars
+                }
             }
         } catch (e: Exception) {
         }
@@ -306,10 +360,25 @@ fun AppleMusicAppContent(
     var isPlaying by remember { mutableStateOf(false) }
     var playerState by remember { mutableIntStateOf(Player.STATE_IDLE) }
     var playerError by remember { mutableStateOf<String?>(null) }
+    val dark = when (themeMode) {
+        "light" -> false
+        "dark" -> true
+        else -> isSystemInDarkTheme()
+    }
 
     var selectedTab by remember { mutableIntStateOf(0) }
     var query by remember { mutableStateOf("") }
     var homeTracks by remember { mutableStateOf<List<YtTrack>>(emptyList()) }
+    // YT Music style variety: per-section rails loaded in parallel.
+    var homeSections by remember { mutableStateOf<Map<String, List<YtTrack>>>(emptyMap()) }
+    // Endless explore: rails appended as the user scrolls (never ends).
+    var endlessRails by remember { mutableStateOf<List<HomeSection>>(emptyList()) }
+    var loadingMoreRails by remember { mutableStateOf(false) }
+    // Every refresh rotates Top Picks seeds (page always changes).
+    var refreshCount by remember { mutableIntStateOf(kotlin.random.Random.nextInt(0, 1000)) }
+    var isRefreshing by remember { mutableStateOf(false) }
+    // See All source per rail title (powers endless full pages).
+    var railSources by remember { mutableStateOf<Map<String, SeeAllRequest>>(emptyMap()) }
     var homeLoading by remember { mutableStateOf(true) }
     var homeError by remember { mutableStateOf<String?>(null) }
     var homeTick by remember { mutableIntStateOf(0) }
@@ -326,6 +395,7 @@ fun AppleMusicAppContent(
     var videoQualityH by remember { mutableIntStateOf(-1) }
     var dashUrl by remember { mutableStateOf("") }
     var dashCapH by remember { mutableIntStateOf(0) }
+    var upcomingTick by remember { mutableIntStateOf(0) }
 
     // Quality rows for the picker: DASH caps when available, else muxed heights.
     fun qualityLabels(): List<String> {
@@ -395,9 +465,8 @@ fun AppleMusicAppContent(
         }
     }
     var showQueue by remember { mutableStateOf(false) }
-    var seeAllTitle by remember { mutableStateOf("") }
-    var seeAllTracks by remember { mutableStateOf<List<YtTrack>>(emptyList()) }
-    var showSeeAll by remember { mutableStateOf(false) }
+    // See All is a full page (not a sheet) with endless pagination.
+    var seeAllPage by remember { mutableStateOf<SeeAllRequest?>(null) }
     var searchFocusTick by remember { mutableIntStateOf(0) }
     var lastSearchTap by remember { mutableLongStateOf(0L) }
     var loggedIn by remember { mutableStateOf(false) }
@@ -432,10 +501,29 @@ fun AppleMusicAppContent(
     }
     var showPlaylist by remember { mutableStateOf<Playlist?>(null) }
 
-    fun openPlaylist(id: String) {
-        try {
-            showPlaylist = PlaylistStore.list(context).find { it.id == id }
+    // Artwork-dominant color drives the player + system bars.
+    var playerDom by remember { mutableStateOf(Color(0xFF3A0A12)) }
+    LaunchedEffect(nowPlaying?.id) {
+        val t = nowPlaying
+        playerDom = try {
+            if (t != null && t.thumbUrl.isNotBlank()) {
+                dominantColor(context, t.thumbUrl)
+            } else {
+                Color(0xFF3A0A12)
+            }
         } catch (e: Exception) {
+            Color(0xFF3A0A12)
+        }
+    }
+    SystemBars(dark, if (showFullPlayer) playerDom else null)
+
+    fun openPlaylist(id: String) {
+        // Store I/O off main (EncryptedSharedPreferences/file JSON ANRs).
+        scope.launch(Dispatchers.IO) {
+            try {
+                showPlaylist = PlaylistStore.list(context).find { it.id == id }
+            } catch (e: Exception) {
+            }
         }
     }
 
@@ -487,16 +575,58 @@ fun AppleMusicAppContent(
         }
     }
 
+    // Non-stop guard: consecutive auto-skips. Stops after 5 so a fully
+    // dead queue surfaces an error instead of spinning forever.
+    var autoSkipErrors by remember { mutableIntStateOf(0) }
+    // Session-restore state (Spotify-style cold start, no autoplay).
+    var restoredPos by remember { mutableLongStateOf(0L) }
+    var sessionRestored by remember { mutableStateOf(false) }
+    var restoreSeekDone by remember { mutableStateOf(false) }
+
+    // Holder breaks the local-fun forward-reference cycle: queue callbacks
+    // run later and must be able to call back into the queue.
+    val queueHolder = remember { arrayOfNulls<PlayerQueue>(1) }
     val queue = remember {
         PlayerQueue(player, scope,
             onResolveStart = { resolving = true },
             onResolved = { t ->
                 resolving = false
                 playerError = null
+                autoSkipErrors = 0
                 nowPlaying = t
                 pushRecent(t)
                 startPlaybackService()
+                // Persist last session via holder (avoids self-reference).
+                scope.launch {
+                    try {
+                        val q = queueHolder[0]
+                        val pos = try {
+                            player.currentPosition
+                        } catch (e: Exception) {
+                            0L
+                        }
+                        if (q != null) {
+                            PlaybackStateStore.save(
+                                context, q.snapshot(), q.currentIndex,
+                                t, pos, q.shuffleOn, q.repeatModeState
+                            )
+                        }
+                    } catch (e: Exception) {
+                    }
+                }
                 Log.i(TAG, "playing ${t.title}")
+                // Every change tops Up Next back up to ~20 related tracks
+                // (trigger-state: refreshUpcoming is declared below).
+                upcomingTick++
+                // BG store the next playable songs (bytes + artwork) so
+                // skipping forward is instant even on flaky networks.
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        val q = queueHolder[0] ?: return@launch
+                        Precache.warmUpcoming(context, q.upcomingIds(2))
+                    } catch (e: Exception) {
+                    }
+                }
                 // Warm the video options so audio->video flips instantly.
                 scope.launch {
                     try {
@@ -514,13 +644,162 @@ fun AppleMusicAppContent(
             },
             onError = { msg ->
                 resolving = false
-                playerError = msg
-            })
+                // Non-stop: unplayable track -> skip forward automatically.
+                val q = queueHolder[0]
+                if (autoSkipErrors < 5 && (q?.hasNext() == true)) {
+                    autoSkipErrors++
+                    playerError = "Skipping unavailable song…"
+                    scope.launch {
+                        delay(600)
+                        try {
+                            q?.next()
+                        } catch (e: Exception) {
+                            playerError = msg
+                        }
+                    }
+                } else {
+                    playerError = msg
+                }
+            },
+            onExhausted = { t ->
+                // Queue ran dry: autoplay related tracks of the current song.
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        val q = queueHolder[0] ?: return@launch
+                        val rel = try {
+                            YoutubeRepository.autoplayFor(t, 20)
+                        } catch (e: Exception) {
+                            emptyList()
+                        }.filter { r -> q.snapshot().none { it.id == r.id } }
+                        if (rel.isEmpty()) return@launch
+                        withContext(Dispatchers.Main) {
+                            try {
+                                q.appendAuto(rel)
+                                autoSkipErrors = 0
+                                playerError = null
+                                Log.i(TAG, "autoplay ${rel.size} related")
+                                q.next()
+                            } catch (e: Exception) {
+                            }
+                        }
+                    } catch (e: Exception) {
+                    }
+                }
+            }).also { queueHolder[0] = it }
     }
 
-    // Auto-advance at track end (repeat/shuffle handled inside queue)
+    // Keep ~20 upcoming tracks after every change (related autoplay).
+    var upcomingJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    fun saveSessionNow() {
+        scope.launch {
+            try {
+                val t = nowPlaying ?: return@launch
+                if (queue.items.isEmpty()) return@launch
+                val pos = try {
+                    player.currentPosition
+                } catch (e: Exception) {
+                    0L
+                }
+                PlaybackStateStore.save(
+                    context, queue.snapshot(), queue.currentIndex,
+                    t, pos, queue.shuffleOn, queue.repeatModeState
+                )
+            } catch (e: Exception) {
+            }
+        }
+    }
+    fun refreshUpcoming() {
+        try {
+            upcomingJob?.cancel()
+        } catch (e: Exception) {
+        }
+        upcomingJob = scope.launch {
+            try {
+                val cur = queue.current ?: return@launch
+                if (queue.upcomingCount() >= 20) return@launch
+                queue.clearAutoTail()
+                if (queue.current?.id != cur.id) return@launch
+                val rel = withContext(Dispatchers.IO) {
+                    try {
+                        YoutubeRepository.autoplayFor(cur, 30)
+                    } catch (e: Exception) {
+                        emptyList()
+                    }
+                }
+                if (queue.current?.id != cur.id) return@launch
+                val fresh = rel.filter { r -> queue.snapshot().none { it.id == r.id } }
+                    .take((20 - queue.upcomingCount()).coerceAtLeast(0))
+                Log.i(TAG, "related ${rel.size}, fresh ${fresh.size}")
+                if (fresh.isNotEmpty()) {
+                    queue.appendAuto(fresh)
+                    Log.i(TAG, "upcoming topped to ${queue.upcomingCount()}")
+                }
+            } catch (e: Exception) {
+            }
+        }
+    }
+    // Smart shuffle: preference-scored order (liked/recent/same artist),
+    // randomized within score tiers so it still feels like a shuffle.
+    fun applySmartShuffle() {
+        try {
+            val q = queue
+            if (q.items.size < 2 || q.currentIndex == -1) return
+            val likedA = liked.map { it.artist.lowercase() }.toSet()
+            val recentA = recent.take(8).map { it.artist.lowercase() }
+            val curA = q.current?.artist?.lowercase() ?: ""
+            val rnd = kotlin.random.Random(System.currentTimeMillis())
+            val rest = q.items.indices.filter { it != q.currentIndex }.map { idx ->
+                val t = q.items[idx]
+                var s = 0
+                val ta = t.artist.lowercase()
+                if (ta in likedA) s += 3
+                val ri = recentA.indexOf(ta)
+                if (ri >= 0) s += 2 - ri / 4
+                if (ta.isNotEmpty() && ta == curA) s += 2
+                Pair(s, idx)
+            }.sortedWith(compareByDescending<Pair<Int, Int>> { it.first }
+                .thenBy { rnd.nextInt() })
+            q.applyOrder(listOf(q.currentIndex) + rest.map { it.second })
+            Log.i(TAG, "smart shuffle applied")
+        } catch (e: Exception) {
+            Log.w(TAG, "smart shuffle failed", e)
+        }
+    }
+    fun cycleShuffleUi() {
+        try {
+            val m = queue.cycleShuffle()
+            if (m == PlayerQueue.SHUFFLE_SMART) {
+                applySmartShuffle()
+            }
+            refreshUpcoming()
+            saveSessionNow()
+        } catch (e: Exception) {
+        }
+    }
+
+    // Up Next top-up trigger (set by resolve callbacks above).
+    LaunchedEffect(upcomingTick) {
+        if (upcomingTick > 0) {
+            Log.i(TAG, "upcoming check")
+            refreshUpcoming()
+        }
+    }
+
+    // Auto-advance at track end (repeat/shuffle handled inside queue).
+    // Dead-end fix: last track + repeat OFF previously sat in ENDED with
+    // the seek bar stuck at the end. Now rewind to 0 and pause (replay).
     LaunchedEffect(playerState) {
-        if (playerState == Player.STATE_ENDED) queue.next()
+        if (playerState == Player.STATE_ENDED) {
+            if (queue.hasNext()) {
+                queue.next()
+            } else {
+                try {
+                    player.seekTo(0)
+                    player.pause()
+                } catch (e: Exception) {
+                }
+            }
+        }
     }
 
     // Gapless lookahead trigger (set by resolve callbacks above).
@@ -550,11 +829,41 @@ fun AppleMusicAppContent(
                     }
                     playerError = "Retrying…"
                     if (!queue.retryWithNextUrl()) {
-                        playerError = "YouTube blocked playback (403)"
+                        // Hosts exhausted: fall through to auto-skip below.
+                        if (autoSkipErrors < 5 && queue.hasNext()) {
+                            autoSkipErrors++
+                            playerError = "Skipping blocked song…"
+                            scope.launch {
+                                delay(600)
+                                try {
+                                    queue.next()
+                                } catch (e: Exception) {
+                                }
+                            }
+                        } else {
+                            playerError = "YouTube blocked playback (403)"
+                        }
+                    } else {
+                        autoSkipErrors = 0
                     }
                     return
                 }
-                playerError = error.message ?: "Playback error (${error.errorCode})"
+                // Any other error (network/decoding/DASH): never dead-end the
+                // mini-player. Retry once via resolve, else skip forward.
+                if (autoSkipErrors < 5 && queue.hasNext()) {
+                    autoSkipErrors++
+                    playerError = "Skipping… (${error.errorCode})"
+                    scope.launch {
+                        delay(800)
+                        try {
+                            queue.next()
+                        } catch (e: Exception) {
+                            playerError = error.message ?: "Playback error (${error.errorCode})"
+                        }
+                    }
+                } else {
+                    playerError = error.message ?: "Playback error (${error.errorCode})"
+                }
             }
         }
         player.addListener(listener)
@@ -567,13 +876,26 @@ fun AppleMusicAppContent(
     var duration by remember { mutableLongStateOf(0L) }
     LaunchedEffect(Unit) {
         while (true) {
-            position = player.currentPosition
-            duration = player.duration.coerceAtLeast(0L)
+            try {
+                position = try {
+                    player.currentPosition
+                } catch (e: Exception) {
+                    0L
+                }
+                duration = try {
+                    player.duration.coerceAtLeast(0L)
+                } catch (e: Exception) {
+                    0L
+                }
+            } catch (e: Exception) {
+                // Controller released (config change / dispose): stop the clock.
+                break
+            }
             delay(500)
         }
     }
 
-    // Lyrics follow the current track
+    // Lyrics follow the current track (duration disambiguates matches).
     var lyrics by remember { mutableStateOf<LyricsState>(LyricsState.NotFound) }
     LaunchedEffect(nowPlaying) {
         val t = nowPlaying
@@ -581,7 +903,103 @@ fun AppleMusicAppContent(
             lyrics = LyricsState.NotFound
         } else {
             lyrics = LyricsState.Loading
-            lyrics = LyricsRepository.fetch(t.artist, t.title)
+            // Player duration may still be unknown right at track change;
+            // wait briefly so duration scoring has real data.
+            var dur = 0L
+            for (i in 0 until 6) {
+                try {
+                    dur = player.duration.coerceAtLeast(0L)
+                } catch (e: Exception) {
+                }
+                if (dur > 30000L) break
+                delay(500)
+            }
+            if (nowPlaying?.id != t.id) return@LaunchedEffect
+            lyrics = LyricsRepository.fetch(t.artist, t.title, dur)
+        }
+    }
+
+    // ---- Spotify/Apple Music style resume: restore last queue + position
+    // on cold start WITHOUT autoplaying. Mini-player shows the track.
+    LaunchedEffect(Unit) {
+        try {
+            val saved = PlaybackStateStore.load(context)
+            if (saved != null && saved.tracks.isNotEmpty() && nowPlaying == null) {
+                val idx = queue.setQueueSilent(
+                    saved.tracks, saved.index, saved.shuffleOn, saved.repeatMode
+                )
+                val track = queue.items.getOrNull(idx)
+                if (track != null) {
+                    nowPlaying = track
+                    restoredPos = saved.positionMs
+                    sessionRestored = true
+                    // Prime the audio URL in background so Resume is instant.
+                    // NOTE: MediaController must be touched on the app thread.
+                    scope.launch(Dispatchers.IO) {
+                        try {
+                            val url = YoutubeRepository.audioUrl(track.watchUrl)
+                            if (url == null) return@launch
+                            if (nowPlaying?.id != track.id) return@launch
+                            withContext(Dispatchers.Main) {
+                                try {
+                                    if (nowPlaying?.id != track.id) return@withContext
+                                    if (player.mediaItemCount != 0) return@withContext
+                                    player.setMediaItem(
+                                        MediaItem.Builder()
+                                            .setUri(url)
+                                            .setMediaId(track.id)
+                                            .setMediaMetadata(metaFor(track))
+                                            .build()
+                                    )
+                                    player.prepare()
+                                    val seekTo = restoredPos.coerceAtLeast(0L)
+                                    if (seekTo > 5000L) {
+                                        try {
+                                            player.seekTo(seekTo)
+                                        } catch (e: Exception) {
+                                        }
+                                    }
+                                    player.pause()
+                                    restoreSeekDone = true
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "restore prime failed", e)
+                                }
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "restore resolve failed", e)
+                        }
+                    }
+                    Log.i(TAG, "session restored ${track.title} @${saved.positionMs}")
+                }
+            } else {
+                sessionRestored = true
+            }
+        } catch (e: Exception) {
+            sessionRestored = true
+        }
+    }
+
+    // 5s position ticker (SimpMusic mayBeSaveRecentPosition pattern):
+    // covers kills with no lifecycle edge.
+    LaunchedEffect(nowPlaying) {
+        while (nowPlaying != null) {
+            delay(5000)
+            try {
+                val t = nowPlaying ?: break
+                if (queue.items.isEmpty()) continue
+                val pos = try {
+                    player.currentPosition
+                } catch (e: Exception) {
+                    continue
+                }
+                // Don't persist the ENDED dead zone.
+                if (pos <= 0L) continue
+                PlaybackStateStore.save(
+                    context, queue.snapshot(), queue.currentIndex,
+                    t, pos, queue.shuffleOn, queue.repeatModeState
+                )
+            } catch (e: Exception) {
+            }
         }
     }
 
@@ -619,25 +1037,36 @@ fun AppleMusicAppContent(
     }
 
     fun play(track: YtTrack) {
-        if (resolving) return
+        // Stuck fix: never drop taps while resolving. Cancel the stale
+        // resolve so the new tap wins instantly (generation token in queue).
+        queue.cancelPending()
+        resolving = false
         playerError = null
-        // Offline first: downloaded songs play without network
-        try {
-            if (DownloadStore.isDownloaded(context, track.id)) {
-                DownloadStore.fileFor(context, track.id)?.let { playFile(track, it); return }
-            }
-        } catch (e: Exception) {
-        }
-        if (track.watchUrl.isBlank()) { nowPlaying = track; return } // demo item
+        autoSkipErrors = 0
+        if (track.watchUrl.isBlank()) { nowPlaying = track; return }
         val idx = queue.items.indexOfFirst { it.id == track.id }
         if (player.mediaItemCount > 0 && queue.current?.id == track.id) {
             if (player.isPlaying) player.pause() else player.play()
             return
         }
         nowPlaying = track
-        if (queue.items.isEmpty()) queue.setQueue(listOf(track), 0)
-        else if (idx == -1) queue.playTrack(track)
-        else queue.playAt(idx)
+        // Offline-first check off the main thread (file I/O).
+        scope.launch(Dispatchers.IO) {
+            val offline: File? = try {
+                if (DownloadStore.isDownloaded(context, track.id)) {
+                    DownloadStore.fileFor(context, track.id)
+                } else null
+            } catch (e: Exception) {
+                null
+            }
+            if (offline != null) {
+                playFile(track, offline)
+                return@launch
+            }
+            if (queue.items.isEmpty()) queue.setQueue(listOf(track), 0)
+            else if (queue.items.indexOfFirst { it.id == track.id } == -1) queue.playTrack(track)
+            else queue.playAt(queue.items.indexOfFirst { it.id == track.id })
+        }
     }
 
     fun togglePlay(track: YtTrack) {
@@ -647,16 +1076,17 @@ fun AppleMusicAppContent(
 
     fun playList(tracks: List<YtTrack>, index: Int = 0, shuffled: Boolean = false) {
         if (tracks.isEmpty()) return
+        queue.cancelPending()
+        resolving = false
         playerError = null
+        autoSkipErrors = 0
         val list = if (shuffled) tracks.shuffled() else tracks
         val i = index.coerceIn(list.indices)
         queue.setQueue(list, i)
         nowPlaying = list[i]
     }
-    fun openSeeAll(title: String, tracks: List<YtTrack>) {
-        seeAllTitle = title
-        seeAllTracks = tracks
-        showSeeAll = true
+    fun openSeeAll(req: SeeAllRequest) {
+        seeAllPage = req
     }
 
     // ---- Video mode: the SAME session player swaps audio<->video streams,
@@ -799,67 +1229,312 @@ fun AppleMusicAppContent(
         }
     }
 
-    // Home: cache instantly (splash releases fast), refresh silently.
-    // No demo data: loading spinner, then error + retry when offline.
+    // Home, SimpMusic-shaped: Quick/Top Picks first (ROTATED every refresh so
+    // the page always changes), then charts / new / moods / mixes rails.
+    // Cache first (splash releases fast), network refresh after.
+    // No demo data: spinner while loading, error + retry when offline.
     LaunchedEffect(homeTick) {
-        homeLoading = homeTracks.isEmpty()
+        val seed = HomeFeed.topSeed(refreshCount)
+        homeLoading = homeTracks.isEmpty() && homeSections.isEmpty()
         homeError = null
+        isRefreshing = homeTracks.isNotEmpty() || homeSections.isNotEmpty()
+        endlessRails = emptyList()
+        // 1) Instant caches for top + core sections.
         try {
             withContext(Dispatchers.IO) {
-                SongCache.load(context, "home", HOME_CACHE_TTL)
-            }?.let { cached ->
-                homeTracks = cached
-                live = true
-                if (queue.items.isEmpty()) {
-                    queue.replaceAll(cached)
-                    if (nowPlaying == null) nowPlaying = cached.firstOrNull()
+                val top = SongCache.load(context, "home_top", HOME_CACHE_TTL)
+                    ?: SongCache.load(context, "home", HOME_CACHE_TTL)
+                val map = HashMap<String, List<YtTrack>>()
+                for (s in HomeFeed.CORE) {
+                    try {
+                        SongCache.load(context, s.cacheKey, HomeFeed.SECTION_TTL_MS)?.let {
+                            if (it.isNotEmpty()) map[s.title] = it
+                        }
+                    } catch (e: Exception) {
+                    }
                 }
-                announce()
-                Log.i(TAG, "home from cache (${cached.size})")
+                Pair(top, map)
+            }.let { (cachedTop, cachedMap) ->
+                if (cachedTop != null && cachedTop.isNotEmpty()) {
+                    homeTracks = cachedTop
+                    live = true
+                    if (queue.items.isEmpty() && nowPlaying == null) {
+                        queue.replaceAll(cachedTop)
+                        nowPlaying = cachedTop.firstOrNull()
+                    }
+                    announce()
+                }
+                if (cachedMap.isNotEmpty()) {
+                    homeSections = cachedMap
+                    live = true
+                    announce()
+                }
+                if (cachedTop != null) Log.i(TAG, "home from cache (${cachedTop.size}, ${cachedMap.size} rails)")
             }
         } catch (e: Exception) {
             Log.w(TAG, "cache read failed", e)
         }
+        // Register See All sources for cached rails.
+        try {
+            val src = railSources.toMutableMap()
+            src["Top Picks For You"] = SeeAllRequest("Top Picks For You", seed.subtitle, seed.query)
+            for (s in HomeFeed.CORE) {
+                if (s.query == "__charts__") {
+                    src[s.title] = SeeAllRequest(s.title, s.subtitle, kiosk = true)
+                } else {
+                    src[s.title] = SeeAllRequest(s.title, s.subtitle, s.query)
+                }
+            }
+            railSources = src
+        } catch (e: Exception) {
+        }
+        // 2) Network refresh: Top Picks ALWAYS reload (rotating seed), so a
+        // refresh visibly changes the page. YT Music song search.
         var attempt = 0
         var loaded = false
         while (attempt < 2 && !loaded) {
             attempt++
             try {
-                val res = YoutubeRepository.searchSongs(HOME_QUERY, 25)
+                val res = YoutubeRepository.searchMusic(seed.query, 25)
                 if (res.isNotEmpty()) {
                     homeTracks = res
                     live = true
-                    if (queue.items.isEmpty()) {
+                    if (queue.items.isEmpty() && nowPlaying == null) {
                         queue.replaceAll(res)
-                        if (nowPlaying == null) nowPlaying = res.first()
+                        nowPlaying = res.first()
                     }
                     try {
                         scope.launch(Dispatchers.IO) {
                             try {
+                                SongCache.save(context, "home_top", res)
                                 SongCache.save(context, "home", res)
                             } catch (e: Exception) {
                             }
                         }
                     } catch (e: Exception) {
                     }
-                    Log.i(TAG, "home loaded ${res.size} songs from YouTube")
+                    Log.i(TAG, "top picks loaded ${res.size} (${seed.query})")
                     loaded = true
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "home load failed (attempt $attempt)", e)
+                Log.w(TAG, "top picks failed (attempt $attempt)", e)
                 if (attempt < 2) {
                     delay(1500)
                 }
             }
         }
-        if (homeTracks.isEmpty()) {
+        if (homeTracks.isEmpty() && homeSections.isEmpty()) {
             homeError = "Couldn't reach YouTube — check connection and retry"
         }
         homeLoading = false
+        isRefreshing = false
         announce() // never trap the splash
+        // 3) Other rails in background, 3 at a time: charts kiosk first,
+        // then core, then related mixes + personalized (history-driven,
+        // like SimpMusic's personalized shelves).
+        try {
+            val jobs = ArrayList<suspend () -> Pair<String, List<YtTrack>>?>()
+            if (homeSections["Charts Right Now"].isNullOrEmpty()) {
+                jobs.add({
+                    try {
+                        val res = YoutubeRepository.trendingMusic(12)
+                        if (res.isNotEmpty()) {
+                            try {
+                                SongCache.save(context, "home_charts", res)
+                            } catch (e: Exception) {
+                            }
+                            Pair("Charts Right Now", res)
+                        } else null
+                    } catch (e: Exception) {
+                        Log.w(TAG, "charts rail failed", e)
+                        null
+                    }
+                })
+            }
+            for (s in HomeFeed.CORE.drop(1)) {
+                if (!homeSections[s.title].isNullOrEmpty()) continue
+                jobs.add({
+                    try {
+                        // New Releases rail = true channel-feed new uploads.
+                        val res = if (s.title == "New Releases") {
+                            val artists = (HomeFeed.artistSeeds(liked + recent, 8) +
+                                listOf("Arijit Singh", "Shreya Ghoshal", "AP Dhillon"))
+                                .distinct()
+                            YoutubeRepository.newReleases(artists, 12)
+                        } else {
+                            YoutubeRepository.searchMusic(s.query, 12)
+                        }
+                        if (res.isNotEmpty()) {
+                            try {
+                                SongCache.save(context, s.cacheKey, res)
+                            } catch (e: Exception) {
+                            }
+                            Pair(s.title, res)
+                        } else null
+                    } catch (e: Exception) {
+                        Log.w(TAG, "rail ${s.title} failed", e)
+                        null
+                    }
+                })
+            }
+            // Related mixes from recent listening (SimpMusic radio-style).
+            try {
+                val seeds = recent.toList().filter { it.watchUrl.isNotBlank() }.take(2)
+                for ((ri, st) in seeds.withIndex()) {
+                    val key = "Because you played " + st.title.take(32)
+                    if (!homeSections[key].isNullOrEmpty()) continue
+                    jobs.add({
+                        try {
+                            val rel = YoutubeRepository.relatedTracks(st.watchUrl, 12)
+                            if (rel.isNotEmpty()) {
+                                try {
+                                    SongCache.save(context, "home_mix_$ri", rel)
+                                } catch (e: Exception) {
+                                }
+                                val src2 = railSources.toMutableMap()
+                                src2[key] = SeeAllRequest(
+                                    "More like this", st.title,
+                                    st.artist + " songs"
+                                )
+                                railSources = src2
+                                Pair(key, rel)
+                            } else null
+                        } catch (e: Exception) {
+                            null
+                        }
+                    })
+                }
+            } catch (e: Exception) {
+            }
+            // Personalized artist rails from library seeds.
+            try {
+                for (s in HomeFeed.personalized(liked, recent.toList())) {
+                    if (!homeSections[s.title].isNullOrEmpty()) continue
+                    jobs.add({
+                        try {
+                            val res = YoutubeRepository.searchMusic(s.query, 12)
+                            if (res.isNotEmpty()) {
+                                try {
+                                    SongCache.save(context, s.cacheKey, res)
+                                } catch (e: Exception) {
+                                }
+                                val src3 = railSources.toMutableMap()
+                                src3[s.title] = SeeAllRequest(s.title, s.subtitle, s.query)
+                                railSources = src3
+                                Pair(s.title, res)
+                            } else null
+                        } catch (e: Exception) {
+                            null
+                        }
+                    })
+                }
+            } catch (e: Exception) {
+            }
+            // Sequential with a breather: parallel extractor bursts get
+            // throttled by YouTube; one rail at a time + one retry wins.
+            for (job in jobs) {
+                try {
+                    var done: Pair<String, List<YtTrack>>? = null
+                    var attempt = 0
+                    while (attempt < 2 && done == null) {
+                        attempt++
+                        try {
+                            done = withContext(Dispatchers.IO) { job() }
+                        } catch (e: Exception) {
+                            if (attempt < 2) delay(2000)
+                        }
+                    }
+                    if (done != null) {
+                        val cur = homeSections.toMutableMap()
+                        cur[done.first] = done.second
+                        homeSections = cur
+                        live = true
+                    }
+                } catch (e: Exception) {
+                }
+                try {
+                    delay(700)
+                } catch (e: Exception) {
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "rails refresh failed", e)
+        }
+    }
+
+    // Endless explore: append the next discovery rail (cache first, then
+    // network). Cycles forever with per-cycle variety.
+    fun loadNextRail() {
+        if (loadingMoreRails) return
+        loadingMoreRails = true
+        scope.launch {
+            try {
+                val pos = endlessRails.size
+                val cycle = refreshCount
+                val s = HomeFeed.discoveryAt(pos, cycle)
+                if (homeSections[s.title].isNullOrEmpty()) {
+                    val cached: List<YtTrack>? = try {
+                        withContext(Dispatchers.IO) {
+                            SongCache.load(context, s.cacheKey, HomeFeed.SECTION_TTL_MS)
+                        }
+                    } catch (e: Exception) {
+                        null
+                    }
+                    if (!cached.isNullOrEmpty()) {
+                        val cur = homeSections.toMutableMap()
+                        cur[s.title] = cached
+                        homeSections = cur
+                        val src = railSources.toMutableMap()
+                        src[s.title] = SeeAllRequest(s.title, s.subtitle, s.query)
+                        railSources = src
+                    }
+                }
+                if (homeSections[s.title].isNullOrEmpty()) {
+                    val res: List<YtTrack> = try {
+                        YoutubeRepository.searchMusic(s.query, 12)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "discovery rail ${s.title} failed", e)
+                        emptyList()
+                    }
+                    if (res.isNotEmpty()) {
+                        try {
+                            withContext(Dispatchers.IO) {
+                                SongCache.save(context, s.cacheKey, res)
+                            }
+                        } catch (e: Exception) {
+                        }
+                        val cur = homeSections.toMutableMap()
+                        cur[s.title] = res
+                        homeSections = cur
+                        val src = railSources.toMutableMap()
+                        src[s.title] = SeeAllRequest(s.title, s.subtitle, s.query)
+                        railSources = src
+                        live = true
+                    }
+                }
+                if (!endlessRails.any { it.title == s.title } &&
+                    !homeSections[s.title].isNullOrEmpty()
+                ) {
+                    endlessRails = endlessRails + s
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "loadNextRail failed", e)
+            } finally {
+                loadingMoreRails = false
+            }
+        }
+    }
+
+    fun doRefreshHome() {
+        refreshCount++
+        homeTick++
     }
 
     // Reconnect reload: when the device regains network, refresh silently.
+    // registerDefaultNetworkCallback fires onAvailable immediately for the
+    // current network: ignore that first fire or every cold start pays
+    // for a cancelled + duplicate home load (extra extractor traffic).
+    val netArmed = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
     DisposableEffect(Unit) {
         val cm = try {
             context.getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
@@ -869,7 +1544,8 @@ fun AppleMusicAppContent(
         }
         val cb = object : android.net.ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: android.net.Network) {
-                if (homeTracks.isEmpty() || !live) {
+                if (!netArmed.getAndSet(true)) return
+                if ((homeTracks.isEmpty() && homeSections.isEmpty()) || !live) {
                     homeTick++
                 }
             }
@@ -883,6 +1559,42 @@ fun AppleMusicAppContent(
                 cm?.unregisterNetworkCallback(cb)
             } catch (e: Exception) {
             }
+        }
+    }
+
+    // Personalized rails fill in late once likes arrive (homeTick may have
+    // run before LikedStore finished loading off the main thread).
+    LaunchedEffect(liked.size) {
+        try {
+            if (liked.isEmpty()) return@LaunchedEffect
+            val personal = HomeFeed.personalized(liked, recent.toList())
+                .filter { homeSections[it.title].isNullOrEmpty() }
+            if (personal.isEmpty()) return@LaunchedEffect
+            // Sequential: avoids extractor throttling bursts.
+            for (s in personal.take(2)) {
+                try {
+                    val res: List<YtTrack> = withContext(Dispatchers.IO) {
+                        YoutubeRepository.searchMusic(s.query, 12)
+                    }
+                    if (res.isNotEmpty()) {
+                        try {
+                            withContext(Dispatchers.IO) {
+                                SongCache.save(context, s.cacheKey, res)
+                            }
+                        } catch (e: Exception) {
+                        }
+                        val cur = homeSections.toMutableMap()
+                        cur[s.title] = res
+                        homeSections = cur
+                    }
+                } catch (e: Exception) {
+                }
+                try {
+                    delay(700)
+                } catch (e: Exception) {
+                }
+            }
+        } catch (e: Exception) {
         }
     }
 
@@ -903,14 +1615,19 @@ fun AppleMusicAppContent(
         } catch (e: Exception) {
         }
     }
-    LaunchedEffect(Unit) {
+    // New releases = latest uploads from YOUR artists' channels
+    // (newest-first feeds), refetched when the library changes.
+    LaunchedEffect(liked.size) {
         try {
             withContext(Dispatchers.IO) {
                 SongCache.load(context, "new", 24 * 60 * 60 * 1000L)
             }?.let { newTracks = it }
         } catch (e: Exception) { }
         try {
-            val fresh = YoutubeRepository.searchSongs("new hindi songs 2026", 12)
+            val artists = (HomeFeed.artistSeeds(liked + recent, 8) +
+                listOf("Arijit Singh", "Shreya Ghoshal", "AP Dhillon"))
+                .distinct()
+            val fresh = YoutubeRepository.newReleases(artists, 12)
             if (fresh.isNotEmpty()) {
                 newTracks = fresh
                 try {
@@ -984,11 +1701,18 @@ fun AppleMusicAppContent(
                 0 -> ListenNowScreen(
                     tracks = homeTracks, recent = recent, fresh = newTracks, live = live,
                     loading = homeLoading, loadError = homeError,
-                    onRetryLoad = { homeTick++ },
+                    sections = homeSections,
+                    onRetryLoad = { doRefreshHome() },
+                    onRefresh = { doRefreshHome() },
+                    refreshing = isRefreshing,
+                    onLoadMoreRails = { loadNextRail() },
+                    loadingMore = loadingMoreRails,
+                    endlessCount = endlessRails.size,
+                    railRequest = { title -> railSources[title] },
                     onPlay = ::play,
                     onPlayList = ::playList,
                     onMood = { mood -> query = mood; selectedTab = 4 },
-                    onSeeAll = { title, list -> openSeeAll(title, list) },
+                    onSeeAll = { req -> openSeeAll(req) },
                     onPlayNext = { queue.playNext(it) },
                     onAddQueue = { queue.addToQueue(it) },
                     likedOf = { isLiked(it) },
@@ -1021,7 +1745,7 @@ fun AppleMusicAppContent(
                     likedOf = { isLiked(it) },
                     onToggleLike = { toggleLike(it) },
                     onMood = { mood -> query = mood; selectedTab = 4 },
-                    onSeeAll = { title, list -> openSeeAll(title, list) }
+                    onSeeAll = { req -> openSeeAll(req) }
                 )
                 2 -> RadioScreen(onStation = { q ->
                     query = q
@@ -1045,8 +1769,13 @@ fun AppleMusicAppContent(
                     onToggleLike = { toggleLike(it) },
                     onSignIn = { loginFailed = false; showSession = true },
                     onSignOut = {
-                        YtSessionManager.logout(context)
-                        loggedIn = false
+                        scope.launch(Dispatchers.IO) {
+                            try {
+                                YtSessionManager.logout(context)
+                            } catch (e: Exception) {
+                            }
+                            loggedIn = false
+                        }
                     },
                     onOpenDownloads = { refreshDownloads(); showDownloads = true },
                     onOpenPlaylist = { openPlaylist(it) },
@@ -1079,6 +1808,7 @@ fun AppleMusicAppContent(
                 error = playerError,
                 lyrics = lyrics,
                 shuffleOn = queue.shuffleOn,
+                smartShuffle = queue.shuffleMode == PlayerQueue.SHUFFLE_SMART,
                 repeatMode = queue.repeatModeState,
                 liked = isLiked(t),
                 videoMode = videoMode,
@@ -1088,7 +1818,7 @@ fun AppleMusicAppContent(
                 onPlayPause = { togglePlay(t) },
                 onPrev = { queue.previous() },
                 onNext = { queue.next() },
-                onShuffle = { queue.toggleShuffle() },
+                onShuffle = { cycleShuffleUi() },
                 onRepeat = { queue.cycleRepeat() },
                 onVideoToggle = { on ->
                     if (on) {
@@ -1101,10 +1831,10 @@ fun AppleMusicAppContent(
                 onLike = { toggleLike(t) },
                 onQueue = { showQueue = true },
                 onSeek = { player.seekTo(it) },
+                domColor = playerDom,
                 onDismiss = {
-                    if (videoMode) {
-                        exitVideo(true)
-                    }
+                    // Video keeps streaming behind the mini-player / other
+                    // tabs / background: only the Audio toggle exits video.
                     showFullPlayer = false
                 }
             )
@@ -1117,22 +1847,24 @@ fun AppleMusicAppContent(
             queue = queue,
             onPlayAt = { queue.playAt(it) },
             onRemove = { queue.removeAt(it) },
-            onDismiss = { showQueue = false }
+            onDismiss = { showQueue = false },
+            onReordered = { saveSessionNow() }
         )
     }
 
     // Full-screen video retired: video now embeds in the player sheet.
 
-    // Full-list browser for every "See All"
-    if (showSeeAll) {
-        SeeAllSheet(
-            title = seeAllTitle, tracks = seeAllTracks,
+    // See All is a full page with endless pagination (not a sheet).
+    seeAllPage?.let { req ->
+        SeeAllScreen(
+            req = req,
             likedOf = { isLiked(it) },
             onPlay = { play(it) },
+            onPlayList = { list, idx -> playList(list, idx, false) },
             onToggleLike = { toggleLike(it) },
             onAddQueue = { queue.addToQueue(it) },
             onPlayNext = { queue.playNext(it) },
-            onDismiss = { showSeeAll = false }
+            onBack = { seeAllPage = null }
         )
     }
 
@@ -1158,13 +1890,25 @@ fun AppleMusicAppContent(
                 }
             },
             onLogout = {
-                YtSessionManager.logout(context)
-                loggedIn = false
-                showSession = false
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        YtSessionManager.logout(context)
+                    } catch (e: Exception) {
+                    }
+                    loggedIn = false
+                    showSession = false
+                }
             },
             onDismiss = {
-                loggedIn = YtSessionManager.isLoggedIn(context)
-                showSession = false
+                scope.launch(Dispatchers.IO) {
+                    val ok = try {
+                        YtSessionManager.isLoggedIn(context)
+                    } catch (e: Exception) {
+                        false
+                    }
+                    loggedIn = ok
+                    showSession = false
+                }
             }
         )
     }
@@ -1192,8 +1936,13 @@ fun AppleMusicAppContent(
                 showSession = true
             },
             onSignOut = {
-                YtSessionManager.logout(context)
-                loggedIn = false
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        YtSessionManager.logout(context)
+                    } catch (e: Exception) {
+                    }
+                    loggedIn = false
+                }
             },
             onOpenDownloads = {
                 showProfile = false
@@ -1214,11 +1963,16 @@ fun AppleMusicAppContent(
                 playFile(t, f)
             },
             onDelete = { t ->
-                try {
-                    DownloadStore.delete(context, t.id)
-                } catch (e: Exception) {
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        DownloadStore.delete(context, t.id)
+                    } catch (e: Exception) {
+                    }
+                    try {
+                        dlItems = DownloadStore.listAll(context)
+                    } catch (e: Exception) {
+                    }
                 }
-                refreshDownloads()
             },
             onDismiss = { showDownloads = false }
         )
@@ -1235,25 +1989,31 @@ fun AppleMusicAppContent(
             onAddQueue = { queue.addToQueue(it) },
             onToggleLike = { toggleLike(it) },
             onRemove = { t ->
-                try {
-                    PlaylistStore.remove(context, pl.id, t.id)
-                } catch (e: Exception) {
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        PlaylistStore.remove(context, pl.id, t.id)
+                    } catch (e: Exception) {
+                    }
+                    openPlaylist(pl.id)
                 }
-                openPlaylist(pl.id)
             },
             onAddSuggested = { t ->
-                try {
-                    PlaylistStore.add(context, pl.id, t)
-                } catch (e: Exception) {
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        PlaylistStore.add(context, pl.id, t)
+                    } catch (e: Exception) {
+                    }
+                    openPlaylist(pl.id)
                 }
-                openPlaylist(pl.id)
             },
             onDeletePlaylist = {
-                try {
-                    PlaylistStore.delete(context, pl.id)
-                } catch (e: Exception) {
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        PlaylistStore.delete(context, pl.id)
+                    } catch (e: Exception) {
+                    }
+                    showPlaylist = null
                 }
-                showPlaylist = null
             },
             onDismiss = { showPlaylist = null }
         )
@@ -1273,6 +2033,7 @@ private fun FullPlayerSheet(
     error: String?,
     lyrics: LyricsState,
     shuffleOn: Boolean,
+    smartShuffle: Boolean = false,
     repeatMode: Int,
     liked: Boolean,
     videoMode: Boolean,
@@ -1289,7 +2050,8 @@ private fun FullPlayerSheet(
     onLike: () -> Unit,
     onQueue: () -> Unit,
     onSeek: (Long) -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    domColor: Color = Color(0xFF3A0A12)
 ) {
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -1305,24 +2067,14 @@ private fun FullPlayerSheet(
     ) {
         val dlscope = rememberCoroutineScope()
         val dlctx = LocalContext.current
-        var domColor by remember(track.id) { mutableStateOf(Color(0xFF3A0A12)) }
+        // Shared dominant color (also drives the system bars); eased here.
         val domAnimated by animateColorAsState(
             targetValue = domColor, animationSpec = tween(800), label = "dom")
-        LaunchedEffect(track.thumbUrl) {
-            domColor = dominantColor(dlctx, track.thumbUrl)
-        }
         AppleMusicTheme(darkTheme = true) {
         Box(Modifier.fillMaxWidth()) {
-            // Blurred artwork base merged into the page (RenderEffect on S+).
-            if (thumbUrl.isNotBlank()) {
-                AsyncImage(
-                    model = thumbUrl,
-                    contentDescription = null,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize().blur(70.dp)
-                )
-            }
-            // Dominant-color lava wash over the blur.
+            // Smooth ambience: dominant-color gradient + one slow blob.
+            // (The old full-bleed 70dp artwork blur re-rendered every frame
+            // and made the sheet feel clingy, especially on weak GPUs.)
             LavaBackground(base = domAnimated, modifier = Modifier.fillMaxSize())
             Surface(
                 color = Color.Transparent,
@@ -1331,32 +2083,76 @@ private fun FullPlayerSheet(
             ) {
             LazyColumn(
                 state = rememberLazyListState(),
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp),
+                modifier = Modifier.fillMaxWidth(),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-            item {
-                // Session-driven embed: the music transport owns this picture.
+            // Full-bleed artwork: edge to edge, top of sheet to the name.
+            // Sharp HD layer, frosted blur veil above it (readability),
+            // dark scrim melting into the page behind name + lyrics.
+            item(key = "art") {
                 if (videoMode && track.watchUrl.isNotBlank()) {
-                    InlineVideo(
-                        player = player,
-                        loading = videoLoading,
-                        qualities = qualities,
-                        currentQuality = currentQuality,
-                        onQuality = onQuality,
-                        modifier = Modifier.fillMaxWidth()
-                            .aspectRatio(16f / 9f)
-                            .clip(RoundedCornerShape(16.dp))
-                    )
-                } else if (thumbUrl.isNotBlank()) {
-                    AsyncImage(
-                        model = thumbUrl,
-                        contentDescription = null,
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier.size(280.dp).clip(RoundedCornerShape(16.dp))
-                    )
+                    // Session-driven embed: the music transport owns this picture.
+                    Box(
+                        Modifier.fillMaxWidth().aspectRatio(16f / 9f)
+                            .background(Color.Black)
+                    ) {
+                        InlineVideo(
+                            player = player,
+                            loading = videoLoading,
+                            qualities = qualities,
+                            currentQuality = currentQuality,
+                            onQuality = onQuality,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
                 } else {
-                    TrackArt("", track.id.hashCode(), 280.dp, 16.dp)
+                    val actx = LocalContext.current
+                    val hd = remember(track.id) { hdThumb(track) }
+                    var hdOk by remember(track.id) { mutableStateOf(true) }
+                    Box(Modifier.fillMaxWidth()) {
+                        AsyncImage(
+                            model = coil.request.ImageRequest.Builder(actx)
+                                .data(if (hdOk) hd else thumbUrl)
+                                .crossfade(true)
+                                .build(),
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            onError = { hdOk = false },
+                            modifier = Modifier.fillMaxWidth().aspectRatio(1f)
+                        )
+                        // Frosted veil above the art: guaranteed blur so the
+                        // name + lyrics stay readable over any artwork.
+                        AsyncImage(
+                            model = coil.request.ImageRequest.Builder(actx)
+                                .data(if (hdOk) hd else thumbUrl)
+                                .crossfade(true)
+                                .build(),
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            onError = { hdOk = false },
+                            modifier = Modifier.fillMaxWidth().aspectRatio(1f)
+                                .blur(26.dp),
+                            alpha = 0.5f
+                        )
+                        // Dark scrim melting art into the page.
+                        Box(
+                            Modifier.fillMaxWidth().aspectRatio(1f)
+                                .background(
+                                    Brush.verticalGradient(
+                                        0f to Color.Transparent,
+                                        0.45f to Color.Transparent,
+                                        1f to Color(0xFF121212)
+                                    )
+                                )
+                        )
+                    }
                 }
+            }
+            item(key = "body") {
+            Column(
+                Modifier.fillMaxWidth().padding(horizontal = 24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
                 Spacer(Modifier.height(16.dp))
                 // Live lyric ticker: one line at a time above the song name.
                 if (lyrics is LyricsState.Synced) {
@@ -1386,11 +2182,23 @@ private fun FullPlayerSheet(
                     horizontalArrangement = Arrangement.SpaceEvenly,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
+                    // 2nd tap = smart shuffle (preference-ordered Up Next).
                     IconButton(onClick = onShuffle, modifier = Modifier.size(48.dp)) {
-                        Icon(Icons.Filled.Shuffle, contentDescription = "Shuffle",
-                            tint = if (shuffleOn) MaterialTheme.colorScheme.primary
-                            else MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(26.dp))
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(
+                                if (smartShuffle) Icons.Filled.AutoAwesome
+                                else Icons.Filled.Shuffle,
+                                contentDescription = if (smartShuffle) "Smart shuffle on"
+                                else if (shuffleOn) "Shuffle on" else "Shuffle off",
+                                tint = if (shuffleOn) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(26.dp)
+                            )
+                            if (smartShuffle) {
+                                Text("smart", style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary)
+                            }
+                        }
                     }
                     IconButton(onClick = onPrev, modifier = Modifier.size(52.dp)) {
                         Icon(Icons.Filled.SkipPrevious, contentDescription = "Previous",
@@ -1400,10 +2208,14 @@ private fun FullPlayerSheet(
                         if (buffering) CircularProgressIndicator(
                             modifier = Modifier.size(28.dp), strokeWidth = 3.dp,
                             color = Color.White)
-                        else Icon(
-                            if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                            contentDescription = if (isPlaying) "Pause" else "Play",
-                            modifier = Modifier.size(40.dp))
+                        else androidx.compose.animation.AnimatedContent(
+                            targetState = isPlaying, label = "pp"
+                        ) { playing ->
+                            Icon(
+                                if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                                contentDescription = if (playing) "Pause" else "Play",
+                                modifier = Modifier.size(40.dp))
+                        }
                     }
                     IconButton(onClick = onNext, modifier = Modifier.size(52.dp)) {
                         Icon(Icons.Filled.SkipNext, contentDescription = "Next",
@@ -1463,7 +2275,8 @@ private fun FullPlayerSheet(
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 Spacer(Modifier.height(4.dp))
-            }
+            } // body column
+            } // body item
             // Karaoke visualizer (own scroller inside)
             item {
                 LyricsView(
@@ -1868,12 +2681,16 @@ private fun FancyBar(
                         modifier = Modifier.size(44.dp).clickable { onPlayPause() }
                     ) {
                         Box(contentAlignment = Alignment.Center) {
-                            Icon(
-                                if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                                contentDescription = if (isPlaying) "Pause" else "Play",
-                                tint = Color.White,
-                                modifier = Modifier.size(26.dp)
-                            )
+                            androidx.compose.animation.AnimatedContent(
+                                targetState = isPlaying, label = "ppmini"
+                            ) { playing ->
+                                Icon(
+                                    if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                                    contentDescription = if (playing) "Pause" else "Play",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(26.dp)
+                                )
+                            }
                         }
                     }
                 }
@@ -1910,12 +2727,12 @@ private fun EqBars() {
         verticalAlignment = Alignment.Bottom,
         modifier = Modifier.height(14.dp)
     ) {
-        for (i in 0 until 4) {
+        for (i in 0 until 3) {
             val h by inf.animateFloat(
-                initialValue = 0.25f,
+                initialValue = 0.3f,
                 targetValue = 1f,
                 animationSpec = infiniteRepeatable(
-                    animation = tween(durationMillis = 380 + i * 90, easing = { it }),
+                    animation = tween(durationMillis = 650 + i * 140, easing = { it }),
                     repeatMode = RepeatMode.Reverse
                 ),
                 label = "eq$i"
@@ -2076,34 +2893,28 @@ private suspend fun dominantColor(ctx: android.content.Context, url: String): Co
         }
     }
 
-/** Slow drifting blobs over the base color: lava-lamp wash. */
+// One slow drifting blob over the base color: cheap ambient wash.
 @Composable
 private fun LavaBackground(base: Color, modifier: Modifier = Modifier) {
     val inf = rememberInfiniteTransition(label = "lava")
     val x1 by inf.animateFloat(0f, 1f,
-        infiniteRepeatable(tween(11000), RepeatMode.Reverse), label = "lx1")
-    val x2 by inf.animateFloat(0f, 1f,
-        infiniteRepeatable(tween(14000), RepeatMode.Reverse), label = "lx2")
-    val x3 by inf.animateFloat(0f, 1f,
-        infiniteRepeatable(tween(9000), RepeatMode.Reverse), label = "lx3")
+        infiniteRepeatable(tween(16000), RepeatMode.Reverse), label = "lx1")
     Box(
         modifier.background(
             Brush.verticalGradient(
                 listOf(
-                    base.copy(alpha = 0.88f),
-                    Color.Black.copy(alpha = 0.72f)
+                    base.copy(alpha = 0.92f),
+                    Color.Black.copy(alpha = 0.78f)
                 )
             )
         )
     ) {
         Canvas(Modifier.fillMaxSize()) {
-            val r = size.minDimension * 0.30f
-            drawCircle(Color.White.copy(alpha = 0.08f), r,
-                androidx.compose.ui.geometry.Offset(size.width * x1, size.height * 0.22f))
-            drawCircle(base.copy(alpha = 0.50f), r * 0.75f,
-                androidx.compose.ui.geometry.Offset(size.width * (1f - x2), size.height * 0.55f))
-            drawCircle(Color.White.copy(alpha = 0.05f), r,
-                androidx.compose.ui.geometry.Offset(size.width * x3, size.height * 0.85f))
+            val r = size.minDimension * 0.32f
+            drawCircle(base.copy(alpha = 0.45f), r,
+                androidx.compose.ui.geometry.Offset(size.width * x1, size.height * 0.45f))
+            drawCircle(Color.White.copy(alpha = 0.05f), r * 0.7f,
+                androidx.compose.ui.geometry.Offset(size.width * (1f - x1), size.height * 0.8f))
         }
     }
 }
@@ -2346,26 +3157,40 @@ private fun LiveBadge(live: Boolean) {
 @Composable
 private fun ListenNowScreen(
     tracks: List<YtTrack>, recent: List<YtTrack>, fresh: List<YtTrack>, live: Boolean,
-    loading: Boolean, loadError: String?, onRetryLoad: () -> Unit,
+    loading: Boolean, loadError: String?,
+    onRetryLoad: () -> Unit, onRefresh: () -> Unit, refreshing: Boolean,
+    onLoadMoreRails: () -> Unit, loadingMore: Boolean, endlessCount: Int,
+    railRequest: (String) -> SeeAllRequest?,
     onPlay: (YtTrack) -> Unit,
     onPlayList: (List<YtTrack>, Int, Boolean) -> Unit,
-    onMood: (String) -> Unit, onSeeAll: (String, List<YtTrack>) -> Unit,
+    onMood: (String) -> Unit, onSeeAll: (SeeAllRequest) -> Unit,
     onPlayNext: (YtTrack) -> Unit, onAddQueue: (YtTrack) -> Unit,
     likedOf: (YtTrack) -> Boolean, onToggleLike: (YtTrack) -> Unit,
-    updateTag: String? = null, onUpdateTap: () -> Unit = {}
+    updateTag: String? = null, onUpdateTap: () -> Unit = {},
+    sections: Map<String, List<YtTrack>> = emptyMap(),
+    resumeTrack: YtTrack? = null,
+    resumePosMs: Long = 0L,
+    onResume: (YtTrack) -> Unit = {}
 ) {
     LazyColumn(
         Modifier.fillMaxSize(),
         contentPadding = PaddingValues(bottom = 16.dp)
     ) {
         item {
-            Text(
-                "Listen Now",
-                style = MaterialTheme.typography.displaySmall,
-                modifier = Modifier.padding(start = 16.dp, top = 8.dp, end = 16.dp)
-            )
-            Box(Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
-                LiveBadge(live)
+            Row(
+                Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Listen Now", style = MaterialTheme.typography.displaySmall)
+                // Refresh rotates Top Picks seeds: the page always changes.
+                IconButton(onClick = onRefresh, enabled = !refreshing && !loading) {
+                    if (refreshing) {
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                    } else {
+                        Icon(Icons.Filled.Refresh, contentDescription = "Refresh")
+                    }
+                }
             }
             // Empty states: spinner while loading, retry when offline. No demo.
             if (tracks.isEmpty() && loading) {
@@ -2394,59 +3219,33 @@ private fun ListenNowScreen(
                     Button(onClick = onRetryLoad) { Text("Retry") }
                 }
             }
-            Surface(
-                shape = RoundedCornerShape(16.dp),
-                modifier = Modifier.padding(16.dp).fillMaxWidth()
-            ) {
-                Box(
-                    Modifier
-                        .background(
-                            Brush.linearGradient(
-                                listOf(Color(0xFFFA243C), Color(0xFF7D0018))
-                            )
-                        )
-                        .padding(20.dp)
-                ) {
-                    Column {
-                        Text("FEATURED MIX", style = MaterialTheme.typography.labelSmall,
-                            color = Color.White.copy(alpha = 0.8f))
-                        Spacer(Modifier.height(4.dp))
-                        Text("Your Daily Fix", style = MaterialTheme.typography.titleLarge,
-                            color = Color.White)
-                        Spacer(Modifier.height(12.dp))
-                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            Button(
-                                onClick = { onPlayList(tracks, 0, false) },
-                                enabled = tracks.isNotEmpty(),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = Color.White,
-                                    contentColor = Color(0xFFFA243C)
-                                )
-                            ) {
-                                Icon(Icons.Filled.PlayArrow, contentDescription = null,
-                                    modifier = Modifier.size(18.dp))
-                                Spacer(Modifier.width(4.dp))
-                                Text("Play")
-                            }
-                            OutlinedButton(
-                                onClick = { onPlayList(tracks, 0, true) },
-                                enabled = tracks.isNotEmpty(),
-                                colors = ButtonDefaults.outlinedButtonColors(
-                                    contentColor = Color.White
-                                ),
-                                border = androidx.compose.foundation.BorderStroke(
-                                    1.dp, Color.White.copy(alpha = 0.7f))
-                            ) {
-                                Icon(Icons.Filled.Shuffle, contentDescription = null,
-                                    modifier = Modifier.size(18.dp))
-                                Spacer(Modifier.width(4.dp))
-                                Text("Shuffle")
-                            }
+            SectionHeader(
+                "Top Picks For You",
+                onSeeAll = {
+                    onSeeAll(
+                        railRequest("Top Picks For You")
+                            ?: SeeAllRequest("Top Picks For You", static = tracks)
+                    )
+                },
+                trailing = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(
+                            onClick = { onPlayList(tracks, 0, false) },
+                            enabled = tracks.isNotEmpty(),
+                            modifier = Modifier.size(36.dp)
+                        ) {
+                            Icon(Icons.Filled.PlayArrow, contentDescription = "Play all")
+                        }
+                        IconButton(
+                            onClick = { onPlayList(tracks, 0, true) },
+                            enabled = tracks.isNotEmpty(),
+                            modifier = Modifier.size(36.dp)
+                        ) {
+                            Icon(Icons.Filled.Shuffle, contentDescription = "Shuffle")
                         }
                     }
                 }
-            }
-            SectionHeader("Top Picks For You") { onSeeAll("Top Picks For You", tracks) }
+            )
         }
         if (updateTag != null) {
             item {
@@ -2479,24 +3278,15 @@ private fun ListenNowScreen(
                 }
             }
         }
+        // Top Picks: 2-row wide grid (YT Music quick-picks style).
         item {
-            LazyRow(contentPadding = PaddingValues(horizontal = 16.dp),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                itemsIndexed(tracks) { idx, t ->
-                    Column(Modifier.width(150.dp).clickable { onPlay(t) }) {
-                        TrackArt(t.thumbUrl, t.id.hashCode() + idx, 150.dp, 12.dp)
-                        Spacer(Modifier.height(6.dp))
-                        Text(t.title, style = MaterialTheme.typography.bodyMedium,
-                            maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text(t.artist, style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    }
+            TopPicksGrid(tracks = tracks.take(12), onPlay = onPlay)
+            SectionHeader(
+                "Recently Played",
+                onSeeAll = {
+                    onSeeAll(SeeAllRequest("Recently Played", static = recent.ifEmpty { tracks }))
                 }
-            }
-            SectionHeader("Recently Played") {
-                onSeeAll("Recently Played", recent.ifEmpty { tracks })
-            }
+            )
         }
         val recentShown = recent.ifEmpty { tracks.take(6) }
         items(recentShown, key = { it.id }) { t ->
@@ -2510,7 +3300,15 @@ private fun ListenNowScreen(
         }
         if (fresh.isNotEmpty()) {
             item {
-                SectionHeader("New Releases") { onSeeAll("New Releases", fresh) }
+                SectionHeader(
+                    "New Releases",
+                    onSeeAll = {
+                        onSeeAll(
+                            railRequest("New Releases")
+                                ?: SeeAllRequest("New Releases", static = fresh)
+                        )
+                    }
+                )
             }
             item {
                 LazyRow(contentPadding = PaddingValues(horizontal = 16.dp),
@@ -2529,11 +3327,86 @@ private fun ListenNowScreen(
                 }
             }
         }
+        // YT Music variety rails: Charts / Trending / Punjabi / Lofi /
+        // Workout / Party / Romantic + mixes + personalized. Each See All
+        // opens a full endless page.
+        val railOrder = (HomeFeed.CORE.map { it.title } + sections.keys)
+            .distinct()
+            .filter { it != "Top Picks For You" && it != "New Releases" }
+        for (railTitle in railOrder) {
+            val rail = sections[railTitle] ?: continue
+            if (rail.isEmpty()) continue
+            item {
+                val sub = try {
+                    HomeFeed.CORE.firstOrNull { it.title == railTitle }?.subtitle ?: ""
+                } catch (e: Exception) {
+                    ""
+                }
+                Column {
+                    SectionHeader(
+                        railTitle,
+                        onSeeAll = {
+                            onSeeAll(railRequest(railTitle) ?: SeeAllRequest(railTitle, static = rail))
+                        }
+                    )
+                    if (sub.isNotBlank()) {
+                        Text(sub,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(start = 16.dp, bottom = 4.dp))
+                    }
+                }
+            }
+            item {
+                LazyRow(contentPadding = PaddingValues(horizontal = 16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    itemsIndexed(rail.take(12)) { idx, t ->
+                        Column(Modifier.width(150.dp).clickable { onPlay(t) }) {
+                            TrackArt(t.thumbUrl, t.id.hashCode() + idx + railTitle.hashCode(), 150.dp, 12.dp)
+                            Spacer(Modifier.height(6.dp))
+                            Text(t.title, style = MaterialTheme.typography.bodyMedium,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(t.artist, style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                }
+            }
+        }
         // Pattern break below the songs: mood tiles that deep-search
         item {
             SectionHeader("Moods")
             MoodPatternRow(onMood = onMood)
             Spacer(Modifier.height(8.dp))
+        }
+        // Endless explore: reaching the bottom appends the next discovery
+        // rail forever (auto-loads when visible, button as fallback).
+        item(key = "endless-footer") {
+            LaunchedEffect(endlessCount) {
+                onLoadMoreRails()
+            }
+            Box(
+                Modifier.fillMaxWidth().padding(vertical = 16.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                if (loadingMore) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        CircularProgressIndicator(modifier = Modifier.size(28.dp), strokeWidth = 3.dp)
+                        Spacer(Modifier.height(8.dp))
+                        Text("Exploring more…",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                } else {
+                    OutlinedButton(onClick = onLoadMoreRails) {
+                        Icon(Icons.Filled.Explore, contentDescription = null,
+                            modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Explore more")
+                    }
+                }
+            }
         }
     }
 }
@@ -2693,7 +3566,8 @@ private fun QueueSheet(
     queue: PlayerQueue,
     onPlayAt: (Int) -> Unit,
     onRemove: (Int) -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    onReordered: () -> Unit = {}
 ) {
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -2704,65 +3578,365 @@ private fun QueueSheet(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text("Up Next (${queue.items.size})", style = MaterialTheme.typography.titleLarge)
-            if (queue.shuffleOn) {
-                Text("shuffled", style = MaterialTheme.typography.bodySmall,
+            Text("Queue (${queue.items.size})", style = MaterialTheme.typography.titleLarge)
+            val shuffleLabel = when (queue.shuffleMode) {
+                PlayerQueue.SHUFFLE_SMART -> "smart shuffled"
+                PlayerQueue.SHUFFLE_ON -> "shuffled"
+                else -> null
+            }
+            if (shuffleLabel != null) {
+                Text(shuffleLabel, style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.primary)
             }
         }
-        LazyColumn(Modifier.fillMaxWidth()) {
-            itemsIndexed(queue.items, key = { _, t -> t.id }) { idx, t ->
-                ListItem(
-                    headlineContent = {
-                        Text(t.title, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                            color = if (idx == queue.currentIndex)
-                                MaterialTheme.colorScheme.primary
-                            else MaterialTheme.colorScheme.onSurface)
-                    },
-                    supportingContent = { Text(t.artist, maxLines = 1) },
-                    leadingContent = { TrackArt(t.thumbUrl, t.id.hashCode(), 48.dp, 8.dp) },
-                    trailingContent = {
-                        IconButton(onClick = { onRemove(idx) }) {
-                            Icon(Icons.Filled.Close, contentDescription = "Remove")
-                        }
-                    },
-                    modifier = Modifier.clickable { onPlayAt(idx) }
-                )
+        // prev songs == current song == next songs (play order).
+        val po = try {
+            queue.playOrder()
+        } catch (e: Exception) {
+            emptyList()
+        }
+        val curPos = po.indexOf(queue.currentIndex)
+        // Chronological prev so the whole list is one contiguous play
+        // order (makes manual drag reorder math trivial).
+        val prev: List<Int>
+        val next: List<Int>
+        if (curPos == -1) {
+            prev = queue.items.indices.filter { it < queue.currentIndex }
+            next = queue.items.indices.filter { it > queue.currentIndex }
+        } else {
+            prev = po.subList(0, curPos)
+            next = po.subList(curPos + 1, po.size)
+        }
+        // Opens at Now Playing: scroll up for prev, down for next.
+        val startIndex = if (prev.isEmpty()) 0 else prev.size + 1
+        val listState = rememberLazyListState(
+            initialFirstVisibleItemIndex = startIndex.coerceAtLeast(0)
+        )
+        // Manual shuffle: long-press the handle and drag rows around.
+        var rowPx by remember { mutableIntStateOf(0) }
+        var dragIdx by remember { mutableStateOf<Int?>(null) }
+        var dragPos by remember { mutableStateOf<Int?>(null) }
+        var dragAcc by remember { mutableFloatStateOf(0f) }
+        fun beginDrag(idx: Int, orderPos: Int) {
+            dragIdx = idx
+            dragPos = orderPos
+            dragAcc = 0f
+        }
+        fun moveDrag(dy: Float) {
+            val dp = dragPos
+            if (dp == null || rowPx <= 0) return
+            dragAcc += dy
+            val step = (dragAcc / rowPx).toInt()
+            if (step != 0) {
+                val size = try {
+                    queue.playOrder().size
+                } catch (e: Exception) {
+                    return
+                }
+                if (size <= 0) return
+                val target = (dp + step).coerceIn(0, size - 1)
+                if (target != dp) {
+                    queue.moveInOrder(dp, target)
+                    dragPos = target
+                    dragAcc -= (target - dp) * rowPx
+                } else {
+                    dragAcc = 0f
+                }
+            }
+        }
+        fun endDrag() {
+            dragIdx = null
+            dragPos = null
+            dragAcc = 0f
+            onReordered()
+        }
+        LazyColumn(Modifier.fillMaxWidth(), state = listState) {
+            if (prev.isNotEmpty()) {
+                item(key = "q-prev-h") {
+                    Text("Previous (${prev.size})",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 4.dp))
+                }
+                items(prev, key = { "q-prev-$it" }) { idx ->
+                    val t = queue.items.getOrNull(idx) ?: return@items
+                    val orderPos = try {
+                        po.indexOf(idx)
+                    } catch (e: Exception) {
+                        -1
+                    }
+                    QueueRow(
+                        t = t, isCurrent = false,
+                        dragging = dragIdx == idx,
+                        onSize = { h -> if (rowPx == 0 && h > 0) rowPx = h },
+                        onDragStart = { beginDrag(idx, orderPos) },
+                        onDrag = { dy -> moveDrag(dy) },
+                        onDragEnd = { endDrag() },
+                        onPlay = { onPlayAt(idx) },
+                        onRemove = { onRemove(idx) }
+                    )
+                }
+            }
+            item(key = "q-cur-h") {
+                Text("Now Playing",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 4.dp))
+            }
+            queue.current?.let { t ->
+                item(key = "q-cur") {
+                    QueueRow(t, true, false, {}, {}, {}, {}, { }, { })
+                }
+            }
+            item(key = "q-next-h") {
+                Text("Up Next (${next.size})",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 4.dp))
+            }
+            if (next.isNotEmpty()) {
+                items(next, key = { "q-next-$it" }) { idx ->
+                    val t = queue.items.getOrNull(idx) ?: return@items
+                    val orderPos = try {
+                        po.indexOf(idx)
+                    } catch (e: Exception) {
+                        -1
+                    }
+                    QueueRow(
+                        t = t, isCurrent = false,
+                        dragging = dragIdx == idx,
+                        onSize = { h -> if (rowPx == 0 && h > 0) rowPx = h },
+                        onDragStart = { beginDrag(idx, orderPos) },
+                        onDrag = { dy -> moveDrag(dy) },
+                        onDragEnd = { endDrag() },
+                        onPlay = { onPlayAt(idx) },
+                        onRemove = { onRemove(idx) }
+                    )
+                }
+            } else {
+                item(key = "q-next-empty") {
+                    Text("Related songs appear here as you listen.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp))
+                }
             }
             item { Spacer(Modifier.height(32.dp)) }
         }
     }
 }
 
+@Composable
+private fun QueueRow(
+    t: YtTrack,
+    isCurrent: Boolean,
+    dragging: Boolean = false,
+    onSize: (Int) -> Unit = {},
+    onDragStart: () -> Unit = {},
+    onDrag: (Float) -> Unit = {},
+    onDragEnd: () -> Unit = {},
+    onPlay: () -> Unit,
+    onRemove: () -> Unit
+) {
+    ListItem(
+        headlineContent = {
+            Text(t.title, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                color = if (isCurrent) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.onSurface)
+        },
+        supportingContent = { Text(t.artist, maxLines = 1) },
+        leadingContent = { TrackArt(t.thumbUrl, t.id.hashCode(), 48.dp, 8.dp) },
+        trailingContent = {
+            if (isCurrent) {
+                Icon(Icons.Filled.Equalizer, contentDescription = "Playing",
+                    tint = MaterialTheme.colorScheme.primary)
+            } else {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    // Long-press and drag to shuffle manually.
+                    Icon(
+                        Icons.Filled.DragHandle, contentDescription = "Reorder",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.pointerInput(t.id) {
+                            detectDragGesturesAfterLongPress(
+                                onDragStart = { onDragStart() },
+                                onDragEnd = { onDragEnd() },
+                                onDragCancel = { onDragEnd() },
+                                onDrag = { _, dragAmount -> onDrag(dragAmount.y) }
+                            )
+                        }
+                    )
+                    IconButton(onClick = onRemove) {
+                        Icon(Icons.Filled.Close, contentDescription = "Remove")
+                    }
+                }
+            }
+        },
+        modifier = Modifier
+            .onGloballyPositioned { onSize(it.size.height) }
+            .let { m ->
+                val m2 = if (dragging) m.background(MaterialTheme.colorScheme.primaryContainer) else m
+                if (isCurrent) m2 else m2.clickable { onPlay() }
+            }
+    )
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun SeeAllSheet(
-    title: String,
-    tracks: List<YtTrack>,
+private fun SeeAllScreen(
+    req: SeeAllRequest,
     likedOf: (YtTrack) -> Boolean,
     onPlay: (YtTrack) -> Unit,
+    onPlayList: (List<YtTrack>, Int) -> Unit,
     onToggleLike: (YtTrack) -> Unit,
     onAddQueue: (YtTrack) -> Unit,
     onPlayNext: (YtTrack) -> Unit,
-    onDismiss: () -> Unit
+    onBack: () -> Unit
 ) {
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    ) {
-        Text(title, style = MaterialTheme.typography.titleLarge,
-            modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp))
-        LazyColumn(Modifier.fillMaxWidth()) {
-            items(tracks, key = { it.id }) { t ->
-                TrackRow(
-                    track = t, isCurrent = false, liked = likedOf(t),
-                    onPlay = { onPlay(t) },
-                    onPlayNext = { onPlayNext(t) },
-                    onAddQueue = { onAddQueue(t) },
-                    onToggleLike = { onToggleLike(t) }
-                )
+    var items by remember(req) { mutableStateOf<List<YtTrack>>(req.static) }
+    var loadingMore by remember(req) { mutableStateOf(false) }
+    var exhausted by remember(req) { mutableStateOf(req.static.isNotEmpty()) }
+    var firstLoading by remember(req) { mutableStateOf(req.static.isEmpty()) }
+    // Stateful endless pager (extractor continuation, SimpMusic pattern).
+    val pager = remember(req) {
+        when {
+            req.kiosk -> YoutubeRepository.KioskPager()
+            req.query.isNotBlank() -> YoutubeRepository.SearchPager(req.query, req.music)
+            else -> null
+        }
+    }
+    val listState = rememberLazyListState()
+    val loadScope = rememberCoroutineScope()
+    fun loadMoreNow() {
+        val p = pager ?: return
+        if (loadingMore || exhausted) return
+        loadingMore = true
+        loadScope.launch(Dispatchers.IO) {
+            try {
+                val more = p.loadMore()
+                if (more.isNotEmpty()) {
+                    items = items + more
+                }
+                exhausted = p.exhausted
+            } catch (e: Exception) {
+            } finally {
+                loadingMore = false
             }
-            item { Spacer(Modifier.height(32.dp)) }
+        }
+    }
+    // Initial page for query/kiosk kinds.
+    LaunchedEffect(req) {
+        val p = pager ?: return@LaunchedEffect
+        firstLoading = true
+        try {
+            val first = p.loadMore()
+            items = first
+            exhausted = p.exhausted
+        } catch (e: Exception) {
+        } finally {
+            firstLoading = false
+        }
+    }
+    // Endless: near the bottom, fetch the next continuation page.
+    LaunchedEffect(listState, items.size) {
+        try {
+            val last = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1
+            if (last >= items.size - 4 && !loadingMore && !exhausted && pager != null) {
+                loadMoreNow()
+            }
+        } catch (e: Exception) {
+        }
+    }
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Column {
+                        Text(req.title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        if (req.subtitle.isNotBlank()) {
+                            Text(req.subtitle, style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+                actions = {
+                    IconButton(
+                        onClick = { if (items.isNotEmpty()) onPlayList(items, 0) },
+                        enabled = items.isNotEmpty()
+                    ) {
+                        Icon(Icons.Filled.PlayArrow, contentDescription = "Play all")
+                    }
+                    IconButton(
+                        onClick = {
+                            // Shuffle-play the loaded items.
+                            val sh = items.shuffled()
+                            if (sh.isNotEmpty()) onPlayList(sh, 0)
+                        },
+                        enabled = items.isNotEmpty()
+                    ) {
+                        Icon(Icons.Filled.Shuffle, contentDescription = "Shuffle")
+                    }
+                }
+            )
+        }
+    ) { pad ->
+        if (firstLoading && items.isEmpty()) {
+            Box(Modifier.fillMaxSize().padding(pad), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator()
+                    Spacer(Modifier.height(12.dp))
+                    Text("Loading songs…", style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        } else {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize().padding(pad),
+                contentPadding = PaddingValues(bottom = 16.dp)
+            ) {
+                items(items, key = { it.id }) { t ->
+                    TrackRow(
+                        track = t, isCurrent = false, liked = likedOf(t),
+                        onPlay = { onPlay(t) },
+                        onPlayNext = { onPlayNext(t) },
+                        onAddQueue = { onAddQueue(t) },
+                        onToggleLike = { onToggleLike(t) }
+                    )
+                }
+                if (loadingMore) {
+                    item {
+                        Box(Modifier.fillMaxWidth().padding(16.dp),
+                            contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator(modifier = Modifier.size(28.dp))
+                        }
+                    }
+                } else if (!exhausted && pager != null && items.isNotEmpty()) {
+                    item {
+                        Box(Modifier.fillMaxWidth().padding(8.dp),
+                            contentAlignment = Alignment.Center) {
+                            TextButton(onClick = { loadMoreNow() }) {
+                                Text("${items.size} loaded — tap for more")
+                            }
+                        }
+                    }
+                }
+                if (items.isEmpty()) {
+                    item {
+                        Box(Modifier.fillMaxWidth().padding(32.dp),
+                            contentAlignment = Alignment.Center) {
+                            Text("Nothing here yet — check connection and go back.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -2791,7 +3965,7 @@ private fun BrowseScreen(
     likedOf: (YtTrack) -> Boolean,
     onToggleLike: (YtTrack) -> Unit,
     onMood: (String) -> Unit,
-    onSeeAll: (String, List<YtTrack>) -> Unit
+    onSeeAll: (SeeAllRequest) -> Unit
 ) {
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 16.dp)) {
         item {
@@ -2826,7 +4000,9 @@ private fun BrowseScreen(
         }
         if (newTracks.isNotEmpty()) {
             item {
-                SectionHeader("New Releases") { onSeeAll("New Releases", newTracks) }
+                SectionHeader("New Releases") {
+                    onSeeAll(SeeAllRequest("New Releases", static = newTracks))
+                }
             }
             items(newTracks.take(8), key = { it.id }) { t ->
                 TrackRow(
@@ -2897,6 +4073,7 @@ private fun LibraryScreen(
     onOpenProfile: () -> Unit
 ) {
     val ctx = LocalContext.current
+    val libScope = rememberCoroutineScope()
     var lists by remember { mutableStateOf<List<Playlist>>(emptyList()) }
     var showNew by remember { mutableStateOf(false) }
     // Reload every time the tab is visited (menus edit the store directly).
@@ -3093,12 +4270,14 @@ private fun LibraryScreen(
     if (showNew) {
         NewPlaylistSheet(
             onCreate = { n ->
-                try {
-                    PlaylistStore.create(ctx, n)
-                    lists = PlaylistStore.list(ctx)
-                } catch (e: Exception) {
+                libScope.launch(Dispatchers.IO) {
+                    try {
+                        PlaylistStore.create(ctx, n)
+                        lists = PlaylistStore.list(ctx)
+                    } catch (e: Exception) {
+                    }
+                    showNew = false
                 }
-                showNew = false
             },
             onDismiss = { showNew = false }
         )
@@ -3282,17 +4461,57 @@ private fun PlaceholderScreen(label: String) {
 }
 
 @Composable
-private fun SectionHeader(title: String, onSeeAll: (() -> Unit)? = null) {
+private fun SectionHeader(
+    title: String,
+    onSeeAll: (() -> Unit)? = null,
+    trailing: @Composable RowScope.() -> Unit = {}
+) {
     Row(
         Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 8.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(title, style = MaterialTheme.typography.titleLarge)
+        Text(title, style = MaterialTheme.typography.titleLarge,
+            modifier = Modifier.weight(1f))
+        trailing()
         if (onSeeAll != null) {
             Text("See All", style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.clickable { onSeeAll() })
+                modifier = Modifier.clickable { onSeeAll() }
+                    .padding(start = 8.dp))
+        }
+    }
+}
+
+/** Top Picks 2-row wide grid (YT Music quick-picks style). */
+@Composable
+private fun TopPicksGrid(
+    tracks: List<YtTrack>,
+    onPlay: (YtTrack) -> Unit
+) {
+    if (tracks.isEmpty()) return
+    LazyHorizontalGrid(
+        rows = GridCells.Fixed(2),
+        contentPadding = PaddingValues(horizontal = 16.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier.height(152.dp).fillMaxWidth()
+    ) {
+        items(tracks, key = { it.id }) { t ->
+            Row(
+                Modifier.width(240.dp).clickable { onPlay(t) },
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                TrackArt(t.thumbUrl, t.id.hashCode(), 64.dp, 8.dp)
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(t.title, style = MaterialTheme.typography.bodyMedium,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(t.artist, style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
         }
     }
 }
@@ -3301,8 +4520,12 @@ private fun SectionHeader(title: String, onSeeAll: (() -> Unit)? = null) {
 @Composable
 private fun TrackArt(thumbUrl: String, seed: Int, size: Dp, corner: Dp = 8.dp) {
     if (thumbUrl.isNotBlank()) {
+        val ctx = LocalContext.current
         AsyncImage(
-            model = thumbUrl,
+            model = coil.request.ImageRequest.Builder(ctx)
+                .data(thumbUrl)
+                .crossfade(true)
+                .build(),
             contentDescription = null,
             contentScale = ContentScale.Crop,
             modifier = Modifier.size(size).clip(RoundedCornerShape(corner))

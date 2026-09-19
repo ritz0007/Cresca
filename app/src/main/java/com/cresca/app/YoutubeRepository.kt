@@ -3,16 +3,23 @@ package com.cresca.app
 import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.schabi.newpipe.extractor.NewPipe
 import org.schabi.newpipe.extractor.MediaFormat
+import org.schabi.newpipe.extractor.Page
 import org.schabi.newpipe.extractor.ServiceList.YouTube
+import org.schabi.newpipe.extractor.channel.ChannelInfoItem
 import org.schabi.newpipe.extractor.downloader.Downloader
 import org.schabi.newpipe.extractor.downloader.Request
 import org.schabi.newpipe.extractor.downloader.Response
+import org.schabi.newpipe.extractor.feed.FeedInfo
+import org.schabi.newpipe.extractor.kiosk.KioskInfo
 import org.schabi.newpipe.extractor.localization.Localization
 import org.schabi.newpipe.extractor.search.SearchInfo
 import org.schabi.newpipe.extractor.stream.AudioStream
@@ -140,6 +147,338 @@ object YoutubeRepository {
     /** Real YouTube search. Throws on network/parse failure (caller falls back to demo). */
     suspend fun search(query: String, max: Int = 15): List<YtTrack> =
         searchSongs(query, max)
+
+    // ---- YT Music style discovery (SimpMusic-shaped, NewPipe-powered) ----
+
+    /** One search hit -> track, or null. Shared by every discovery source. */
+    private fun toTrack(item: StreamInfoItem): YtTrack? {
+        return try {
+            val d = try {
+                item.duration
+            } catch (e: Exception) {
+                0L
+            }
+            // Songs only: keep unknown-length and <= 10 min.
+            if (d > 600L) return null
+            val id = Regex("[?&]v=([A-Za-z0-9_-]{11})")
+                .find(item.url)?.groupValues?.get(1) ?: return null
+            val thumb = try {
+                item.thumbnails.maxByOrNull { it.height }?.url ?: ""
+            } catch (e: Exception) {
+                ""
+            }
+            val artist = try {
+                item.uploaderName ?: "YouTube"
+            } catch (e: Exception) {
+                "YouTube"
+            }
+            YtTrack(
+                id = id,
+                title = item.name,
+                artist = artist,
+                thumbUrl = thumb,
+                watchUrl = item.url
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "skip item", e)
+            null
+        }
+    }
+
+    /**
+     * YouTube Music song search (music.youtube.com, like YT Music / SimpMusic
+     * shelves). Returns cleaner artist/title pairs than plain YouTube search.
+     */
+    suspend fun searchMusic(query: String, max: Int = 15): List<YtTrack> =
+        withContext(Dispatchers.IO) {
+            ensureInit()
+            val qh = YouTube.searchQHFactory.fromQuery(
+                query, listOf("music_songs"), ""
+            )
+            val info = SearchInfo.getInfo(YouTube, qh)
+            info.relatedItems.filterIsInstance<StreamInfoItem>()
+                .mapNotNull { toTrack(it) }
+                .distinctBy { it.id }
+                .take(max)
+        }
+
+    /** YouTube Charts trending music (charts.youtube.com Right Now). */
+    suspend fun trendingMusic(max: Int = 15): List<YtTrack> =
+        withContext(Dispatchers.IO) {
+            ensureInit()
+            try {
+                val extractor = YouTube.getKioskList().getExtractorById("trending_music", null)
+                extractor.fetchPage()
+                val info = KioskInfo.getInfo(extractor)
+                info.relatedItems.filterIsInstance<StreamInfoItem>()
+                    .mapNotNull { toTrack(it) }
+                    .distinctBy { it.id }
+                    .take(max)
+            } catch (e: Exception) {
+                Log.w(TAG, "trending failed", e)
+                emptyList()
+            }
+        }
+
+    /**
+     * True new releases: latest uploads from the artists' own channels
+     * (channel feeds are newest-first), round-robin interleaved.
+     * Falls back to a "new songs" music search when the library is empty.
+     */
+    suspend fun newReleases(artists: List<String>, max: Int = 12): List<YtTrack> =
+        withContext(Dispatchers.IO) {
+            ensureInit()
+            val seeds = artists.map { it.trim() }
+                .filter { it.isNotEmpty() && !it.equals("YouTube", true) }
+                .distinct()
+                .take(3)
+            if (seeds.isEmpty()) {
+                return@withContext try {
+                    searchMusic("new hindi songs 2026", max)
+                } catch (e: Exception) {
+                    emptyList()
+                }
+            }
+            try {
+                val perArtist: List<List<YtTrack>> = coroutineScope {
+                    seeds.map { artist ->
+                        async(Dispatchers.IO) {
+                            try {
+                                val aqh = YouTube.searchQHFactory.fromQuery(
+                                    artist, listOf("music_artists"), ""
+                                )
+                                val ainfo = SearchInfo.getInfo(YouTube, aqh)
+                                val chan = ainfo.relatedItems
+                                    .filterIsInstance<ChannelInfoItem>()
+                                    .firstOrNull() ?: return@async emptyList<YtTrack>()
+                                val feed = FeedInfo.getInfo(YouTube, chan.url)
+                                feed.relatedItems.filterIsInstance<StreamInfoItem>()
+                                    .mapNotNull { toTrack(it) }
+                                    .distinctBy { it.id }
+                                    .take(5)
+                            } catch (e: Exception) {
+                                Log.w(TAG, "artist feed failed ($artist)", e)
+                                emptyList()
+                            }
+                        }
+                    }.awaitAll()
+                }
+                // Round-robin interleave keeps every artist represented.
+                val out = ArrayList<YtTrack>(max)
+                val seen = HashSet<String>()
+                var round = 0
+                var progress = true
+                while (out.size < max && progress) {
+                    progress = false
+                    for (list in perArtist) {
+                        val t = list.getOrNull(round) ?: continue
+                        if (seen.add(t.id)) {
+                            out.add(t)
+                            progress = true
+                            if (out.size >= max) break
+                        }
+                    }
+                    round++
+                }
+                if (out.isNotEmpty()) out
+                else searchMusic("new hindi songs 2026", max)
+            } catch (e: Exception) {
+                Log.w(TAG, "newReleases failed", e)
+                try {
+                    searchMusic("new hindi songs 2026", max)
+                } catch (e2: Exception) {
+                    emptyList()
+                }
+            }
+        }
+
+    /** "Because you listened" mix: streams related to a watched track. */
+    suspend fun relatedTracks(watchUrl: String, max: Int = 12): List<YtTrack> =
+        withContext(Dispatchers.IO) {
+            ensureInit()
+            try {
+                // Related extraction is reliable on www URLs; music URLs
+                // carry the same video id.
+                val id = Regex("[?&]v=([A-Za-z0-9_-]{11})")
+                    .find(watchUrl)?.groupValues?.get(1) ?: return@withContext emptyList()
+                val se = YouTube.getStreamExtractor("https://www.youtube.com/watch?v=$id")
+                se.fetchPage()
+                val out = (se.relatedStreams?.items ?: emptyList())
+                    .filterIsInstance<StreamInfoItem>()
+                    .mapNotNull { toTrack(it) }
+                    .distinctBy { it.id }
+                    .take(max)
+                if (out.isEmpty()) Log.w(TAG, "related empty for $id")
+                out
+            } catch (e: Exception) {
+                Log.w(TAG, "related failed", e)
+                emptyList()
+            }
+        }
+
+    /**
+     * Autoplay pool for a track: related streams first, topped up with an
+     * artist music-search when related extraction comes back thin. Always
+     * returns something playable when the network cooperates.
+     */
+    suspend fun autoplayFor(t: YtTrack, max: Int = 20): List<YtTrack> =
+        withContext(Dispatchers.IO) {
+            ensureInit()
+            val rel = try {
+                relatedTracks(t.watchUrl, max)
+            } catch (e: Exception) {
+                emptyList()
+            }
+            if (rel.size >= max / 2) return@withContext rel
+            try {
+                val low = t.artist.lowercase()
+                val labelish = low.isBlank() || low == "youtube" ||
+                    low.contains("music") || low.contains("official") ||
+                    low.contains("films") || low.contains("records")
+                val q = if (labelish) "${t.title} songs" else "${t.artist} songs"
+                val extra = try {
+                    searchMusic(q, max)
+                } catch (e: Exception) {
+                    emptyList()
+                }
+                (rel + extra).distinctBy { it.id }
+                    .filter { it.id != t.id }
+                    .take(max)
+                    .also { Log.i(TAG, "autoplay ${rel.size} related + ${extra.size} search") }
+            } catch (e: Exception) {
+                rel
+            }
+        }
+
+    /** Common type for endless See All pagers (search + kiosk). */
+    interface EndlessPager {
+        val exhausted: Boolean
+        suspend fun loadMore(): List<YtTrack>
+    }
+
+    /**
+     * Endless search pager for See All full pages: keeps the query handler +
+     * continuation, appends page after page (SimpMusic continuation pattern).
+     */
+    class SearchPager(
+        val query: String,
+        val music: Boolean = true,
+        val pageSize: Int = 20
+    ) : EndlessPager {
+        private var handler: org.schabi.newpipe.extractor.linkhandler.SearchQueryHandler? = null
+        private var next: Page? = null
+        private var started = false
+        val seen: MutableSet<String> = HashSet()
+        @Volatile override var exhausted: Boolean = false
+            private set
+
+        override suspend fun loadMore(): List<YtTrack> = withContext(Dispatchers.IO) {
+            ensureInit()
+            if (exhausted) return@withContext emptyList()
+            try {
+                val qh = handler ?: YouTube.searchQHFactory.fromQuery(
+                    query,
+                    if (music) listOf("music_songs") else emptyList(),
+                    ""
+                ).also { handler = it }
+                val items: List<StreamInfoItem>
+                val np: Page?
+                if (!started) {
+                    val info = SearchInfo.getInfo(YouTube, qh)
+                    items = info.relatedItems.filterIsInstance<StreamInfoItem>()
+                    np = try {
+                        if (info.hasNextPage()) info.nextPage else null
+                    } catch (e: Exception) {
+                        null
+                    }
+                    started = true
+                } else {
+                    val p = next ?: run {
+                        exhausted = true
+                        return@withContext emptyList()
+                    }
+                    val page = SearchInfo.getMoreItems(YouTube, qh, p)
+                    items = page.items.filterIsInstance<StreamInfoItem>()
+                    np = try {
+                        if (page.hasNextPage()) page.nextPage else null
+                    } catch (e: Exception) {
+                        null
+                    }
+                }
+                next = np
+                if (np == null) exhausted = true
+                items.mapNotNull { toTrack(it) }
+                    .filter { seen.add(it.id) }
+                    .take(pageSize)
+                    .also { if (it.isEmpty() && np == null) exhausted = true }
+            } catch (e: Exception) {
+                Log.w(TAG, "search page failed", e)
+                emptyList()
+            }
+        }
+    }
+
+    /**
+     * Endless charts pager for the Charts See All page.
+     */
+    class KioskPager(
+        val kioskId: String = "trending_music",
+        val pageSize: Int = 20
+    ) : EndlessPager {
+        private var extractor: org.schabi.newpipe.extractor.kiosk.KioskExtractor<*>? = null
+        private var next: Page? = null
+        private var started = false
+        val seen: MutableSet<String> = HashSet()
+        @Volatile override var exhausted: Boolean = false
+            private set
+
+        override suspend fun loadMore(): List<YtTrack> = withContext(Dispatchers.IO) {
+            ensureInit()
+            if (exhausted) return@withContext emptyList()
+            try {
+                val items: List<StreamInfoItem>
+                val np: Page?
+                if (!started) {
+                    val ex = YouTube.getKioskList().getExtractorById(kioskId, null)
+                    ex.fetchPage()
+                    extractor = ex
+                    val info = KioskInfo.getInfo(ex)
+                    items = info.relatedItems.filterIsInstance<StreamInfoItem>()
+                    np = try {
+                        if (info.hasNextPage()) info.nextPage else null
+                    } catch (e: Exception) {
+                        null
+                    }
+                    started = true
+                } else {
+                    val ex = extractor ?: run {
+                        exhausted = true
+                        return@withContext emptyList()
+                    }
+                    val p = next ?: run {
+                        exhausted = true
+                        return@withContext emptyList()
+                    }
+                    val page = ex.getPage(p)
+                    items = page.items.filterIsInstance<StreamInfoItem>()
+                    np = try {
+                        if (page.hasNextPage()) page.nextPage else null
+                    } catch (e: Exception) {
+                        null
+                    }
+                }
+                next = np
+                if (np == null) exhausted = true
+                items.mapNotNull { toTrack(it) }
+                    .filter { seen.add(it.id) }
+                    .take(pageSize)
+                    .also { if (it.isEmpty() && np == null) exhausted = true }
+            } catch (e: Exception) {
+                Log.w(TAG, "kiosk page failed", e)
+                emptyList()
+            }
+        }
+    }
 
     /** Ranked audio stream URLs, best first. Used for 403 fallback retries. */
     suspend fun audioUrls(watchUrl: String): List<String> =

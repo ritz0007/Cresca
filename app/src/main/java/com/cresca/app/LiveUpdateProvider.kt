@@ -2,7 +2,9 @@ package com.cresca.app
 
 import android.app.Notification
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
 import android.graphics.Color
 import android.graphics.drawable.Icon
 import android.os.Build
@@ -146,6 +148,10 @@ class LiveUpdateProvider(ctx: Context) : MediaNotification.Provider {
         }
         try {
             val actions = b.actions
+            val scored = ArrayList<Triple<Int, Int, Notification.Action>>()
+            var hasNext = false
+            var hasPrev = false
+            var hasPlay = false
             if (actions != null) {
                 for (i in 0 until actions.size) {
                     val a = actions[i] ?: continue
@@ -167,12 +173,41 @@ class LiveUpdateProvider(ctx: Context) : MediaNotification.Provider {
                     } catch (e: Exception) {
                         null
                     } ?: ""
-                    if (aicon != null) {
-                        builder.addAction(
-                            Notification.Action.Builder(aicon, atitle, ai).build()
-                        )
+                    if (aicon == null) {
+                        continue
                     }
+                    val low = atitle.toString().lowercase()
+                    if (low.contains("next")) hasNext = true
+                    if (low.contains("prev")) hasPrev = true
+                    if (low.startsWith("play") || low.startsWith("pause")) hasPlay = true
+                    val rank = when {
+                        low.startsWith("play") || low.startsWith("pause") -> 0
+                        low.contains("next") -> 1
+                        low.contains("prev") -> 2
+                        else -> 3
+                    }
+                    scored.add(Triple(rank, i, Notification.Action.Builder(aicon, atitle, ai).build()))
                 }
+            }
+            // Add synthetic Next action if missing (for Live Updates card).
+            if (!hasNext && hasPlay) {
+                // Create a proper PendingIntent for Next that triggers a broadcast
+                // to seek to next via the MediaController.
+                val nextIntent = Intent("com.cresca.app.NEXT_ACTION")
+                    .setPackage(app.packageName)
+                val ai = PendingIntent.getBroadcast(
+                    app,
+                    0,
+                    nextIntent,
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                )
+                val aicon = Icon.createWithResource(app, android.R.drawable.ic_media_next)
+                scored.add(Triple(1, Int.MAX_VALUE, Notification.Action.Builder(aicon, "Next", ai).build()))
+                hasNext = true
+            }
+            scored.sortWith(compareBy({ it.first }, { it.second }))
+            for ((_, _, act) in scored) {
+                builder.addAction(act)
             }
         } catch (e: Exception) {
         }
