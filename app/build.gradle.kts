@@ -11,8 +11,18 @@ android {
         applicationId = "com.cresca.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 9
-        versionName = "0.9.0"
+        versionCode = 10
+        versionName = "0.9.1"
+    }
+    // Per-device APKs (arm64 for modern phones, armv7 for old 32-bit,
+    // x86_64 for emulators/Chromebooks) + one universal fallback.
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("armeabi-v7a", "arm64-v8a", "x86_64")
+            isUniversalApk = true
+        }
     }
     buildFeatures { compose = true }
     compileOptions {

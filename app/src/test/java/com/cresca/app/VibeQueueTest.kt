@@ -34,6 +34,47 @@ class VibeQueueTest {
     }
 
     @Test
+    fun isSameName_catchesTitleEcho() {
+        val seed = track("s", "Diamond", "Rihanna")
+        assertTrue(YoutubeRepository.isSameName(seed, track("a", "Diamond (Official Video)", "X")))
+        assertTrue(YoutubeRepository.isSameName(seed, track("b", "Diamond - Love Aaj Kal", "Y")))
+        assertFalse(YoutubeRepository.isSameName(seed, track("c", "Diamond Eyes Party Mix", "Z")))
+        assertFalse(YoutubeRepository.isSameName(seed, track("d", "Tere Bina", "Arijit Singh")))
+    }
+
+    @Test
+    fun rankByVibe_sinksSameNameDiamondClones() {
+        // The reported bug: playing "Diamond" queued every song called Diamond.
+        val seed = track("s", "Diamond", "Rihanna")
+        val clone1 = track("a", "Diamond (Official Music Video)", "Akriti")
+        val clone2 = track("b", "Diamond - Desi Remix", "DJ Foo")
+        val vibe = track("c", "Shine Bright Party Anthem", "Neha Kakkar")
+        val ranked = YoutubeRepository.rankByVibe(seed, listOf(clone1, clone2, vibe))
+        assertEquals("c", ranked[0].id)
+        assertTrue(ranked.indexOf(vibe) < ranked.indexOf(clone1))
+        assertTrue(ranked.indexOf(vibe) < ranked.indexOf(clone2))
+    }
+
+    @Test
+    fun rankByVibe_relatedGraphFirst() {
+        val seed = track("s", "Tere Bina", "Arijit Singh")
+        val rel = track("r", "Random Vibe Track", "Someone Else")
+        val other = track("o", "Another Track", "Third Artist")
+        val ranked = YoutubeRepository.rankByVibe(seed, listOf(other, rel), setOf("r"))
+        assertEquals("r", ranked[0].id)
+    }
+
+    @Test
+    fun vibeQueries_moodLeads() {
+        val qs = YoutubeRepository.vibeQueries(
+            track("a", "Tere Bina Love Story (Official Video)", "Arijit Singh")
+        )
+        assertTrue(qs.isNotEmpty())
+        // Mood-led query comes first (broad vibe pool, not title echo).
+        assertTrue(qs[0].contains("romantic"))
+    }
+
+    @Test
     fun rankByVibe_stress() {
         val rnd = java.util.Random(21)
         repeat(300) {

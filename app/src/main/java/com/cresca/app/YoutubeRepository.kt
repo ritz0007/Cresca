@@ -339,17 +339,27 @@ object YoutubeRepository {
             }
             // Thin related: vibe-search by song keywords (mood/title words),
             // NOT artist name — artist-only is what caused same-singer loops.
+            // Same-NAME hits from search are dropped outright (a "Diamond"
+            // search must not queue every song called Diamond — that's
+            // title-matching, not vibe). Related-graph hits are untouched.
             val vibeQs = try {
                 vibeQueries(t)
             } catch (e: Exception) {
                 emptyList()
             }
             val pool = ArrayList<YtTrack>(rel)
+            val relIds = try {
+                rel.map { it.id }.toSet()
+            } catch (e: Exception) {
+                emptySet()
+            }
             for (q in vibeQs.take(3)) {
                 try {
                     val hits = searchMusic(q, 12)
                     for (h in hits) {
-                        if (pool.none { it.id == h.id } && h.id != t.id) pool.add(h)
+                        if (pool.none { it.id == h.id } && h.id != t.id &&
+                            !isSameName(h, t)
+                        ) pool.add(h)
                         if (pool.size >= max + 10) break
                     }
                 } catch (e: Exception) {
@@ -367,7 +377,9 @@ object YoutubeRepository {
                         val extra = searchMusic("${t.artist} songs", 8)
                         var added = 0
                         for (h in extra) {
-                            if (pool.none { it.id == h.id } && h.id != t.id && added < max / 4) {
+                            if (pool.none { it.id == h.id } && h.id != t.id &&
+                                !isSameName(h, t) && added < max / 4
+                            ) {
                                 pool.add(h)
                                 added++
                             }
@@ -376,10 +388,10 @@ object YoutubeRepository {
                 }
             } catch (e: Exception) {
             }
-            // Vibe-rank: shared title words first, artist overlap penalized
-            // (prevents same-singer clumps), then shuffle within tiers.
+            // Vibe-rank: related graph first, mood overlap next, same-name
+            // and same-artist clumps sunk, then shuffle within tiers.
             val ranked = try {
-                rankByVibe(t, pool)
+                rankByVibe(t, pool, relIds)
             } catch (e: Exception) {
                 pool
             }
@@ -406,9 +418,12 @@ object YoutubeRepository {
                 .distinct().take(4)
             val mood = detectMood(t.title + " " + t.artist)
             val out = ArrayList<String>()
-            if (words.size >= 2) out.add((words.take(3) + (mood?.let { listOf(it) } ?: emptyList())).joinToString(" ") + " songs")
-            if (words.isNotEmpty()) out.add(words.take(2).joinToString(" ") + " ${mood ?: "songs"}")
+            // Mood first: broad vibe pool (title echo comes later and its
+            // same-name hits are dropped downstream anyway).
             if (mood != null) out.add("$mood hindi songs")
+            if (words.size >= 2) out.add((words.take(3) + (mood?.let { listOf(it) } ?: emptyList())).joinToString(" ") + " songs")
+            if (words.isNotEmpty() && mood != null) out.add(words.take(2).joinToString(" ") + " $mood")
+            else if (words.isNotEmpty()) out.add(words.take(2).joinToString(" ") + " songs")
             out.distinct().take(3)
         } catch (e: Exception) {
             emptyList()
@@ -432,23 +447,78 @@ object YoutubeRepository {
         }
     }
 
-    /** Score pool by vibe: shared words up, same-artist clumps down. */
-    internal fun rankByVibe(seed: YtTrack, pool: List<YtTrack>): List<YtTrack> {
+    /**
+     * Same-name test: normalized titles equal, or one title's distinctive
+     * core sits inside the other ("Diamond" vs "Diamond (Official Video)").
+     * Same-name hits are title-matches, never vibe — dropped from search
+     * filler and sunk in ranking.
+     */
+    internal fun isSameName(a: YtTrack, b: YtTrack): Boolean {
         return try {
-            val seedWords = (seed.title.lowercase().replace(Regex("""[^a-z0-9 ]"""), " ")
-                .split(Regex("""\s+""")).filter { it.length > 3 } +
-                vibeQueries(seed).flatMap { it.split(" ") }.filter { it.length > 3 })
-                .toSet()
+            fun norm(t: String): List<String> {
+                var s = t.lowercase()
+                    .replace(Regex("""[\(\[].*?[\)\]]"""), " ")
+                // "Song - Movie" suffixes go before punctuation is stripped
+                // (stripping first would erase the " - " separator itself).
+                val dash = s.indexOf(" - ")
+                if (dash >= 3) s = s.substring(0, dash)
+                s = s.replace(Regex("""[^a-z0-9 ]"""), " ")
+                return s.split(Regex("""\s+"""))
+                    .map { it.trim() }
+                    .filter { it.length > 2 }
+                    .filterNot {
+                        it in setOf(
+                            "official", "video", "audio", "lyrics", "lyric",
+                            "song", "songs", "full", "visualizer", "the"
+                        )
+                    }
+            }
+            val aw = norm(a.title)
+            val bw = norm(b.title)
+            if (aw.isEmpty() || bw.isEmpty()) return false
+            if (aw == bw) return true
+            // Containment needs a 2+ word core: a lone shared word like
+            // "Diamond" in "Diamond Eyes" is a different song, not an echo.
+            val core = if (aw.size <= bw.size) aw else bw
+            val other = if (aw.size <= bw.size) bw else aw
+            return core.size >= 2 && core.all { it in other }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Score pool by vibe: related-graph tracks first (true co-listen vibe),
+     * same mood next, artist variety over clumps, same-NAME sunk hard.
+     * Title-word overlap is deliberately NOT scored — it queues every song
+     * called "Diamond" instead of songs that feel like Diamond.
+     */
+    internal fun rankByVibe(
+        seed: YtTrack,
+        pool: List<YtTrack>,
+        relatedIds: Set<String> = emptySet()
+    ): List<YtTrack> {
+        return try {
+            val seedMood = try {
+                detectMood(seed.title + " " + seed.artist)
+            } catch (e: Exception) {
+                null
+            }
             val seedArtist = seed.artist.lowercase()
             val rnd = java.util.Random(System.currentTimeMillis())
             pool.map { c ->
                 var s = 0
-                val cw = c.title.lowercase().replace(Regex("""[^a-z0-9 ]"""), " ")
-                    .split(Regex("""\s+""")).filter { it.length > 3 }
-                s += cw.count { it in seedWords } * 2
-                // Penalize same-artist (the old bug): vibe variety wins.
+                if (c.id in relatedIds) s += 5
+                if (isSameName(c, seed)) s -= 8
+                try {
+                    val cm = detectMood(c.title + " " + c.artist)
+                    if (seedMood != null && cm == seedMood) s += 4
+                } catch (e: Exception) {
+                }
+                // Variety wins: same-artist clumps sunk, fresh voices up.
                 if (c.artist.lowercase() == seedArtist) s -= 3
                 else if (c.artist.lowercase().contains(seedArtist.take(5)) && seedArtist.length > 5) s -= 2
+                else s += 1
                 Pair(s, c)
             }.sortedWith(compareByDescending<Pair<Int, YtTrack>> { it.first }
                 .thenBy { rnd.nextInt() })

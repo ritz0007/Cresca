@@ -212,6 +212,12 @@ class MainActivity : ComponentActivity() {
         var uiReady = false
         splash.setKeepOnScreenCondition { !uiReady }
         super.onCreate(savedInstanceState)
+        // Edge-to-edge: the full player bleeds artwork under the status
+        // bar (Scaffold + sheets already consume insets as padding).
+        try {
+            androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, false)
+        } catch (e: Exception) {
+        }
         try {
             themeMode = getPreferences(MODE_PRIVATE).getString("theme", "system") ?: "system"
         } catch (e: Exception) {
@@ -262,16 +268,29 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-/** Status + nav bars follow the page: artwork-dominant color inside the
- * player, solid app surface everywhere else (never transparent glass the
- * status icons can't read against). */
+/** Status + nav bars follow the page: in the full player they go fully
+ * transparent so the thumbnail art covers the status bar and melts into
+ * the backdrop (no square edges); everywhere else they wear the solid app
+ * surface so icons always stay readable. */
 @Composable
-private fun SystemBars(dark: Boolean, barColor: Color? = null) {
+private fun SystemBars(dark: Boolean, barColor: Color? = null, immersivePlayer: Boolean = false) {
     val view = LocalView.current
-    DisposableEffect(dark, barColor) {
+    DisposableEffect(dark, barColor, immersivePlayer) {
         try {
             val window = (view.context as android.app.Activity).window
-            if (barColor != null) {
+            if (immersivePlayer) {
+                window.statusBarColor = android.graphics.Color.TRANSPARENT
+                window.navigationBarColor = android.graphics.Color.TRANSPARENT
+                // Icon tone from the artwork luminance.
+                val dom = barColor
+                val lightBars = if (dom != null) {
+                    (dom.red * 0.2126f + dom.green * 0.7152f + dom.blue * 0.0722f) > 0.45f
+                } else !dark
+                WindowCompat.getInsetsController(window, view).apply {
+                    isAppearanceLightStatusBars = lightBars
+                    isAppearanceLightNavigationBars = lightBars
+                }
+            } else if (barColor != null) {
                 val argb = android.graphics.Color.argb(
                     255,
                     (barColor.red * 255).toInt().coerceIn(0, 255),
@@ -558,7 +577,11 @@ fun AppleMusicAppContent(
             Color(0xFF3A0A12)
         }
     }
-    SystemBars(dark, if (showFullPlayer) playerDom else MaterialTheme.colorScheme.background)
+    SystemBars(
+        dark,
+        if (showFullPlayer) playerDom else MaterialTheme.colorScheme.background,
+        immersivePlayer = showFullPlayer
+    )
 
     fun openPlaylist(id: String) {
         // Store I/O off main (file JSON ANRs). State assigns on Main
@@ -2596,7 +2619,34 @@ private fun FullPlayerSheet(
                     val actx = LocalContext.current
                     val hd = remember(track.id) { hdThumb(track) }
                     var hdOk by remember(track.id) { mutableStateOf(true) }
+                    // Melt tone: artwork-darkened lava color. The bottom scrim
+                    // ends in exactly this, so no square edge is ever visible.
+                    val melt = remember(domAnimated) {
+                        try {
+                            Color(
+                                (domAnimated.red * 0.30f).coerceIn(0f, 1f),
+                                (domAnimated.green * 0.30f).coerceIn(0f, 1f),
+                                (domAnimated.blue * 0.30f).coerceIn(0f, 1f)
+                            )
+                        } catch (e: Exception) {
+                            Color(0xFF121212)
+                        }
+                    }
                     Box(Modifier.fillMaxWidth()) {
+                        // Slightly transparent: roaming lava/bokeh breathe
+                        // through the art a little.
+                        AsyncImage(
+                            model = coil.request.ImageRequest.Builder(actx)
+                                .data(if (hdOk) hd else thumbUrl)
+                                .crossfade(true)
+                                .build(),
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            onError = { hdOk = false },
+                            modifier = Modifier.fillMaxWidth().aspectRatio(1f),
+                            alpha = 0.86f
+                        )
+                        // Heavy dream veil: blurred-vision frost, no shapes.
                         AsyncImage(
                             model = coil.request.ImageRequest.Builder(actx)
                                 .data(if (hdOk) hd else thumbUrl)
@@ -2606,30 +2656,18 @@ private fun FullPlayerSheet(
                             contentScale = ContentScale.Crop,
                             onError = { hdOk = false },
                             modifier = Modifier.fillMaxWidth().aspectRatio(1f)
+                                .blur(28.dp),
+                            alpha = 0.42f
                         )
-                        // Light frosted veil above the art: just enough for the
-                        // overlay text to read over any artwork (dreaminess
-                        // dialled way down from the old heavy blur).
-                        AsyncImage(
-                            model = coil.request.ImageRequest.Builder(actx)
-                                .data(if (hdOk) hd else thumbUrl)
-                                .crossfade(true)
-                                .build(),
-                            contentDescription = null,
-                            contentScale = ContentScale.Crop,
-                            onError = { hdOk = false },
-                            modifier = Modifier.fillMaxWidth().aspectRatio(1f)
-                                .blur(12.dp),
-                            alpha = 0.18f
-                        )
-                        // Dark scrim melting art into the page.
+                        // Feathered scrim melting art into the lava backdrop.
                         Box(
                             Modifier.fillMaxWidth().aspectRatio(1f)
                                 .background(
                                     Brush.verticalGradient(
                                         0f to Color.Transparent,
-                                        0.45f to Color.Transparent,
-                                        1f to Color(0xFF121212)
+                                        0.40f to Color.Transparent,
+                                        0.72f to melt.copy(alpha = 0.55f),
+                                        1f to melt
                                     )
                                 )
                         )
@@ -4002,6 +4040,8 @@ private fun ProfileSheet(
             item {
                 val pctx = LocalContext.current
                 var hasCrash by remember { mutableStateOf(false) }
+                // Real installed version (never a hardcoded string that rots).
+                var appVer by remember { mutableStateOf("") }
                 LaunchedEffect(Unit) {
                     hasCrash = try {
                         withContext(Dispatchers.IO) {
@@ -4010,9 +4050,21 @@ private fun ProfileSheet(
                     } catch (e: Exception) {
                         false
                     }
+                    appVer = try {
+                        withContext(Dispatchers.IO) {
+                            UpdateCheck.currentVersion(pctx)
+                        }
+                    } catch (e: Exception) {
+                        ""
+                    }
                 }
                 ListItem(
-                    headlineContent = { Text("Cresca Music 0.8.0") },
+                    headlineContent = {
+                        Text(
+                            if (appVer.isNotBlank()) "Cresca Music $appVer"
+                            else "Cresca Music"
+                        )
+                    },
                     supportingContent = {
                         Text("Live YouTube audio • karaoke lyrics • offline mode")
                     },
