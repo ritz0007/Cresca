@@ -1458,8 +1458,20 @@ fun AppleMusicAppContent(
             try {
                 val res = YoutubeRepository.searchMusic(seed.query, 25)
                 if (res.isNotEmpty()) {
-                    homeTracks = res
+                    // Staged write: software renderers take seconds to
+                    // upload 25 fresh images in one frame (input ANR). Two
+                    // smaller frames stay under the timeout, same content.
+                    homeTracks = res.take(10)
                     live = true
+                    try {
+                        delay(300)
+                    } catch (e: Exception) {
+                    }
+                    homeTracks = res
+                    try {
+                        delay(150)
+                    } catch (e: Exception) {
+                    }
                     if (queue.items.isEmpty() && nowPlaying == null) {
                         queue.replaceAll(res)
                         nowPlaying = res.first()
@@ -3545,12 +3557,13 @@ private fun LavaBackground(
             Triple(x, y, s)
         }
         Canvas(Modifier.fillMaxSize()) {
-            val r = size.minDimension * 0.32f
-                        drawCircle(base.copy(alpha = 0.45f), r,
+            val r = size.minDimension * 0.22f
+            // Wash, not balls: faint large tints melting into the gradient.
+            drawCircle(base.copy(alpha = 0.16f), r,
                 androidx.compose.ui.geometry.Offset(size.width * ax, size.height * ay))
-            drawCircle(Color.White.copy(alpha = 0.05f), r * 0.7f,
+            drawCircle(Color.White.copy(alpha = 0.03f), r * 0.7f,
                 androidx.compose.ui.geometry.Offset(size.width * bx, size.height * by))
-            drawCircle(base.copy(alpha = 0.30f), r * 0.55f,
+            drawCircle(base.copy(alpha = 0.10f), r * 0.55f,
                 androidx.compose.ui.geometry.Offset(size.width * cx, size.height * cy))
             // Bokeh layer above the blobs: soft radial discs.
             for ((fx, fy, s) in bokehXY) {
