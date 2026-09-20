@@ -51,6 +51,22 @@ class PlayerQueue(
     // Exhaust hook fires once per track (avoids fetch loops).
     private var exhaustedFor: String? = null
 
+    /**
+     * Call gate: when true, items still resolve + seek (prepared, paused)
+     * but play() is never issued — audio focus is locked during calls and
+     * starting the foreground service then crashes the app
+     * (RemoteServiceException). The UI resumes after the call.
+     */
+    var deferPlay: () -> Boolean = { false }
+
+    private fun playAllowed(): Boolean {
+        return try {
+            !deferPlay()
+        } catch (e: Exception) {
+            true
+        }
+    }
+
     // Stuck fix: every resolve gets a generation token. Rapid taps cancel
     // the stale job so the last tap always wins (no wrong-track flips,
     // no shared urlOptions cross-talk, no permanent `resolving` lock).
@@ -263,7 +279,14 @@ class PlayerQueue(
                     exhaustedFor = null
                     try {
                         player.seekToNext()
-                        player.play()
+                        if (playAllowed()) {
+                            player.play()
+                        } else {
+                            try {
+                                player.pause()
+                            } catch (ignored: Exception) {
+                            }
+                        }
                         if (player.mediaItemCount > 1) {
                             player.removeMediaItem(0)
                         }
@@ -502,6 +525,19 @@ class PlayerQueue(
         }
     }
 
+    /** Previous [n] tracks in play order (back-skip precache). */
+    fun previousIds(n: Int): List<YtTrack> {
+        try {
+            if (items.isEmpty() || currentIndex == -1 || n <= 0) return emptyList()
+            val pos = order.indexOf(currentIndex)
+            if (pos <= 0) return emptyList()
+            return order.subList(0, pos).takeLast(n)
+                .mapNotNull { items.getOrNull(it) }
+        } catch (e: Exception) {
+            return emptyList()
+        }
+    }
+
     /**
      * Append engine-picked tracks (related autoplay). New ids are tagged so
      * the next refresh can replace the tail without touching user tracks.
@@ -625,7 +661,14 @@ class PlayerQueue(
             .build()
         player.setMediaItem(item)
         player.prepare()
-        player.play()
+        if (playAllowed()) {
+            player.play()
+        } else {
+            try {
+                player.pause()
+            } catch (e: Exception) {
+            }
+        }
     }
 
     // 403/410 fallback: the extractor hands several hosts; try the next one.

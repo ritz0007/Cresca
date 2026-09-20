@@ -31,6 +31,24 @@ object Precache {
     // Whole songs: typical audio streams are 3-8 MB.
     private const val CAP_BYTES = 10L * 1024L * 1024L
 
+    /**
+     * 4 GB on-device budget (mirrors ExoCache). The SimpleCache LRU evictor
+     * enforces it automatically on every write — hottest bytes (current,
+     * upcoming, recent, charts, searches) stay resident; cold bytes are
+     * dropped first. This helper only reports pressure for diagnostics.
+     */
+    const val BUDGET_BYTES = 4L * 1024L * 1024L
+
+    /** 0..1 budget pressure (1 = evictor actively trimming). Never throws. */
+    suspend fun budgetPressure(ctx: Context): Float = withContext(Dispatchers.IO) {
+        try {
+            val used = ExoCache.get(ctx.applicationContext).cacheSpace
+            (used.toFloat() / BUDGET_BYTES.toFloat()).coerceIn(0f, 1f)
+        } catch (e: Exception) {
+            0f
+        }
+    }
+
     /** Pre-store one resolved stream URL (URL cache should be warm first). */
     suspend fun warmUrl(ctx: Context, url: String) = withContext(Dispatchers.IO) {
         try {
@@ -94,21 +112,28 @@ object Precache {
         }
 
     /**
-     * Taste-predicted warming: queue Up Next first (instant skip), then a
-     * few vibe-matched predictions from liked + recent seeds. Runs on IO,
-     * never throws, safe to call on every track change.
+     * Taste-predicted warming: queue Up Next first (instant skip), previous
+     * tracks (instant back-skip), likely charts, then a few vibe-matched
+     * predictions from liked + recent seeds. Runs on IO, never throws,
+     * safe to call on every track change.
      */
     suspend fun warmPredicted(
         ctx: Context,
         upcoming: List<YtTrack>,
         liked: List<YtTrack> = emptyList(),
-        recent: List<YtTrack> = emptyList()
+        recent: List<YtTrack> = emptyList(),
+        previous: List<YtTrack> = emptyList(),
+        charts: List<YtTrack> = emptyList()
     ) = withContext(Dispatchers.IO) {
         try {
             val app = ctx.applicationContext
             // 1) Up Next: the next 5 play instantly (covers rapid skipping).
             warmUpcoming(app, upcoming, 5)
-            // 2) Taste predictions: 3 vibe picks from library seeds.
+            // 2) Previous: back-skips resolve instantly too.
+            warmUpcoming(app, previous.take(3), 3)
+            // 3) Charts the user opens (or probably opens): top of each rail.
+            warmUpcoming(app, charts.take(6), 6)
+            // 4) Taste predictions: 3 vibe picks from library seeds.
             try {
                 val seeds = (liked.take(6) + recent.take(6)).distinctBy { it.id }
                     .filter { it.watchUrl.isNotBlank() }.take(3)
@@ -124,10 +149,28 @@ object Precache {
                 }
             } catch (e: Exception) {
             }
+            try {
+                val pressure = budgetPressure(app)
+                if (pressure > 0.9f) Log.i(TAG, "cache pressure ${"%.0f".format(pressure * 100)}%")
+            } catch (e: Exception) {
+            }
         } catch (e: Exception) {
             Log.w(TAG, "warmPredicted failed", e)
         }
     }
+
+    /**
+     * Search fast-lane: the moment results land, store the top 4 instantly
+     * so tapping any of them streams from disk. Fire-and-forget on IO.
+     */
+    suspend fun warmSearchTop(ctx: Context, results: List<YtTrack>) =
+        withContext(Dispatchers.IO) {
+            try {
+                warmUpcoming(ctx.applicationContext, results.take(4), 4)
+            } catch (e: Exception) {
+                Log.w(TAG, "warmSearchTop failed", e)
+            }
+        }
 
     /** Warm Coil disk cache so artwork appears instantly. */
     suspend fun warmArt(ctx: Context, url: String) = withContext(Dispatchers.IO) {

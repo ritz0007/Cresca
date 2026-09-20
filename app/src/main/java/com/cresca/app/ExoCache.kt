@@ -11,8 +11,9 @@ import java.io.File
  * On-disk ExoPlayer cache:
  * streamed audio bytes are reused on replay / prefetch / offline-ish
  * replay, so playback is smooth and non-stop even on flaky networks.
- * 3 GB LRU in cacheDir/exoplayer (strong cache: upcoming + taste-
- * predicted songs live here, skip feels instant).
+ * 4 GB LRU in cacheDir/exoplayer: upcoming + previous + taste-predicted
+ * + charts + search-top songs live here. Least-recently-used eviction
+ * keeps the 4 GB budget automatically (hot songs stay, cold bytes go).
  */
 object ExoCache {
     private const val TAG = "ExoCache"
@@ -34,7 +35,7 @@ object ExoCache {
             StandaloneDatabaseProvider(ctx.applicationContext)
         }
         val cache = SimpleCache(
-            dir, LeastRecentlyUsedCacheEvictor(3L * 1024L * 1024L * 1024L), db
+            dir, LeastRecentlyUsedCacheEvictor(4L * 1024L * 1024L * 1024L), db
         )
         instance = cache
         return cache

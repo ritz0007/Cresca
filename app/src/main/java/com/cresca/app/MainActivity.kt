@@ -422,6 +422,11 @@ fun AppleMusicAppContent(
     var dashUrl by remember { mutableStateOf("") }
     var dashCapH by remember { mutableIntStateOf(0) }
     var upcomingTick by remember { mutableIntStateOf(0) }
+    // Parked mid-call taps: true when the user asked to play while a call
+    // held focus. onCallEnded starts the service + plays (never mid-call).
+    // (Declared up here: playDash below also parks.)
+    var callPendingPlay by remember { mutableStateOf(false) }
+    var userPausedMidCall by remember { mutableStateOf(false) }
 
     // Quality rows for the picker: DASH caps when available, else muxed heights.
     fun qualityLabels(): List<String> {
@@ -465,7 +470,19 @@ fun AppleMusicAppContent(
         player.prepare()
         player.seekTo(fromPos)
         if (autoplay) {
-            player.play()
+            val defer = try {
+                CallGuard.isInCall(context)
+            } catch (e: Exception) {
+                false
+            }
+            if (defer) {
+                callPendingPlay = true
+                playerError = "On call — starts when the call ends"
+                try {
+                    player.pause()
+                } catch (e: Exception) {
+                }
+            } else player.play()
         }
         dashCapH = capH
     }
@@ -602,12 +619,40 @@ fun AppleMusicAppContent(
     fun isLiked(t: YtTrack) = liked.any { it.id == t.id }
 
     fun startPlaybackService() {
+        // Crash gate: starting playback mid-call kills the app — the player
+        // can't take audio focus, the notification never goes ongoing, and
+        // the system fires RemoteServiceException for the missing
+        // startForeground() (ExoPlayer #7977 pattern). Start only off-call;
+        // parked taps resume via onCallEnded below.
+        try {
+            if (!CallGuard.CallPlaybackGate.shouldStartForegroundService(
+                    CallGuard.isInCall(context)
+                )
+            ) {
+                return
+            }
+        } catch (e: Exception) {
+        }
         try {
             androidx.core.content.ContextCompat.startForegroundService(
                 context, android.content.Intent(context, PlaybackService::class.java)
             )
         } catch (e: Exception) {
             Log.w(TAG, "service start failed", e)
+        }
+    }
+
+    // Parked mid-call taps are declared near the top (before playDash).
+    // This helper only records the tap + hint.
+    fun noteTapDuringCall(): Boolean {
+        return try {
+            if (CallGuard.isInCall(context)) {
+                callPendingPlay = true
+                playerError = "On call — starts when the call ends"
+                true
+            } else false
+        } catch (e: Exception) {
+            false
         }
     }
 
@@ -654,8 +699,8 @@ fun AppleMusicAppContent(
                 // Every change tops Up Next back up to ~20 related tracks
                 // (trigger-state: refreshUpcoming is declared below).
                 upcomingTick++
-                // BG store next + taste-predicted songs (3 GB cache) so
-                // skipping forward is instant even on flaky networks.
+                // BG store next + prev + charts + taste-predicted songs
+                // (4 GB cache) so skips stream instantly, even offline-ish.
                 scope.launch(Dispatchers.IO) {
                     try {
                         val q = queueHolder[0] ?: return@launch
@@ -668,6 +713,16 @@ fun AppleMusicAppContent(
                             },
                             try {
                                 recent.toList()
+                            } catch (e: Exception) {
+                                emptyList()
+                            },
+                            try {
+                                q.previousIds(3)
+                            } catch (e: Exception) {
+                                emptyList()
+                            },
+                            try {
+                                homeSections["Charts Right Now"] ?: emptyList()
                             } catch (e: Exception) {
                                 emptyList()
                             }
@@ -734,6 +789,21 @@ fun AppleMusicAppContent(
                     }
                 }
             }).also { queueHolder[0] = it }
+    }
+
+    // Queue never issues play() mid-call (focus locked); it prepares + pauses
+    // and the UI resumes after the call via onCallEnded.
+    LaunchedEffect(queue) {
+        try {
+            queue.deferPlay = {
+                try {
+                    CallGuard.isInCall(context)
+                } catch (e: Exception) {
+                    false
+                }
+            }
+        } catch (e: Exception) {
+        }
     }
 
     // Keep ~20 upcoming tracks after every change (related autoplay).
@@ -945,11 +1015,28 @@ fun AppleMusicAppContent(
     }
 
     // Phone calls win: pause while in a call, resume after (if playing).
-    // Crash-proof via CallGuard (isolates API-31 surface, never throws,
-    // safe to play-while-in-call: pauses cleanly instead of crashing).
+    // Crash-proof via CallGuard (isolates API-31 surface, never throws).
+    // Parked mid-call taps start here: service + play are only safe now
+    // that focus is unlocked (starting them mid-call = RemoteService crash).
     DisposableEffect(player) {
         val unregister = try {
-            CallGuard.register(context, player)
+            CallGuard.register(context, player) {
+                try {
+                    if (callPendingPlay && !userPausedMidCall && nowPlaying != null) {
+                        callPendingPlay = false
+                        playerError = null
+                        startPlaybackService()
+                        try {
+                            player.play()
+                        } catch (e: Exception) {
+                        }
+                        Log.i(TAG, "resumed parked playback after call")
+                    } else {
+                        callPendingPlay = false
+                    }
+                } catch (e: Exception) {
+                }
+            }
         } catch (e: Exception) {
             {}
         }
@@ -1093,7 +1180,23 @@ fun AppleMusicAppContent(
             )
             player.prepare()
             startPlaybackService()
-            player.play()
+            if (CallGuard.CallPlaybackGate.actionForTap(
+                    try {
+                        CallGuard.isInCall(context)
+                    } catch (e: Exception) {
+                        false
+                    }
+                ) == CallGuard.CallPlayAction.START_NOW
+            ) {
+                player.play()
+            } else {
+                callPendingPlay = true
+                playerError = "On call — starts when the call ends"
+                try {
+                    player.pause()
+                } catch (e: Exception) {
+                }
+            }
             pushRecent(t)
             Log.i(TAG, "playing offline ${t.title}")
         } catch (e: Exception) {
@@ -1109,6 +1212,10 @@ fun AppleMusicAppContent(
         resolving = false
         playerError = null
         autoSkipErrors = 0
+        userPausedMidCall = false
+        // Mid-call tap: park it ("starts when the call ends"). The queue
+        // still resolves + prepares (paused); the service start waits.
+        noteTapDuringCall()
         if (track.watchUrl.isBlank()) { nowPlaying = track; return }
         val idx = queue.items.indexOfFirst { it.id == track.id }
         if (player.mediaItemCount > 0 && queue.current?.id == track.id) {
@@ -1137,7 +1244,16 @@ fun AppleMusicAppContent(
 
     fun togglePlay(track: YtTrack) {
         if (player.mediaItemCount == 0) play(track)
-        else if (player.isPlaying) player.pause() else player.play()
+        else if (player.isPlaying) {
+            try {
+                if (CallGuard.isInCall(context)) userPausedMidCall = true
+            } catch (e: Exception) {
+            }
+            player.pause()
+        } else if (noteTapDuringCall()) {
+            userPausedMidCall = false
+            // Parked: prepared item stays paused until the call ends.
+        } else player.play()
     }
 
     fun playList(tracks: List<YtTrack>, index: Int = 0, shuffled: Boolean = false) {
@@ -1146,6 +1262,8 @@ fun AppleMusicAppContent(
         resolving = false
         playerError = null
         autoSkipErrors = 0
+        userPausedMidCall = false
+        noteTapDuringCall()
         val list = if (shuffled) tracks.shuffled() else tracks
         val i = index.coerceIn(list.indices)
         queue.setQueue(list, i)
@@ -1158,6 +1276,8 @@ fun AppleMusicAppContent(
         try {
             resolving = true
             playerError = null
+            userPausedMidCall = false
+            noteTapDuringCall()
             queue.next()
             // Optimistic: show the new current instantly (resolve confirms).
             try {
@@ -1179,6 +1299,16 @@ fun AppleMusicAppContent(
                             recent.toList()
                         } catch (e: Exception) {
                             emptyList()
+                        },
+                        try {
+                            q.previousIds(3)
+                        } catch (e: Exception) {
+                            emptyList()
+                        },
+                        try {
+                            homeSections["Charts Right Now"] ?: emptyList()
+                        } catch (e: Exception) {
+                            emptyList()
                         }
                     )
                 } catch (e: Exception) {
@@ -1196,6 +1326,8 @@ fun AppleMusicAppContent(
         try {
             resolving = true
             playerError = null
+            userPausedMidCall = false
+            noteTapDuringCall()
             queue.previous()
             try {
                 queue.current?.let { nowPlaying = it }
@@ -1248,6 +1380,20 @@ fun AppleMusicAppContent(
     }
     fun openSeeAll(req: SeeAllRequest) {
         seeAllPage = req
+        // Charts/rails the user opens get stored: probable replays stream
+        // from disk next time (4 GB budget, LRU-kept).
+        try {
+            val static = req.static
+            if (static.isNotEmpty()) {
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        Precache.warmUpcoming(context, static.take(8), 8)
+                    } catch (e: Exception) {
+                    }
+                }
+            }
+        } catch (e: Exception) {
+        }
     }
 
     // ---- Video mode: the SAME session player swaps audio<->video streams,
@@ -2253,7 +2399,7 @@ fun AppleMusicAppContent(
     }
 }
 
-/** Single source for song name + live lyric, overlaid on art AND video. */
+/** Single source for song name + live lyric, overlaid on artwork only. */
 @Composable
 private fun androidx.compose.foundation.layout.BoxScope.ThumbnailOverlay(
     track: YtTrack,
@@ -2299,6 +2445,55 @@ private fun androidx.compose.foundation.layout.BoxScope.ThumbnailOverlay(
             style = MaterialTheme.typography.bodyMedium,
             color = Color.White.copy(alpha = 0.75f),
             maxLines = 1, overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+/** Video mode meta block: name + live lyric BELOW the video, never on it. */
+@Composable
+private fun VideoMeta(
+    track: YtTrack,
+    lyrics: LyricsState,
+    position: Long
+) {
+    val line = try {
+        if (lyrics is LyricsState.Synced) {
+            val ls = lyrics.lines
+            ls.indexOfLast { it.ms <= position }
+                .takeIf { it >= 0 }?.let { ls[it].text } ?: ""
+        } else ""
+    } catch (e: Exception) {
+        ""
+    }
+    Column(
+        Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        if (line.isNotBlank()) {
+            Text(
+                line,
+                style = MaterialTheme.typography.bodyMedium.copy(
+                    fontWeight = FontWeight.SemiBold
+                ),
+                color = MaterialTheme.colorScheme.primary,
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(bottom = 4.dp)
+            )
+        }
+        Text(
+            track.title,
+            style = MaterialTheme.typography.titleLarge.copy(
+                fontWeight = FontWeight.Bold
+            ),
+            maxLines = 2, overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center
+        )
+        Text(
+            track.artist,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1, overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center
         )
     }
 }
@@ -2381,7 +2576,9 @@ private fun FullPlayerSheet(
             // dark scrim melting into the page behind name + lyrics.
             item(key = "art") {
                 if (videoMode && track.watchUrl.isNotBlank()) {
-                    // Session-driven embed: the music transport owns this picture.
+                    // Session-driven embed: the music transport owns this
+                    // picture. Kept clean: no overlay/scrim on the video —
+                    // name + live lyric sit BELOW it (next item).
                     Box(
                         Modifier.fillMaxWidth().aspectRatio(16f / 9f)
                             .background(Color.Black)
@@ -2393,23 +2590,6 @@ private fun FullPlayerSheet(
                             currentQuality = currentQuality,
                             onQuality = onQuality,
                             modifier = Modifier.fillMaxSize()
-                        )
-                        // Same song name + live lyrics overlay as artwork mode
-                        // (scrim behind for readability over video frames).
-                        Box(
-                            Modifier.fillMaxSize()
-                                .background(
-                                    Brush.verticalGradient(
-                                        0f to Color.Transparent,
-                                        0.55f to Color.Transparent,
-                                        1f to Color(0xFF121212)
-                                    )
-                                )
-                        )
-                        ThumbnailOverlay(
-                            track = track,
-                            lyrics = lyrics,
-                            position = position
                         )
                     }
                 } else {
@@ -2463,14 +2643,25 @@ private fun FullPlayerSheet(
                     }
                 }
             }
+            // Video mode: name + live lyric BELOW the video (never on it).
+            if (videoMode && track.watchUrl.isNotBlank()) {
+                item(key = "videometa") {
+                    VideoMeta(
+                        track = track,
+                        lyrics = lyrics,
+                        position = position
+                    )
+                }
+            }
             item(key = "body") {
             Column(
                 Modifier.fillMaxWidth().padding(horizontal = 24.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Spacer(Modifier.height(16.dp))
-                // Song name + live lyric live ONLY on the thumbnail/video
-                // overlay above (single source, no duplicates below).
+                // Song name + live lyric live ONLY on the thumbnail overlay
+                // above (single source, no duplicates below). Video mode has
+                // its own below-video block (videometa item).
                 SleekBar(positionMs = position, durationMs = duration, onSeek = onSeek)
                 if (error != null) {
                     Text(error, style = MaterialTheme.typography.bodySmall,
@@ -5417,6 +5608,7 @@ private fun SearchScreen(
     val context = LocalContext.current
     var error by remember { mutableStateOf<String?>(null) }
     var retryTick by remember { mutableIntStateOf(0) }
+    val searchScope = rememberCoroutineScope()
     // Double-tap on the Search tab icon focuses the bar with keyboard up
     val focusRequester = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
@@ -5441,6 +5633,12 @@ private fun SearchScreen(
             }?.let { cached ->
                 results = cached
                 error = null
+                searchScope.launch(Dispatchers.IO) {
+                    try {
+                        Precache.warmSearchTop(context, cached)
+                    } catch (e: Exception) {
+                    }
+                }
             }
         } catch (e: Exception) { }
         delay(800)
@@ -5463,9 +5661,12 @@ private fun SearchScreen(
             if (fresh.isNotEmpty()) {
                 results = fresh
                 val snapshot = fresh
+                // Search fast-lane: top 4 stored instantly so taps stream
+                // from disk (4 GB budget, LRU-kept).
                 try {
                     withContext(Dispatchers.IO) {
                         SongCache.save(context, cacheKey, snapshot)
+                        Precache.warmSearchTop(context, snapshot)
                     }
                 } catch (e: Exception) {
                 }

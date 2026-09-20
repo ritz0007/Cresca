@@ -44,4 +44,28 @@ class CallGuardTest {
         // Resume-after-call must only fire from call modes, never NORMAL.
         assertFalse(CallGuard.isCallMode(0))
     }
+
+    @Test
+    fun gate_defersPlayAndServiceInCall() {
+        // The RemoteServiceException crash: starting playback mid-call while
+        // focus is locked. Gate must defer taps and block service starts.
+        assertEquals(
+            CallGuard.CallPlayAction.DEFER_UNTIL_CALL_END,
+            CallGuard.CallPlaybackGate.actionForTap(true)
+        )
+        assertEquals(
+            CallGuard.CallPlayAction.START_NOW,
+            CallGuard.CallPlaybackGate.actionForTap(false)
+        )
+        assertFalse(CallGuard.CallPlaybackGate.shouldStartForegroundService(true))
+        assertTrue(CallGuard.CallPlaybackGate.shouldStartForegroundService(false))
+    }
+
+    @Test
+    fun gate_stress_neverThrows() {
+        repeat(1000) {
+            CallGuard.CallPlaybackGate.actionForTap(it % 2 == 0)
+            CallGuard.CallPlaybackGate.shouldStartForegroundService(it % 3 == 0)
+        }
+    }
 }
