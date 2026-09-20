@@ -52,11 +52,11 @@ import kotlinx.coroutines.delay
  *
  * Waiting-dots contract (user spec):
  * - dots ONLY for real breaks: waits under 5s show lines back-to-back
- * - 5s wait = 1 dot, up to 9s = 2 dots, above 9s = 3 dots
+ * - every break gets exactly 3 dots (no 1/2-dot rows)
+ * - the dots segment always ends a full 2s BEFORE the next line: the
+ *   fill completes, dots hold bright 2s, then the lyric fires
  * - dots also wrap the song: lead-in before the first line and outro
  *   after the last line (needs [durationMs], 0 = skip outro dots)
- * - the dots segment always ends a full 1s BEFORE the next line: the
- *   fill completes, dots hold bright 1s, then the lyric fires.
  * - past dots dim like past lyrics (never stay shiny white).
  */
 @Composable
@@ -300,6 +300,18 @@ private fun SyncedLyrics(
                         animationSpec = tween(300),
                         label = "lyricAlpha"
                     )
+                    // Constant gentle pan: past lines rest lifted, upcoming
+                    // settle from below — always applied, eased, never jumpy.
+                    val targetShift = when {
+                        isActive -> 0f
+                        isPast -> -8f
+                        else -> 8f
+                    }
+                    val shift by animateFloatAsState(
+                        targetValue = targetShift,
+                        animationSpec = tween(320),
+                        label = "lyricPan"
+                    )
                     // Frosted depth for far lines, crisp prev/next. Blur is
                     // skipped while scrolling (perf) — alpha carries it.
                     val blurDp = when {
@@ -310,7 +322,7 @@ private fun SyncedLyrics(
                     var mod = Modifier
                         .fillMaxWidth()
                         .padding(vertical = 12.dp)
-                        .graphicsLayer(scaleX = scale, scaleY = scale)
+                        .graphicsLayer(scaleX = scale, scaleY = scale, translationY = shift)
                         .alpha(alphaAnim)
                     if (blurDp.value > 0.01f) mod = mod.blur(blurDp)
                     if (onLineClick != null) {
@@ -346,20 +358,16 @@ private fun SyncedLyrics(
                     )
                 }
                 is LyricRow.Dots -> {
-                    val dotsTotal = row.dotCount.coerceAtLeast(1)
+                    val dotsTotal = 3
                     val span = (row.toMs - row.fromMs).coerceAtLeast(1)
-                    val rawFrac = try {
+                    // Direct drive, no easing animation on the fraction: the
+                    // position already polls at 150ms, and re-triggered tweens
+                    // never finished — that's what made dots look stuck.
+                    val frac = try {
                         ((safePos - row.fromMs).toFloat() / span.toFloat()).coerceIn(0f, 1f)
                     } catch (e: Exception) {
                         0f
                     }
-                    // Eased fill: position polls discretely, so animate the
-                    // fraction itself — dots glide instead of jumping.
-                    val frac by animateFloatAsState(
-                        targetValue = rawFrac,
-                        animationSpec = tween(220),
-                        label = "dotsFrac"
-                    )
                     val filled = (frac * dotsTotal).toInt().coerceIn(0, dotsTotal)
                     val isActiveDots = rows.getOrNull(activeRow) == row
                     val isPastDots = try {
@@ -436,21 +444,15 @@ private fun SyncedLyrics(
 // ---------------------------------------------------------------------------
 
 internal const val DOTS_MIN_GAP_MS = 5000L
-internal const val DOTS_ONE_MAX_MS = 6000L
-internal const val DOTS_TWO_MAX_MS = 9000L
-internal const val LYRIC_HOLD_MS = 1000L
+internal const val LYRIC_HOLD_MS = 2000L
 
 /**
  * Dots for a wait gap: none under 5s (normal line gaps stay clean),
- * 1 dot for a ~5s wait, 2 dots up to 9s, 3 dots above 9s.
- * Boundaries: [5000,6000)=1, [6000,9000]=2, (9000,inf)=3.
+ * exactly 3 dots for any longer break.
  */
 internal fun dotCountForGap(gapMs: Long): Int {
     return try {
-        if (gapMs < DOTS_MIN_GAP_MS) 0
-        else if (gapMs < DOTS_ONE_MAX_MS) 1
-        else if (gapMs <= DOTS_TWO_MAX_MS) 2
-        else 3
+        if (gapMs < DOTS_MIN_GAP_MS) 0 else 3
     } catch (e: Exception) {
         0
     }

@@ -20,6 +20,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.togetherWith
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
@@ -1947,27 +1948,51 @@ fun AppleMusicAppContent(
         }
     }
 
-    // Update check: once a day — in-app banner AND system notification
-    // (the old flow was banner-only and easily missed).
+    // Update check: once a day automatically (banner + system
+    // notification), plus a manual "Check for updates" in Settings that
+    // bypasses the daily gate and reports the result on screen.
     var update by remember { mutableStateOf<UpdateCheck.Update?>(null) }
-    LaunchedEffect(Unit) {
-        try {
-            if (!UpdateCheck.dueForCheck(context)) {
-                return@LaunchedEffect
-            }
-            val latest = UpdateCheck.latest()
-            UpdateCheck.markChecked(context)
-            if (latest != null &&
-                UpdateCheck.isNewer(UpdateCheck.currentVersion(context), latest.tag)
-            ) {
-                update = latest
-                try {
-                    UpdateNotify.notifyIfNewer(context, latest)
-                } catch (e: Exception) {
+    var updateChecking by remember { mutableStateOf(false) }
+    var updateStatus by remember { mutableStateOf("") }
+    fun runUpdateCheck(manual: Boolean) {
+        if (updateChecking) return
+        updateChecking = true
+        if (manual) updateStatus = "Checking…"
+        scope.launch {
+            try {
+                if (!manual && !UpdateCheck.dueForCheck(context)) {
+                    return@launch
                 }
+                val latest = UpdateCheck.latest()
+                UpdateCheck.markChecked(context)
+                val current = try {
+                    UpdateCheck.currentVersion(context)
+                } catch (e: Exception) {
+                    "0.0.0"
+                }
+                if (latest != null && UpdateCheck.isNewer(current, latest.tag)) {
+                    update = latest
+                    if (manual) updateStatus = "Update available: ${latest.tag}"
+                    try {
+                        UpdateNotify.notifyIfNewer(context, latest)
+                    } catch (e: Exception) {
+                    }
+                } else if (manual) {
+                    updateStatus = if (latest == null) {
+                        "Couldn't reach updates — try again"
+                    } else {
+                        "You're up to date ($current)"
+                    }
+                }
+            } catch (e: Exception) {
+                if (manual) updateStatus = "Couldn't reach updates — try again"
+            } finally {
+                updateChecking = false
             }
-        } catch (e: Exception) {
         }
+    }
+    LaunchedEffect(Unit) {
+        runUpdateCheck(false)
     }
     // New releases = latest uploads from YOUR artists' channels
     // (newest-first feeds), refetched when the library changes.
@@ -2349,6 +2374,21 @@ fun AppleMusicAppContent(
                 showDownloads = true
             },
             onClearCache = { clearSongCache() },
+            updateTag = update?.tag,
+            updateChecking = updateChecking,
+            updateStatus = updateStatus,
+            onCheckUpdate = { runUpdateCheck(true) },
+            onUpdateTap = {
+                val u = update
+                if (u != null) {
+                    try {
+                        context.startActivity(
+                            Intent(Intent.ACTION_VIEW, Uri.parse(u.url))
+                        )
+                    } catch (e: Exception) {
+                    }
+                }
+            },
             onDismiss = { showProfile = false }
         )
     }
@@ -2427,16 +2467,15 @@ fun AppleMusicAppContent(
 private fun androidx.compose.foundation.layout.BoxScope.ThumbnailOverlay(
     track: YtTrack,
     lyrics: LyricsState,
-    position: Long
+    position: Long,
+    durationMs: Long = 0L
 ) {
-    val line = try {
-        if (lyrics is LyricsState.Synced) {
-            val ls = lyrics.lines
-            ls.indexOfLast { it.ms <= position }
-                .takeIf { it >= 0 }?.let { ls[it].text } ?: ""
-        } else ""
-    } catch (e: Exception) {
-        ""
+    val overlay = remember(lyrics, position, durationMs) {
+        try {
+            overlayState(lyrics, position, durationMs)
+        } catch (e: Exception) {
+            OverlayState("", 0f, false)
+        }
     }
     Column(
         Modifier.align(Alignment.BottomStart)
@@ -2444,16 +2483,30 @@ private fun androidx.compose.foundation.layout.BoxScope.ThumbnailOverlay(
             .padding(start = 20.dp, end = 20.dp, bottom = 14.dp),
         horizontalAlignment = Alignment.Start
     ) {
-        if (line.isNotBlank()) {
-            Text(
-                line,
-                style = MaterialTheme.typography.bodyMedium.copy(
-                    fontWeight = FontWeight.SemiBold
-                ),
-                color = MaterialTheme.colorScheme.primary,
-                maxLines = 1, overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.padding(bottom = 4.dp)
-            )
+        if (overlay.line.isNotBlank()) {
+            // Box-rolling ticker: each line rolls up into place.
+            androidx.compose.animation.AnimatedContent(
+                targetState = overlay.line,
+                transitionSpec = {
+                    (slideInVertically(tween(280)) { h -> h } + fadeIn(tween(280))) togetherWith
+                        (slideOutVertically(tween(280)) { h -> -h } + fadeOut(tween(280)))
+                },
+                label = "overlayRoll"
+            ) { rolled ->
+                Text(
+                    rolled,
+                    style = MaterialTheme.typography.bodyMedium.copy(
+                        fontWeight = FontWeight.SemiBold
+                    ),
+                    color = MaterialTheme.colorScheme.primary,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(bottom = 4.dp)
+                )
+            }
+        }
+        if (overlay.showDots) {
+            OverlayDots(frac = overlay.dotsFrac)
+            Spacer(Modifier.height(4.dp))
         }
         Text(
             track.title,
@@ -2472,36 +2525,106 @@ private fun androidx.compose.foundation.layout.BoxScope.ThumbnailOverlay(
     }
 }
 
+/** Overlay snapshot: current line + dots fill (pure, unit-friendly). */
+private data class OverlayState(
+    val line: String,
+    val dotsFrac: Float,
+    val showDots: Boolean
+)
+
+private fun overlayState(
+    lyrics: LyricsState,
+    positionMs: Long,
+    durationMs: Long
+): OverlayState {
+    if (lyrics !is LyricsState.Synced || lyrics.lines.isEmpty()) {
+        return OverlayState("", 0f, false)
+    }
+    val pos = positionMs.coerceAtLeast(0L)
+    val sorted = lyrics.lines.filter { it.text.isNotBlank() }.sortedBy { it.ms }
+    if (sorted.isEmpty()) return OverlayState("", 0f, false)
+    val line = sorted.indexOfLast { it.ms <= pos }
+        .takeIf { it >= 0 }?.let { sorted[it].text } ?: ""
+    return try {
+        val rows = buildLyricRows(sorted, durationMs)
+        val ai = sorted.indexOfLast { it.ms <= pos }
+        val ar = activeRowIndex(rows, ai, pos)
+        val dots = rows.getOrNull(ar) as? LyricRow.Dots
+        if (dots != null) {
+            val span = (dots.toMs - dots.fromMs).coerceAtLeast(1L)
+            val frac = ((pos - dots.fromMs).toFloat() / span.toFloat()).coerceIn(0f, 1f)
+            OverlayState(line, frac, true)
+        } else OverlayState(line, 0f, false)
+    } catch (e: Exception) {
+        OverlayState(line, 0f, false)
+    }
+}
+
+/** Compact dots for the thumbnail overlay (mirrors the karaoke row). */
+@Composable
+private fun OverlayDots(frac: Float) {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.Start),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        val filled = (frac.coerceIn(0f, 1f) * 3).toInt().coerceIn(0, 3)
+        for (d in 0 until 3) {
+            Box(
+                modifier = Modifier
+                    .size(7.dp)
+                    .background(
+                        color = if (d < filled) Color.White
+                        else Color.White.copy(alpha = 0.25f),
+                        shape = androidx.compose.foundation.shape.CircleShape
+                    )
+            )
+        }
+    }
+}
+
 /** Video mode meta block: name + live lyric BELOW the video, never on it. */
 @Composable
 private fun VideoMeta(
     track: YtTrack,
     lyrics: LyricsState,
-    position: Long
+    position: Long,
+    durationMs: Long = 0L
 ) {
-    val line = try {
-        if (lyrics is LyricsState.Synced) {
-            val ls = lyrics.lines
-            ls.indexOfLast { it.ms <= position }
-                .takeIf { it >= 0 }?.let { ls[it].text } ?: ""
-        } else ""
-    } catch (e: Exception) {
-        ""
+    val overlay = remember(lyrics, position, durationMs) {
+        try {
+            overlayState(lyrics, position, durationMs)
+        } catch (e: Exception) {
+            OverlayState("", 0f, false)
+        }
     }
     Column(
         Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        if (line.isNotBlank()) {
-            Text(
-                line,
-                style = MaterialTheme.typography.bodyMedium.copy(
-                    fontWeight = FontWeight.SemiBold
-                ),
-                color = MaterialTheme.colorScheme.primary,
-                maxLines = 1, overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.padding(bottom = 4.dp)
-            )
+        if (overlay.line.isNotBlank()) {
+            androidx.compose.animation.AnimatedContent(
+                targetState = overlay.line,
+                transitionSpec = {
+                    (slideInVertically(tween(280)) { h -> h } + fadeIn(tween(280))) togetherWith
+                        (slideOutVertically(tween(280)) { h -> -h } + fadeOut(tween(280)))
+                },
+                label = "videoMetaRoll"
+            ) { rolled ->
+                Text(
+                    rolled,
+                    style = MaterialTheme.typography.bodyMedium.copy(
+                        fontWeight = FontWeight.SemiBold
+                    ),
+                    color = MaterialTheme.colorScheme.primary,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(bottom = 4.dp)
+                )
+            }
+        }
+        if (overlay.showDots) {
+            OverlayDots(frac = overlay.dotsFrac)
+            Spacer(Modifier.height(4.dp))
         }
         Text(
             track.title,
@@ -2712,7 +2835,8 @@ private fun FullPlayerSheet(
                         ThumbnailOverlay(
                             track = track,
                             lyrics = lyrics,
-                            position = position
+                            position = position,
+                            durationMs = duration
                         )
                     }
                 }
@@ -2723,7 +2847,8 @@ private fun FullPlayerSheet(
                     VideoMeta(
                         track = track,
                         lyrics = lyrics,
-                        position = position
+                        position = position,
+                        durationMs = duration
                     )
                 }
             }
@@ -3943,6 +4068,11 @@ private fun ProfileSheet(
     onSignOut: () -> Unit,
     onOpenDownloads: () -> Unit,
     onClearCache: () -> Unit,
+    updateTag: String? = null,
+    updateChecking: Boolean = false,
+    updateStatus: String = "",
+    onCheckUpdate: () -> Unit = {},
+    onUpdateTap: () -> Unit = {},
     onDismiss: () -> Unit
 ) {
     ModalBottomSheet(
@@ -4106,6 +4236,40 @@ private fun ProfileSheet(
                     },
                     leadingContent = {
                         Icon(Icons.Filled.Info, contentDescription = null)
+                    }
+                )
+                if (updateTag != null) {
+                    ListItem(
+                        headlineContent = { Text("Update available: $updateTag") },
+                        supportingContent = { Text("Tap to download the latest release") },
+                        leadingContent = {
+                            Icon(Icons.Filled.SystemUpdate, contentDescription = null)
+                        },
+                        modifier = Modifier.clickable { onUpdateTap() }
+                    )
+                }
+                ListItem(
+                    headlineContent = { Text("Check for updates") },
+                    supportingContent = {
+                        Text(
+                            when {
+                                updateChecking -> "Checking…"
+                                updateStatus.isNotBlank() -> updateStatus
+                                else -> "Latest check: automatic, once a day"
+                            }
+                        )
+                    },
+                    leadingContent = {
+                        if (updateChecking) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(24.dp), strokeWidth = 2.dp
+                            )
+                        } else {
+                            Icon(Icons.Filled.Refresh, contentDescription = null)
+                        }
+                    },
+                    modifier = Modifier.clickable {
+                        if (!updateChecking) onCheckUpdate()
                     }
                 )
                 if (hasCrash) {
