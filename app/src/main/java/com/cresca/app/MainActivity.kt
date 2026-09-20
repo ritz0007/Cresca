@@ -2573,6 +2573,42 @@ private fun FullPlayerSheet(
         // Shared dominant color (also drives the system bars); eased here.
         val domAnimated by animateColorAsState(
             targetValue = domColor, animationSpec = tween(800), label = "dom")
+        // The sheet lives in a dialog window with its own system bars:
+        // make them transparent + tone the icons from the artwork so the
+        // thumbnail truly owns the status bar (no black strip on top).
+        val sheetView = LocalView.current
+        DisposableEffect(sheetView, domAnimated) {
+            try {
+                val w = try {
+                    (sheetView.parent as?
+                        androidx.compose.ui.window.DialogWindowProvider)?.window
+                } catch (e: Exception) {
+                    null
+                }
+                if (w != null) {
+                    // Edge-to-edge dialog: content draws under the status
+                    // bar so the thumbnail covers it (activity flag alone
+                    // can't move dialog content).
+                    try {
+                        WindowCompat.setDecorFitsSystemWindows(w, false)
+                    } catch (e: Exception) {
+                    }
+                    w.statusBarColor = android.graphics.Color.TRANSPARENT
+                    w.navigationBarColor = android.graphics.Color.TRANSPARENT
+                    val lum = domAnimated.red * 0.2126f +
+                        domAnimated.green * 0.7152f + domAnimated.blue * 0.0722f
+                    try {
+                        WindowCompat.getInsetsController(w, sheetView).apply {
+                            isAppearanceLightStatusBars = lum > 0.45f
+                            isAppearanceLightNavigationBars = lum > 0.45f
+                        }
+                    } catch (e: Exception) {
+                    }
+                }
+            } catch (e: Exception) {
+            }
+            onDispose { }
+        }
         AppleMusicTheme(darkTheme = true) {
         Box(Modifier.fillMaxWidth()) {
             // Smooth ambience: dominant-color gradient + roaming lava blobs
