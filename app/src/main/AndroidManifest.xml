@@ -6,6 +6,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <application
         android:label="Cresca Music"
         android:icon="@mipmap/ic_launcher"
@@ -30,6 +31,23 @@
                 <action android:name="com.cresca.app.LIKE_ACTION" />
             </intent-filter>
         </receiver>
+        <receiver
+            android:name=".UpdateActionReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.cresca.app.UPDATE_DOWNLOAD" />
+                <action android:name="android.intent.action.DOWNLOAD_COMPLETE" />
+            </intent-filter>
+        </receiver>
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="com.cresca.app.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/filepaths" />
+        </provider>
         <service
             android:name=".PlaybackService"
             android:foregroundServiceType="mediaPlayback"

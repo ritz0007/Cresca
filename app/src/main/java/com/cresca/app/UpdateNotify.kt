@@ -5,16 +5,14 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.net.Uri
 import android.os.Build
 import android.util.Log
 import androidx.core.app.NotificationCompat
 
 /**
  * Update-available alerts: system notification + in-app banner data.
- * The daily GitHub check was silent (banner only, easily missed, and the
- * check needs network) — now a heads-up notification fires the moment a
- * newer release is found, tapping opens the release page.
+ * Tapping downloads the APK for this device straight away (no browser);
+ * only when no direct asset exists does it fall back to the release page.
  */
 object UpdateNotify {
     private const val TAG = "UpdateNotify"
@@ -77,22 +75,32 @@ object UpdateNotify {
                 }
             }
             channel(ctx)
+            // Tap = direct download broadcast (falls back to page inside
+            // the receiver when no APK asset matches this device).
             val open = try {
-                PendingIntent.getActivity(
-                    ctx, 0,
-                    Intent(Intent.ACTION_VIEW, Uri.parse(update.url)).apply {
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    },
+                val dl = Intent(UpdateDownload.ACTION_DOWNLOAD).apply {
+                    setPackage(ctx.packageName)
+                    putExtra("tag", update.tag)
+                    putExtra("apkUrl", update.apkUrl)
+                    putExtra("apkName", update.apkName)
+                    putExtra("page", update.url)
+                }
+                PendingIntent.getBroadcast(
+                    ctx, 0, dl,
                     PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
                 )
             } catch (e: Exception) {
                 return
             }
+            val direct = update.apkUrl.isNotBlank()
             val notif = try {
                 NotificationCompat.Builder(ctx, CHANNEL)
                     .setSmallIcon(android.R.drawable.stat_sys_download_done)
                     .setContentTitle("Cresca update available: ${update.tag}")
-                    .setContentText("Tap to download the latest release")
+                    .setContentText(
+                        if (direct) "Tap to download and install"
+                        else "Tap to open the release page"
+                    )
                     .setContentIntent(open)
                     .setAutoCancel(true)
                     .setPriority(NotificationCompat.PRIORITY_DEFAULT)

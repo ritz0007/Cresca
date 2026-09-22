@@ -4,7 +4,6 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.webkit.CookieManager
 import android.webkit.WebView
-import android.webkit.WebViewClient
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import kotlinx.coroutines.Dispatchers
@@ -107,27 +106,9 @@ object YtSessionManager {
     }
 
     fun loginWebView(ctx: Context, onDone: () -> Unit): WebView {
-        val wv = WebView(ctx)
-        try {
-            CookieManager.getInstance().setAcceptCookie(true)
-        } catch (e: Exception) {
-        }
-        wv.settings.javaScriptEnabled = true
-        wv.settings.domStorageEnabled = true
-        // Desktop UA: Google blocks logins from embedded-WebView agents.
-        try {
-            wv.settings.userAgentString =
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-        } catch (e: Exception) {
-        }
-        try {
-            CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
-        } catch (e: Exception) {
-        }
-        wv.webViewClient = WebViewClient()
-        wv.loadUrl(MUSIC_URL)
-        return wv
+        // Hardened login surface (undetectable embedded browser); the Done
+        // + capture flow in SessionSheet is unchanged.
+        return LoginWebView.create(ctx, onDone)
     }
 
     suspend fun capture(ctx: Context) {

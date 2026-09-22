@@ -20,7 +20,34 @@ object UpdateCheck {
     private const val KEY_LAST = "update_last_check"
     private const val INTERVAL_MS = 24 * 60 * 60 * 1000L
 
-    data class Update(val tag: String, val url: String)
+    data class Update(val tag: String, val url: String, val apkUrl: String = "", val apkName: String = "")
+
+    /** Device ABI slug matching release asset names (arm64/armv7/x86_64). */
+    internal fun deviceAbi(): String {
+        return try {
+            val abis = android.os.Build.SUPPORTED_ABIS ?: arrayOf()
+            when {
+                abis.contains("arm64-v8a") -> "arm64"
+                abis.contains("armeabi-v7a") -> "armv7"
+                abis.contains("x86_64") -> "x86_64"
+                else -> "universal"
+            }
+        } catch (e: Exception) {
+            "universal"
+        }
+    }
+
+    /** Pick the direct APK asset for this device (exact ABI, else universal). */
+    internal fun pickApkAsset(names: List<Pair<String, String>>): Pair<String, String>? {
+        return try {
+            if (names.isEmpty()) return null
+            val abi = deviceAbi()
+            names.firstOrNull { it.first.contains("-$abi.apk") }
+                ?: names.firstOrNull { it.first.contains("-universal.apk") }
+        } catch (e: Exception) {
+            null
+        }
+    }
 
     fun currentVersion(ctx: Context): String {
         return try {
@@ -71,7 +98,28 @@ object UpdateCheck {
                     if (tag.isBlank() || url.isBlank()) {
                         return@withContext null
                     }
-                    Update(tag, url)
+                    // Direct APK asset for this device (seamless download).
+                    var apkUrl = ""
+                    var apkName = ""
+                    try {
+                        val assets = json.optJSONArray("assets")
+                        if (assets != null) {
+                            val names = ArrayList<Pair<String, String>>()
+                            for (i in 0 until assets.length()) {
+                                val a = assets.optJSONObject(i) ?: continue
+                                val n = a.optString("name", "")
+                                val u = a.optString("browser_download_url", "")
+                                if (n.endsWith(".apk") && u.isNotBlank()) names.add(Pair(n, u))
+                            }
+                            val pick = pickApkAsset(names)
+                            if (pick != null) {
+                                apkName = pick.first
+                                apkUrl = pick.second
+                            }
+                        }
+                    } catch (e: Exception) {
+                    }
+                    Update(tag, url, apkUrl, apkName)
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "update check failed", e)

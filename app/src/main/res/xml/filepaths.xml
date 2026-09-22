@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider paths: update APKs live in public Downloads. -->
+<paths>
+    <external-path name="downloads" path="Download/" />
+</paths>

@@ -1,6 +1,14 @@
 # Changelog — Cresca Music
 
-## 1.0.0 (major)
+## 1.1.0
+- Seamless updates: notification tap / Settings downloads the APK for your
+  exact ABI straight from the release (no browser), tap-to-install on
+  completion; release page only as fallback
+- Fancy playback motion: bass-driven gentle cover breathe (on-device FFT,
+  idle fallback, no permission), spring pop + rolling title swap on every
+  song change, mini-player crossfade
+- Secure login fix: hardened WebView defeats Google's embedded-browser
+  block (device-consistent UA, no package header, synced cookie store)
 - New brand: bars-mark launcher icon, Cresca wordmark on boot splash,
   intro and profile
 - Instant playback engine: lazy `cresca://` URIs resolve on ExoPlayer's

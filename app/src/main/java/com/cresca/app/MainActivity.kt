@@ -2198,8 +2198,36 @@ fun AppleMusicAppContent(
     var update by remember { mutableStateOf<UpdateCheck.Update?>(null) }
     var updateChecking by remember { mutableStateOf(false) }
     var updateStatus by remember { mutableStateOf("") }
-    fun runUpdateCheck(manual: Boolean) {
-        if (updateChecking) return
+    // Seamless update: direct APK download for this device, installer on
+    // completion. Release page only when no matching asset exists.
+    fun downloadUpdate(u: UpdateCheck.Update?) {
+        if (u == null) return
+        if (u.apkUrl.isBlank()) {
+            try {
+                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u.url)))
+            } catch (e: Exception) {
+            }
+            return
+        }
+        updateStatus = "Downloading ${u.tag}…"
+        scope.launch(Dispatchers.IO) {
+            val ok = try {
+                UpdateDownload.startDownload(context, u)
+            } catch (e: Exception) {
+                false
+            }
+            if (!ok) {
+                withContext(Dispatchers.Main) {
+                    updateStatus = "Download failed — opening release page"
+                    try {
+                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u.url)))
+                    } catch (e: Exception) {
+                    }
+                }
+            }
+        }
+    }
+    fun runUpdateCheck(manual: Boolean) {        if (updateChecking) return
         updateChecking = true
         if (manual) updateStatus = "Checking…"
         scope.launch {
@@ -2385,15 +2413,7 @@ fun AppleMusicAppContent(
                     onToggleLike = { toggleLike(it) },
                     updateTag = update?.tag,
                     onUpdateTap = {
-                        val u = update
-                        if (u != null) {
-                            try {
-                                context.startActivity(
-                                    Intent(Intent.ACTION_VIEW, Uri.parse(u.url))
-                                )
-                            } catch (e: Exception) {
-                            }
-                        }
+                        downloadUpdate(update)
                     }
                 )
                 4 -> SearchScreen(
@@ -2643,15 +2663,7 @@ fun AppleMusicAppContent(
             updateStatus = updateStatus,
             onCheckUpdate = { runUpdateCheck(true) },
             onUpdateTap = {
-                val u = update
-                if (u != null) {
-                    try {
-                        context.startActivity(
-                            Intent(Intent.ACTION_VIEW, Uri.parse(u.url))
-                        )
-                    } catch (e: Exception) {
-                    }
-                }
+                downloadUpdate(update)
             },
             onDismiss = { showProfile = false }
         )
@@ -2772,20 +2784,39 @@ private fun androidx.compose.foundation.layout.BoxScope.ThumbnailOverlay(
             OverlayDots(frac = overlay.dotsFrac)
             Spacer(Modifier.height(4.dp))
         }
-        Text(
-            track.title,
-            style = MaterialTheme.typography.titleLarge.copy(
-                fontWeight = FontWeight.Bold
-            ),
-            color = Color.White,
-            maxLines = 2, overflow = TextOverflow.Ellipsis
-        )
-        Text(
-            track.artist,
-            style = MaterialTheme.typography.bodyMedium,
-            color = Color.White.copy(alpha = 0.75f),
-            maxLines = 1, overflow = TextOverflow.Ellipsis
-        )
+        // Song swap choreography: title + artist roll with the same
+        // slide+fade language as the lyric ticker.
+        androidx.compose.animation.AnimatedContent(
+            targetState = track.id,
+            transitionSpec = {
+                (androidx.compose.animation.slideInVertically(
+                    androidx.compose.animation.core.tween(320)) { h -> h } +
+                    androidx.compose.animation.fadeIn(
+                        androidx.compose.animation.core.tween(320))) togetherWith
+                    (androidx.compose.animation.slideOutVertically(
+                        androidx.compose.animation.core.tween(320)) { h -> -h } +
+                        androidx.compose.animation.fadeOut(
+                            androidx.compose.animation.core.tween(320)))
+            },
+            label = "songSwap"
+        ) {
+            Column(horizontalAlignment = Alignment.Start) {
+                Text(
+                    track.title,
+                    style = MaterialTheme.typography.titleLarge.copy(
+                        fontWeight = FontWeight.Bold
+                    ),
+                    color = Color.White,
+                    maxLines = 2, overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    track.artist,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color.White.copy(alpha = 0.75f),
+                    maxLines = 1, overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
     }
 }
 
@@ -2824,8 +2855,7 @@ private fun overlayState(
     }
 }
 
-/** Compact dots for the thumbnail overlay (mirrors the karaoke row). */
-@Composable
+/** Compact dots for the thumbnail overlay (mirrors the karaoke row). */@Composable
 private fun OverlayDots(frac: Float) {
     Row(
         horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.Start),
@@ -3056,6 +3086,24 @@ private fun FullPlayerSheet(
                         }
                     }
                     Box(Modifier.fillMaxWidth()) {
+                        // Beat-sync + song-change choreography: the cover
+                        // breathes with the bass (Visualizer FFT, idle sine
+                        // fallback) and pops in on every track change.
+                        val sessionId = try {
+                            (player as? androidx.media3.exoplayer.ExoPlayer)?.audioSessionId ?: 0
+                        } catch (e: Exception) {
+                            0
+                        }
+                        val beat = rememberBeatLevel(sessionId, isPlaying)
+                        var artPop by remember(track.id) { mutableFloatStateOf(0.93f) }
+                        LaunchedEffect(track.id) { artPop = 1f }
+                        val popAnim by animateFloatAsState(
+                            targetValue = artPop,
+                            animationSpec = spring(dampingRatio = 0.7f, stiffness = 320f),
+                            label = "artPop"
+                        )
+                        // Whisper-gentle: ~1% breathe on the bass pulse.
+                        val beatScale = (popAnim * (1f + 0.012f * beat)).coerceIn(0.9f, 1.04f)
                         // Slightly transparent: roaming lava/bokeh breathe
                         // through the art a little.
                         AsyncImage(
@@ -3066,7 +3114,8 @@ private fun FullPlayerSheet(
                             contentDescription = null,
                             contentScale = ContentScale.Crop,
                             onError = { hdOk = false },
-                            modifier = Modifier.fillMaxWidth().aspectRatio(1f),
+                            modifier = Modifier.fillMaxWidth().aspectRatio(1f)
+                                .graphicsLayer(scaleX = beatScale, scaleY = beatScale),
                             alpha = 0.86f
                         )
                         // Heavy dream veil: blurred-vision frost, no shapes.
@@ -3887,9 +3936,23 @@ private fun FancyBar(
             ) {
                 TrackArt(track.thumbUrl, track.id.hashCode(), 54.dp, 16.dp)
                 Spacer(Modifier.width(12.dp))
-                Column(Modifier.weight(1f)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(track.title,
+                // Song swap: title/artist crossfade+rise on every change.
+                androidx.compose.animation.AnimatedContent(
+                    targetState = track.id,
+                    transitionSpec = {
+                        (androidx.compose.animation.fadeIn(
+                            androidx.compose.animation.core.tween(280)) +
+                            androidx.compose.animation.slideInVertically(
+                                androidx.compose.animation.core.tween(280)) { h -> h / 2 }) togetherWith
+                            androidx.compose.animation.fadeOut(
+                                androidx.compose.animation.core.tween(200))
+                    },
+                    label = "miniSwap",
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Column {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(track.title,
                             style = MaterialTheme.typography.bodyMedium.copy(
                                 fontWeight = FontWeight.SemiBold),
                             maxLines = 1, overflow = TextOverflow.Ellipsis,
@@ -3910,6 +3973,7 @@ private fun FancyBar(
                         else MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1, overflow = TextOverflow.Ellipsis
                     )
+                    }
                 }
                 // Mini-player like shortcut (no need to open the sheet).
                 IconButton(onClick = onLike, modifier = Modifier.size(40.dp)) {
