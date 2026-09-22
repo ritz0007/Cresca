@@ -71,6 +71,52 @@ object LyricsRepository {
         return s
     }
 
+    /** Last timestamp in synced LRC (0 when unparseable). Pure, tested. */
+    internal fun lastLineMs(synced: String): Long {
+        return try {
+            var last = 0L
+            for (m in lrcLine.findAll(synced)) {
+                try {
+                    val min = m.groupValues[1].toLong()
+                    val sec = m.groupValues[2].toLong()
+                    var frac = m.groupValues[3]
+                    val ms = when (frac.length) {
+                        2 -> frac.toLong() * 10
+                        3 -> frac.toLong()
+                        else -> {
+                            frac = (frac + "000").take(3)
+                            frac.toLong()
+                        }
+                    }
+                    last = maxOf(last, (min * 60 + sec) * 1000 + ms)
+                } catch (e: Exception) {
+                }
+            }
+            last
+        } catch (e: Exception) {
+            0L
+        }
+    }
+
+    /**
+     * Timestamp-consistency penalty: lines must live inside the record's own
+     * duration. Kills mistimed records (e.g. full-length timestamps attached
+     * to a 3:00 sped-up upload) that text scoring alone cannot catch.
+     */
+    internal fun consistencyPenalty(lastMs: Long, durSec: Double): Int {
+        return try {
+            if (lastMs <= 0L || durSec.isNaN() || durSec <= 0) return 0
+            val durMs = (durSec * 1000).toLong()
+            when {
+                lastMs > durMs + 15000 -> -8
+                lastMs < (durMs * 0.6).toLong() -> -4
+                else -> 0
+            }
+        } catch (e: Exception) {
+            0
+        }
+    }
+
     private fun get(url: String): String? {
         return try {
             val req = Request.Builder().url(url)
@@ -157,13 +203,24 @@ object LyricsRepository {
                     }
                 }
                 // Duration proximity: official audio vs lyric video/covers.
+                // Bands are tight on purpose: a 30s-longer music video with
+                // audio-timed lines desyncs visibly ("lyrics run faster").
                 if (durationMs > 0 && !durSec.isNaN() && durSec > 0) {
                     val diff = kotlin.math.abs(durSec * 1000 - durationMs)
                     when {
                         diff <= 10000 -> score += 4
                         diff <= 25000 -> score += 1
                         diff > 60000 -> score -= 6
-                        else -> score -= 2
+                        else -> score -= 4
+                    }
+                }
+                // Timestamp consistency: the record's own lines must fit its
+                // own duration (catches full-length lines on sped-up uploads
+                // that text scoring cannot see).
+                if (synced.isNotBlank() && !durSec.isNaN() && durSec > 0) {
+                    try {
+                        score += consistencyPenalty(lastLineMs(synced), durSec)
+                    } catch (e: Exception) {
                     }
                 }
                 if (score > bestScore) {
@@ -212,10 +269,20 @@ object LyricsRepository {
             }
             val durSec = o.optDouble("duration", Double.NaN)
             if (durationMs > 0 && !durSec.isNaN() && durSec > 0 &&
-                kotlin.math.abs(durSec * 1000 - durationMs) > 45000
+                kotlin.math.abs(durSec * 1000 - durationMs) > 30000
             ) {
                 Log.i(TAG, "lyrics exact rejected on duration")
                 return null
+            }
+            // Same mistimed-record guard as fuzzy search.
+            if (synced.isNotBlank() && !durSec.isNaN() && durSec > 0) {
+                try {
+                    if (consistencyPenalty(lastLineMs(synced), durSec) < 0) {
+                        Log.i(TAG, "lyrics exact rejected on consistency")
+                        return null
+                    }
+                } catch (e: Exception) {
+                }
             }
             if (synced.isNotBlank()) {
                 val lines = parseLrc(synced)

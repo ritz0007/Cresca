@@ -2,10 +2,14 @@ package com.cresca.app
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
@@ -34,6 +38,36 @@ data class YtTrack(
     val watchUrl: String,
     val localPath: String = ""
 )
+
+/**
+ * Songs + music videos ONLY. Drops podcast/TV episodes, trailers, Shorts
+ * and other non-music clutter by title/artist shape. Shared by the NewPipe
+ * mappers here and the InnerTube parsers (same module, internal).
+ */
+internal fun isMusicJunk(title: String, artist: String): Boolean {
+    return try {
+        val t = title.lowercase()
+        val a = artist.lowercase().trim()
+        // Episode-shaped titles: "Mohini Episode 12", "Ep. 5", "S01E03".
+        if (Regex("""\b(ep|episode|eps)\b[\s._:#-]{0,4}\d+""").containsMatchIn(t)) return true
+        if (Regex("""\bs\d{1,2}\s?e\d{1,3}\b""").containsMatchIn(t)) return true
+        // Non-music first segments: podcast/trailer/teaser/episode uploads.
+        if (a in setOf("episode", "episodes", "podcast", "podcasts", "trailer", "trailers", "teaser", "shorts")) return true
+        if (t.contains("full episode") || t.contains("episode recap")) return true
+        false
+    } catch (e: Exception) {
+        false
+    }
+}
+
+/** True for YouTube Shorts URLs (never songs-in-queue material). */
+internal fun isShortsUrl(url: String): Boolean {
+    return try {
+        url.contains("/shorts/")
+    } catch (e: Exception) {
+        false
+    }
+}
 
 /** OkHttp-backed downloader so NewPipeExtractor can fetch YouTube pages. */
 private class OkHttpDownloader(private val client: OkHttpClient) : Downloader() {
@@ -70,26 +104,162 @@ private class OkHttpDownloader(private val client: OkHttpClient) : Downloader() 
 
 object YoutubeRepository {
     private const val TAG = "YoutubeRepo"
-    // Generous timeouts: search does several round trips; slow networks
-    // must not surface as crashes or instant failures.
+    // Tuned for instant fetches: short fail-fast timeouts (slow networks
+    // retry quickly instead of hanging 25s), shared pool + higher per-host
+    // concurrency so parallel rails don't queue behind each other.
+    // HTTP/2 + keep-alive reuses TLS sessions across search/player calls.
+    private val dispatcher = okhttp3.Dispatcher().apply {
+        maxRequests = 64
+        maxRequestsPerHost = 16
+    }
+    private val pool = okhttp3.ConnectionPool(12, 5, java.util.concurrent.TimeUnit.MINUTES)
     private val http = okhttp3.OkHttpClient.Builder()
-        .connectTimeout(25, java.util.concurrent.TimeUnit.SECONDS)
-        .readTimeout(25, java.util.concurrent.TimeUnit.SECONDS)
-        .writeTimeout(25, java.util.concurrent.TimeUnit.SECONDS)
+        .dispatcher(dispatcher)
+        .connectionPool(pool)
+        .protocols(listOf(okhttp3.Protocol.HTTP_2, okhttp3.Protocol.HTTP_1_1))
+        .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(12, java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(12, java.util.concurrent.TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .build()
+
+    /** Elapsed-ms helper for fetch timing logs (Phase 0 baseline). */
+    private inline fun <T> timed(tag: String, block: () -> T): T {
+        val t0 = android.os.SystemClock.elapsedRealtime()
+        try {
+            return block()
+        } finally {
+            try {
+                Log.d(TAG, "$tag ${android.os.SystemClock.elapsedRealtime() - t0}ms")
+            } catch (e: Exception) {
+            }
+        }
+    }
 
     @Volatile private var ready = false
     @Volatile private var appContext: Context? = null
 
+    /**
+     * InnerTube fast path (default ON; Stable available in Profile).
+     * true → try on-device youtubei/v1 first, fall back to NewPipeExtractor
+     * on empty/failure. Every fast call logs `via InnerTube` with ms so
+     * field timings prove the win; fallback logs the reason.
+     */
+    @Volatile var useInnerTube: Boolean = true
+
     // Resolved stream URLs, good for hours. Hits make replays instant.
+    // Memory (5h) fronted by a disk snapshot (6h): process restarts and
+    // song picks from search/charts resolve without any network when fresh.
     private const val URL_TTL_MS = 5 * 60 * 60 * 1000L
+    private const val URL_DISK_TTL_MS = 6 * 60 * 60 * 1000L
+    private const val URL_DISK_FILE = "yt_urls.json"
     private val urlCache = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Long>>()
     private val videoOptsCache =
         java.util.concurrent.ConcurrentHashMap<String, Pair<List<VideoOption>, Long>>()
+    private val urlDiskScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    @Volatile private var lastUrlDiskSave = 0L
+
+    private fun rememberUrl(watchUrl: String, url: String) {
+        try {
+            urlCache[watchUrl] = Pair(url, System.currentTimeMillis())
+        } catch (e: Exception) {
+        }
+        // Throttled disk snapshot (≤1 write/30s) so hot paths stay cheap.
+        try {
+            val now = System.currentTimeMillis()
+            if (now - lastUrlDiskSave < 30_000L) return
+            lastUrlDiskSave = now
+            val ctx = appContext ?: return
+            val snap = try {
+                HashMap(urlCache)
+            } catch (e: Exception) {
+                return
+            }
+            urlDiskScope.launch {
+                try {
+                    val root = org.json.JSONObject()
+                    root.put("savedAt", now)
+                    val items = org.json.JSONObject()
+                    for ((k, v) in snap) {
+                        try {
+                            // Skip already-stale rows at write time.
+                            if (now - v.second > URL_DISK_TTL_MS) continue
+                            items.put(k, org.json.JSONObject().put("u", v.first).put("t", v.second))
+                        } catch (e: Exception) {
+                        }
+                    }
+                    root.put("items", items)
+                    java.io.File(ctx.cacheDir, URL_DISK_FILE).writeText(root.toString())
+                } catch (e: Exception) {
+                }
+            }
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun loadUrlDisk() {
+        val ctx = appContext ?: return
+        try {
+            val f = java.io.File(ctx.cacheDir, URL_DISK_FILE)
+            if (!f.exists()) return
+            val root = org.json.JSONObject(f.readText())
+            val items = root.optJSONObject("items") ?: return
+            val now = System.currentTimeMillis()
+            var n = 0
+            val keys = items.keys()
+            while (keys.hasNext()) {
+                try {
+                    val k = keys.next()
+                    val o = items.optJSONObject(k) ?: continue
+                    val t = o.optLong("t", 0L)
+                    if (now - t > URL_DISK_TTL_MS) continue
+                    val u = o.optString("u", "")
+                    if (u.isBlank()) continue
+                    urlCache.putIfAbsent(k, Pair(u, t))
+                    n++
+                } catch (e: Exception) {
+                }
+            }
+            Log.d(TAG, "urlCache disk restored $n rows")
+        } catch (e: Exception) {
+        }
+    }
+
+    /** Best-effort TLS/DNS warmup so the first tap reuses a live connection. */
+    private fun prewarmConnection() {
+        try {
+            val req = okhttp3.Request.Builder()
+                .url("https://music.youtube.com/")
+                .header("User-Agent", "Cresca/1.0 (Android)")
+                .get()
+                .build()
+            http.newCall(req).enqueue(object : okhttp3.Callback {
+                override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
+                override fun onResponse(call: okhttp3.Call, resp: okhttp3.Response) {
+                    try {
+                        resp.close()
+                    } catch (e: Exception) {
+                    }
+                }
+            })
+        } catch (e: Exception) {
+        }
+    }
 
     fun initAppContext(ctx: Context) {
         appContext = ctx.applicationContext
+        // Disk urlCache (cold starts aren't cold) + connection pre-warm
+        // (first tap skips DNS/TLS handshake). Fire-and-forget, never throws.
+        urlDiskScope.launch {
+            try {
+                loadUrlDisk()
+            } catch (e: Exception) {
+            }
+            try {
+                prewarmConnection()
+            } catch (e: Exception) {
+            }
+        }
     }
 
     internal fun sessionCookies(): String {
@@ -100,6 +270,103 @@ object YoutubeRepository {
             ""
         }
     }
+
+    private fun sessionVisitor(): String {
+        val c = appContext ?: return ""
+        return try {
+            YtSessionManager.loadVisitorData(c)
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    private fun sessionPoToken(): String {
+        val c = appContext ?: return ""
+        return try {
+            YtSessionManager.loadPoToken(c)
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    private fun innerTubeAllowed(): Boolean {
+        if (!useInnerTube) return false
+        val c = appContext ?: return true
+        return try {
+            YtSessionManager.canFetchInnerTube(c)
+        } catch (e: Exception) {
+            true
+        }
+    }
+
+    /** As-you-type suggestions (fast path only; empty in stable mode). */
+    suspend fun suggestions(input: String): List<String> =
+        withContext(Dispatchers.IO) {
+            if (!innerTubeAllowed()) return@withContext emptyList()
+            if (input.trim().length < 2) return@withContext emptyList()
+            try {
+                com.cresca.app.innertube.InnerTubeApi.suggestions(
+                    input, sessionCookies(), sessionVisitor()
+                )
+            } catch (e: Exception) {
+                emptyList()
+            }
+        }
+
+    /**
+     * Logged-in library pull (YT liked songs + history) for taste seeds.
+     * Authed browse (cookies + SAPISIDHASH ride along); empty when logged
+     * out or on any failure. Caller persists + feeds recommendation seeds —
+     * never merges into local liked/recent.
+     */
+    suspend fun ytLibrary(max: Int = 50): Pair<List<YtTrack>, List<YtTrack>> =
+        withContext(Dispatchers.IO) {
+            val c = appContext ?: return@withContext Pair(emptyList(), emptyList())
+            val cookies = try {
+                YtSessionManager.loadCookies(c)
+            } catch (e: Exception) {
+                ""
+            }
+            if (!YtSessionManager.isLoggedIn(c)) return@withContext Pair(emptyList(), emptyList())
+            val visitor = sessionVisitor()
+            val po = sessionPoToken()
+            val liked = try {
+                com.cresca.app.innertube.InnerTubeApi.browseShelves(
+                    "FEmusic_liked", cookies, visitor, po, maxShelves = 4, perShelf = 25
+                ).values.flatten().distinctBy { it.id }.take(max)
+            } catch (e: Exception) {
+                Log.d(TAG, "yt liked pull failed: ${e.message}")
+                emptyList()
+            }
+            val history = try {
+                com.cresca.app.innertube.InnerTubeApi.browseShelves(
+                    "FEmusic_history", cookies, visitor, po, maxShelves = 4, perShelf = 25
+                ).values.flatten().distinctBy { it.id }.take(max)
+            } catch (e: Exception) {
+                Log.d(TAG, "yt history pull failed: ${e.message}")
+                emptyList()
+            }
+            Log.i(TAG, "yt library: ${liked.size} liked, ${history.size} history")
+            Pair(liked, history)
+        }
+
+    /**
+     * One-call home shelves (FEmusic_home). Returns shelf title → tracks,
+     * empty on failure (caller keeps existing rails logic as fallback).
+     */
+    suspend fun homeShelves(maxShelves: Int = 8, perShelf: Int = 12): Map<String, List<YtTrack>> =
+        withContext(Dispatchers.IO) {
+            if (!innerTubeAllowed()) return@withContext emptyMap()
+            try {
+                com.cresca.app.innertube.InnerTubeApi.browseShelves(
+                    "FEmusic_home", sessionCookies(), sessionVisitor(), sessionPoToken(),
+                    maxShelves = maxShelves, perShelf = perShelf
+                )
+            } catch (e: Exception) {
+                Log.d(TAG, "homeShelves failed: ${e.message}")
+                emptyMap()
+            }
+        }
 
     @Synchronized
     fun ensureInit() {
@@ -117,23 +384,50 @@ object YoutubeRepository {
      */
     suspend fun searchSongs(query: String, max: Int = 15): List<YtTrack> =
         withContext(Dispatchers.IO) {
+            val t0 = android.os.SystemClock.elapsedRealtime()
+            // Fast path: youtubei/v1 search (WEB_REMIX), fallback to scrape.
+            if (innerTubeAllowed()) {
+                try {
+                    val fast = com.cresca.app.innertube.InnerTubeApi.searchMusic(
+                        query, max + 10, sessionCookies(), sessionVisitor(), sessionPoToken()
+                    )
+                    if (fast.isNotEmpty()) {
+                        return@withContext fast.distinctBy { it.id }.take(max)
+                            .also {
+                                try {
+                                    Log.d(TAG, "searchSongs '$query' ${it.size} hits ${android.os.SystemClock.elapsedRealtime() - t0}ms via InnerTube")
+                                } catch (e: Exception) {
+                                }
+                            }
+                    }
+                    Log.d(TAG, "searchSongs InnerTube empty, falling back to NewPipe")
+                } catch (e: Exception) {
+                    Log.d(TAG, "searchSongs InnerTube failed, fallback: ${e.message}")
+                }
+            }
             ensureInit()
             val qh = YouTube.searchQHFactory.fromQuery(query)
             val items = SearchInfo.getInfo(YouTube, qh).relatedItems
             items.filterIsInstance<StreamInfoItem>()
+                // Songs only, strict: known duration 30s-10min. Unknown-length
+                // uploads are compilations/lives/episodes far more often than
+                // songs, and they were the "Mohini episodes" leak.
                 .filter { item ->
                     val d = try { item.duration } catch (e: Exception) { 0L }
-                    d <= 0L || d <= 600L
+                    d in 30L..600L
                 }
                 .take(max + 10).mapNotNull { item ->
                     try {
+                        if (isShortsUrl(item.url)) return@mapNotNull null
                         val id = Regex("[?&]v=([A-Za-z0-9_-]{11})")
                             .find(item.url)?.groupValues?.get(1) ?: return@mapNotNull null
                         val thumb = item.thumbnails.maxByOrNull { it.height }?.url ?: ""
+                        val artist = item.uploaderName ?: "YouTube"
+                        if (isMusicJunk(item.name, artist)) return@mapNotNull null
                         YtTrack(
                             id = id,
                             title = item.name,
-                            artist = item.uploaderName ?: "YouTube",
+                            artist = artist,
                             thumbUrl = thumb,
                             watchUrl = item.url
                         )
@@ -145,6 +439,12 @@ object YoutubeRepository {
                 // Duplicate ids crash keyed lazy lists: drop them here.
                 .distinctBy { it.id }
                 .take(max)
+                .also {
+                    try {
+                        Log.d(TAG, "searchSongs '$query' ${it.size} hits ${android.os.SystemClock.elapsedRealtime() - t0}ms")
+                    } catch (e: Exception) {
+                    }
+                }
         }
 
     /** Real YouTube search. Throws on network/parse failure (caller falls back to demo). */
@@ -156,17 +456,31 @@ object YoutubeRepository {
     /** One search hit -> track, or null. Shared by every discovery source. */
     private fun toTrack(item: StreamInfoItem): YtTrack? {
         return try {
+            // Shorts + episodes/trailer junk never enter any list.
+            try {
+                if (isShortsUrl(item.url)) return null
+            } catch (e: Exception) {
+            }
+            // Lives/upcoming/episode streams are never songs.
+            try {
+                if (item.streamType == org.schabi.newpipe.extractor.stream.StreamType.LIVE_STREAM) return null
+            } catch (e: Exception) {
+            }
             val d = try {
                 item.duration
             } catch (e: Exception) {
                 0L
             }
-            // Songs only: keep unknown-length and <= 10 min.
-            if (d > 600L) return null
+            // Songs only, strict: known duration 30s-10min. Unknown-length
+            // uploads are compilations/lives/episodes far more often than
+            // songs (the "Mohini episodes" leak).
+            if (d !in 30L..600L) return null
             val id = Regex("[?&]v=([A-Za-z0-9_-]{11})")
                 .find(item.url)?.groupValues?.get(1) ?: return null
             val thumb = try {
-                item.thumbnails.maxByOrNull { it.height }?.url ?: ""
+                val raw = item.thumbnails.maxByOrNull { it.height }?.url ?: ""
+                // YTM serves =w120 thumbs: upscale at parse so cards are sharp.
+                com.cresca.app.innertube.InnerTubeApi.sharpThumb(raw)
             } catch (e: Exception) {
                 ""
             }
@@ -175,6 +489,7 @@ object YoutubeRepository {
             } catch (e: Exception) {
                 "YouTube"
             }
+            if (isMusicJunk(item.name, artist)) return null
             YtTrack(
                 id = id,
                 title = item.name,
@@ -194,6 +509,26 @@ object YoutubeRepository {
      */
     suspend fun searchMusic(query: String, max: Int = 15): List<YtTrack> =
         withContext(Dispatchers.IO) {
+            val t0 = android.os.SystemClock.elapsedRealtime()
+            if (innerTubeAllowed()) {
+                try {
+                    val fast = com.cresca.app.innertube.InnerTubeApi.searchMusic(
+                        query, max, sessionCookies(), sessionVisitor(), sessionPoToken()
+                    )
+                    if (fast.isNotEmpty()) {
+                        return@withContext fast.distinctBy { it.id }.take(max)
+                            .also {
+                                try {
+                                    Log.d(TAG, "searchMusic '$query' ${it.size} hits ${android.os.SystemClock.elapsedRealtime() - t0}ms via InnerTube")
+                                } catch (e: Exception) {
+                                }
+                            }
+                    }
+                    Log.d(TAG, "searchMusic InnerTube empty, falling back to NewPipe")
+                } catch (e: Exception) {
+                    Log.d(TAG, "searchMusic InnerTube failed, fallback: ${e.message}")
+                }
+            }
             ensureInit()
             val qh = YouTube.searchQHFactory.fromQuery(
                 query, listOf("music_songs"), ""
@@ -203,11 +538,33 @@ object YoutubeRepository {
                 .mapNotNull { toTrack(it) }
                 .distinctBy { it.id }
                 .take(max)
+                .also {
+                    try {
+                        Log.d(TAG, "searchMusic '$query' ${it.size} hits ${android.os.SystemClock.elapsedRealtime() - t0}ms")
+                    } catch (e: Exception) {
+                    }
+                }
         }
 
-    /** YouTube Charts trending music (charts.youtube.com Right Now). */
+    /** YouTube Charts trending music. Fast path: browse FEmusic_charts shelves. */
     suspend fun trendingMusic(max: Int = 15): List<YtTrack> =
         withContext(Dispatchers.IO) {
+            if (innerTubeAllowed()) {
+                try {
+                    val shelves = com.cresca.app.innertube.InnerTubeApi.browseShelves(
+                        "FEmusic_charts", sessionCookies(), sessionVisitor(), sessionPoToken(),
+                        maxShelves = 3, perShelf = max
+                    )
+                    val flat = shelves.values.flatten().distinctBy { it.id }.take(max)
+                    if (flat.isNotEmpty()) {
+                        Log.d(TAG, "trending ${flat.size} via InnerTube charts")
+                        return@withContext flat
+                    }
+                    Log.d(TAG, "trending InnerTube empty, falling back to kiosk")
+                } catch (e: Exception) {
+                    Log.d(TAG, "trending InnerTube failed, fallback: ${e.message}")
+                }
+            }
             ensureInit()
             try {
                 val extractor = YouTube.getKioskList().getExtractorById("trending_music", null)
@@ -295,15 +652,55 @@ object YoutubeRepository {
             }
         }
 
-    /** "Because you listened" mix: streams related to a watched track. */
+    /**
+     * Curated playlist rail (e.g. the user's Released playlist): one
+     * PlaylistInfo fetch, same song gates as everything else (duration,
+     * junk, distinct). Empty on failure (caller keeps old rail).
+     */
+    suspend fun playlistTracks(playlistId: String, max: Int = 25): List<YtTrack> =
+        withContext(Dispatchers.IO) {
+            val t0 = android.os.SystemClock.elapsedRealtime()
+            ensureInit()
+            try {
+                val info = org.schabi.newpipe.extractor.playlist.PlaylistInfo.getInfo(
+                    YouTube, "https://www.youtube.com/playlist?list=$playlistId"
+                )
+                info.relatedItems.filterIsInstance<StreamInfoItem>()
+                    .mapNotNull { toTrack(it) }
+                    .distinctBy { it.id }
+                    .take(max)
+                    .also {
+                        try {
+                            Log.d(TAG, "playlist $playlistId ${it.size} tracks ${android.os.SystemClock.elapsedRealtime() - t0}ms")
+                        } catch (e: Exception) {
+                        }
+                    }
+            } catch (e: Exception) {
+                Log.w(TAG, "playlist failed ($playlistId)", e)
+                emptyList()
+            }
+        }
+
+    /** "Because you listened" mix: fast path via next endpoint, fallback to extractor. */
     suspend fun relatedTracks(watchUrl: String, max: Int = 12): List<YtTrack> =
         withContext(Dispatchers.IO) {
+            val id = Regex("[?&]v=([A-Za-z0-9_-]{11})")
+                .find(watchUrl)?.groupValues?.get(1) ?: return@withContext emptyList()
+            if (innerTubeAllowed()) {
+                try {
+                    val fast = com.cresca.app.innertube.InnerTubeApi.related(
+                        id, max, sessionCookies(), sessionVisitor(), sessionPoToken()
+                    )
+                    if (fast.isNotEmpty()) return@withContext fast
+                    Log.d(TAG, "related InnerTube empty for $id, falling back")
+                } catch (e: Exception) {
+                    Log.d(TAG, "related InnerTube failed, fallback: ${e.message}")
+                }
+            }
             ensureInit()
             try {
                 // Related extraction is reliable on www URLs; music URLs
-                // carry the same video id.
-                val id = Regex("[?&]v=([A-Za-z0-9_-]{11})")
-                    .find(watchUrl)?.groupValues?.get(1) ?: return@withContext emptyList()
+                // carry the same video id (reuses `id` above).
                 val se = YouTube.getStreamExtractor("https://www.youtube.com/watch?v=$id")
                 se.fetchPage()
                 val out = (se.relatedStreams?.items ?: emptyList())
@@ -320,83 +717,73 @@ object YoutubeRepository {
         }
 
     /**
-     * Vibe-based autoplay (YT Music style): YouTube's related graph is the
-     * vibe signal (co-listened tracks, same mood/tempo — NOT same singer).
-     * Same-artist search is only a last-resort filler, down-ranked, so the
-     * queue matches the song's vibe instead of looping one singer.
+     * BitChord-style autoplay: the related graph (RDAMVM/co-listen) IS the
+     * queue. Hard rules that killed the "Mohini episodes" bug:
+     *  - same-NAME tracks dropped outright (title-matching is never vibe)
+     *  - max 2 tracks per artist (no singer loops, seed artist included)
+     *  - no title-word vibe searches (they re-imported the junk)
+     * One artist-radio filler only when the graph is thin.
      */
     suspend fun autoplayFor(t: YtTrack, max: Int = 20): List<YtTrack> =
         withContext(Dispatchers.IO) {
             ensureInit()
             val rel = try {
-                relatedTracks(t.watchUrl, max)
+                relatedTracks(t.watchUrl, max + 10)
             } catch (e: Exception) {
                 emptyList()
             }
-            // Related IS the vibe (YT Music mixes the same way). Enough? Done.
-            if (rel.size >= max / 2) {
-                return@withContext rel.filter { it.id != t.id }.take(max)
+            // Hard pass: seed itself + same-name echoes are never queue.
+            val clean = ArrayList<YtTrack>()
+            val artistCount = HashMap<String, Int>()
+            for (c in rel) {
+                if (c.id == t.id || isSameName(c, t)) continue
+                val key = c.artist.lowercase()
+                val n = (artistCount[key] ?: 0) + 1
+                if (n > 2) continue
+                artistCount[key] = n
+                clean.add(c)
+                if (clean.size >= max) break
             }
-            // Thin related: vibe-search by song keywords (mood/title words),
-            // NOT artist name — artist-only is what caused same-singer loops.
-            // Same-NAME hits from search are dropped outright (a "Diamond"
-            // search must not queue every song called Diamond — that's
-            // title-matching, not vibe). Related-graph hits are untouched.
-            val vibeQs = try {
-                vibeQueries(t)
+                if (clean.size >= max / 2) {
+                    return@withContext clean.take(max)
+                        .also { Log.i(TAG, "autoplay ${it.size} related (clean)") }
+                }
+            // Thin graph: ONE artist-radio filler, same hard rules.
+            try {
+                val low = t.artist.lowercase()
+                val labelish = low.isBlank() || low == "youtube" ||
+                    low == "song" || low == "songs" ||
+                    low == "episode" || low == "episodes" || low == "podcast" ||
+                    low.contains("music") || low.contains("official") ||
+                    low.contains("films") || low.contains("records")
+                if (!labelish) {
+                    val extra = searchMusic("${t.artist} songs", 10)
+                    for (h in extra) {
+                        if (clean.size >= max) break
+                        if (h.id == t.id || isSameName(h, t)) continue
+                        if (clean.any { it.id == h.id }) continue
+                        val key = h.artist.lowercase()
+                        val n = (artistCount[key] ?: 0) + 1
+                        if (n > 2) continue
+                        artistCount[key] = n
+                        clean.add(h)
+                    }
+                }
             } catch (e: Exception) {
-                emptyList()
             }
-            val pool = ArrayList<YtTrack>(rel)
+            // Order: related-graph first, mood overlap next, clumps sunk.
             val relIds = try {
                 rel.map { it.id }.toSet()
             } catch (e: Exception) {
                 emptySet()
             }
-            for (q in vibeQs.take(3)) {
-                try {
-                    val hits = searchMusic(q, 12)
-                    for (h in hits) {
-                        if (pool.none { it.id == h.id } && h.id != t.id &&
-                            !isSameName(h, t)
-                        ) pool.add(h)
-                        if (pool.size >= max + 10) break
-                    }
-                } catch (e: Exception) {
-                }
-                if (pool.size >= max + 10) break
-            }
-            // Last resort: a LITTLE same-artist filler (max 25%), clearly last.
-            try {
-                if (pool.size < max) {
-                    val low = t.artist.lowercase()
-                    val labelish = low.isBlank() || low == "youtube" ||
-                        low.contains("music") || low.contains("official") ||
-                        low.contains("films") || low.contains("records")
-                    if (!labelish) {
-                        val extra = searchMusic("${t.artist} songs", 8)
-                        var added = 0
-                        for (h in extra) {
-                            if (pool.none { it.id == h.id } && h.id != t.id &&
-                                !isSameName(h, t) && added < max / 4
-                            ) {
-                                pool.add(h)
-                                added++
-                            }
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-            }
-            // Vibe-rank: related graph first, mood overlap next, same-name
-            // and same-artist clumps sunk, then shuffle within tiers.
             val ranked = try {
-                rankByVibe(t, pool, relIds)
+                rankByVibe(t, clean, relIds)
             } catch (e: Exception) {
-                pool
+                clean
             }
             ranked.distinctBy { it.id }.filter { it.id != t.id }.take(max)
-                .also { Log.i(TAG, "autoplay vibe ${rel.size} related + ${pool.size - rel.size} vibe") }
+                .also { Log.i(TAG, "autoplay ${rel.size} related -> ${it.size} clean") }
         }
 
     /** Vibe queries from a track: title keywords + mood words, no artist. */
@@ -661,6 +1048,30 @@ object YoutubeRepository {
     /** Ranked audio stream URLs, best first. Used for 403 fallback retries. */
     suspend fun audioUrls(watchUrl: String): List<String> =
         withContext(Dispatchers.IO) {
+            val t0 = android.os.SystemClock.elapsedRealtime()
+            // Fast path: player endpoint chain (MUSIC → VR → REMIX), then scrape.
+            if (innerTubeAllowed()) {
+                try {
+                    val vid = Regex("[?&]v=([A-Za-z0-9_-]{11})")
+                        .find(watchUrl)?.groupValues?.get(1)
+                    if (!vid.isNullOrBlank()) {
+                        val fast = com.cresca.app.innertube.InnerTubeApi.audioUrls(
+                            vid, sessionCookies(), sessionVisitor(), sessionPoToken()
+                        )
+                        if (fast.isNotEmpty()) {
+                            rememberUrl(watchUrl, fast.first())
+                            try {
+                                Log.d(TAG, "audioUrls ${fast.size} urls ${android.os.SystemClock.elapsedRealtime() - t0}ms via InnerTube")
+                            } catch (e: Exception) {
+                            }
+                            return@withContext fast
+                        }
+                        Log.d(TAG, "audioUrls InnerTube empty, falling back to NewPipe")
+                    }
+                } catch (e: Exception) {
+                    Log.d(TAG, "audioUrls InnerTube failed, fallback: ${e.message}")
+                }
+            }
             ensureInit()
             try {
                 val se = YouTube.getStreamExtractor(watchUrl)
@@ -678,10 +1089,11 @@ object YoutubeRepository {
                     .distinct()
                 val best = ranked.firstOrNull()
                 if (best != null) {
-                    try {
-                        urlCache[watchUrl] = Pair(best, System.currentTimeMillis())
-                    } catch (e: Exception) {
-                    }
+                    rememberUrl(watchUrl, best)
+                }
+                try {
+                    Log.d(TAG, "audioUrls ${ranked.size} urls ${android.os.SystemClock.elapsedRealtime() - t0}ms")
+                } catch (e: Exception) {
                 }
                 ranked
             } catch (e: Exception) {
@@ -698,22 +1110,56 @@ object YoutubeRepository {
         }
     }
 
-    /** Direct audio stream URL for Media3 ExoPlayer (handles signature decipher). */
-    suspend fun audioUrl(watchUrl: String): String? =
-        withContext(Dispatchers.IO) {
-            ensureInit()
-            // Memory cache first: stream URLs stay valid for hours.
+    /** Direct audio stream URL for Media3 ExoPlayer (handles signature decipher).
+     * Single-flight: concurrent callers for the same track share one network
+     * resolve (prime + prefetch + warm + UI used to pay 3-4x). */
+    private val audioFlight =
+        java.util.concurrent.ConcurrentHashMap<String, CompletableDeferred<String?>>()
+
+    suspend fun audioUrl(watchUrl: String): String? {
+        // Memory cache first: stream URLs stay valid for hours.
+        try {
+            val hit = urlCache[watchUrl]
+            if (hit != null && System.currentTimeMillis() - hit.second < URL_TTL_MS) {
+                return hit.first
+            } else if (hit != null) {
+                urlCache.remove(watchUrl)
+            }
+        } catch (e: Exception) {
+        }
+        // Join an in-flight resolve instead of starting a duplicate.
+        val mine = CompletableDeferred<String?>()
+        val existing = audioFlight.putIfAbsent(watchUrl, mine)
+        if (existing != null) {
+            return try {
+                existing.await()
+            } catch (e: Exception) {
+                null
+            }
+        }
+        try {
+            val url = withContext(Dispatchers.IO) {
+                ensureInit()
+                audioUrls(watchUrl).firstOrNull()
+            }
             try {
-                val hit = urlCache[watchUrl]
-                if (hit != null && System.currentTimeMillis() - hit.second < URL_TTL_MS) {
-                    return@withContext hit.first
-                } else if (hit != null) {
-                    urlCache.remove(watchUrl)
-                }
+                mine.complete(url)
             } catch (e: Exception) {
             }
-            audioUrls(watchUrl).firstOrNull()
+            return url
+        } catch (e: Exception) {
+            try {
+                mine.complete(null)
+            } catch (e2: Exception) {
+            }
+            return null
+        } finally {
+            try {
+                audioFlight.remove(watchUrl, mine)
+            } catch (e: Exception) {
+            }
         }
+    }
 
     /** Direct muxed (video+audio) progressive stream URL for Media3 ExoPlayer, capped at 720p. */
     suspend fun videoUrl(watchUrl: String): String? =

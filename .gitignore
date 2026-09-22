@@ -18,3 +18,10 @@ Thumbs.db
 
 # Release APKs live on GitHub Releases, not in git
 *.apk
+
+# AI context files stay local, never pushed
+AGENTS.md
+AGENTS_readable.md
+AGENTS_utf8.md
+filelist.txt
+full_listing.txt

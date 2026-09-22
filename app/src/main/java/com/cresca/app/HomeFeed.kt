@@ -22,13 +22,17 @@ data class HomeSection(
 object HomeFeed {
     const val SECTION_TTL_MS = 12 * 60 * 60 * 1000L
 
+    /** Curated playlist rails (fetched via playlist, not search). */
+    const val RELEASED_PLAYLIST_ID = "RDCLAK5uy_ksEjgm3H_7zOJ_RHzRjN1wY-_FFcs7aAU"
+    val RELEASED = HomeSection("Released", "Fresh drops", "__released__", "home_released")
+
     /** Top Picks seed pool: refresh cycles through these, so the page changes. */
     val TOP_SEEDS: List<HomeSection> = listOf(
         HomeSection("Top Picks For You", "Made for long listening", "top hindi songs", "home_top"),
         HomeSection("Top Picks For You", "Fresh rotation", "trending hindi songs", "home_top"),
         HomeSection("Top Picks For You", "Picked for you", "best of arijit singh", "home_top"),
         HomeSection("Top Picks For You", "On repeat energy", "bollywood party hits", "home_top"),
-        HomeSection("Top Picks For You", "Your mix", "hindi lofi hits", "home_top"),
+        HomeSection("Top Picks For You", "Evergreen voices", "kishore kumar evergreen hits", "home_top"),
         HomeSection("Top Picks For You", "Something new", "latest punjabi songs", "home_top"),
     )
 
@@ -38,7 +42,6 @@ object HomeFeed {
     /** Core rails after Quick Picks (fixed order, like server shelves). */
     val CORE: List<HomeSection> = listOf(
         HomeSection("Charts Right Now", "YouTube music charts", "__charts__", "home_charts"),
-        HomeSection("New Releases", "Fresh drops", "new hindi songs 2026", "home_new"),
         HomeSection("Trending Now", "What India is playing", "trending songs india 2026", "home_trending"),
         HomeSection("Punjabi Heat", "Bhangra & hip-hop", "punjabi hits 2026", "home_punjabi"),
         HomeSection("Chill & Lofi", "Slow evenings", "lofi chill hindi songs", "home_lofi"),
@@ -77,7 +80,7 @@ object HomeFeed {
     }
 
     /** "Because you liked <artist>" sections from library seeds. */
-    fun personalized(liked: List<YtTrack>, recent: List<YtTrack>, max: Int = 2): List<HomeSection> {
+    fun personalized(liked: List<YtTrack>, recent: List<YtTrack>, max: Int = 4): List<HomeSection> {
         val seeds = artistSeeds(liked + recent, max)
         return seeds.mapIndexed { i, artist ->
             HomeSection(
@@ -98,7 +101,8 @@ object HomeFeed {
         "jiosaavn", "wynk", "hungama", "shemaroo", "superhits", "radio",
         "topic", "movies", "talkies", "audio", "channel", "network",
         "entertainment", "multimedia", "creations", "junction", "jukebox",
-        "melodies", "hits", "originals", "pictures", "talkies"
+        "melodies", "hits", "originals", "pictures", "talkies",
+        "episode", "episodes", "podcast", "song", "video", "shorts"
     )
 
     fun artistSeeds(tracks: List<YtTrack>, max: Int): List<String> {
@@ -112,6 +116,7 @@ object HomeFeed {
                 if (name.length < 3 || name.length > 40) continue
                 val low = name.lowercase()
                 if (low == "youtube" || low == "unknown artist" ||
+                    low == "song" || low == "songs" ||
                     low == "various artists" || low == "various"
                 ) continue
                 if (LABEL_WORDS.any { low.contains(it) }) continue

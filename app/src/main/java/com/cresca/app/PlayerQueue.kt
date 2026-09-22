@@ -8,6 +8,9 @@ import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 
 class PlayerQueue(
@@ -67,9 +70,9 @@ class PlayerQueue(
         }
     }
 
-    // Stuck fix: every resolve gets a generation token. Rapid taps cancel
-    // the stale job so the last tap always wins (no wrong-track flips,
-    // no shared urlOptions cross-talk, no permanent `resolving` lock).
+    // Stuck fix: every tap gets a generation token. Rapid taps cancel the
+    // stale job so the last tap always wins (no wrong-track flips, no
+    // permanent `resolving` lock).
     private var generation: Long = 0L
     private var resolveJob: Job? = null
 
@@ -345,7 +348,12 @@ class PlayerQueue(
         }
     }
 
-    private fun mediaItemFor(t: YtTrack, url: String): MediaItem {
+    /**
+     * Stable lazy URI: no network here. The googlevideo URL resolves on
+     * ExoPlayer's loader thread (ResolvingDataSource), usually from
+     * single-flight + disk urlCache + videoId-keyed bytes. Skip = instant.
+     */
+    private fun mediaItemFor(t: YtTrack): MediaItem {
         val metaBuilder = MediaMetadata.Builder()
             .setTitle(t.title)
             .setArtist(t.artist)
@@ -356,8 +364,13 @@ class PlayerQueue(
         } catch (e: Exception) {
         }
         return MediaItem.Builder()
-            .setUri(url)
+            .setUri(ResolvingDataSource.uriFor(t.id))
             .setMediaId(t.id)
+            // Stable cache key: googlevideo URLs are signed (query changes
+            // per resolve), so the default full-URL key orphaned precached
+            // bytes on every re-resolve. Keyed by videoId, replays and
+            // back-skips hit disk instead of re-downloading.
+            .setCustomCacheKey("yt:" + t.id)
             .setMediaMetadata(metaBuilder.build())
             .build()
     }
@@ -365,24 +378,18 @@ class PlayerQueue(
     // Buffer upcoming tracks behind current: ExoPlayer flips gaplessly on
     // auto-advance, and manual next() is instant (even 2 rapid skips).
     // Keeps up to 2 primed ahead: [current, next, next+1].
+    // Zero network: items carry lazy cresca:// URIs (resolve happens on
+    // the loader thread, usually from cache). Pure playlist surgery.
     suspend fun primeNext() {
         if (items.isEmpty() || currentIndex == -1) return
         if (repeatModeState == Player.REPEAT_MODE_ONE) return
         try {
-            // Prime while fewer than 3 buffered (covers double-skip).
             while (player.mediaItemCount < 3) {
                 val idx = peekIndexAhead(player.mediaItemCount - 1) ?: return
                 val t = items.getOrNull(idx) ?: return
                 if (t.watchUrl.isBlank()) return
-                val url = try {
-                    YoutubeRepository.audioUrl(t.watchUrl)
-                } catch (e: Exception) {
-                    null
-                } ?: return
-                // Race guard: queue moved while resolving.
-                if (peekIndexAhead(player.mediaItemCount - 1) != idx) return
                 try {
-                    player.addMediaItem(mediaItemFor(t, url))
+                    player.addMediaItem(mediaItemFor(t))
                 } catch (e: Exception) {
                     return
                 }
@@ -412,8 +419,7 @@ class PlayerQueue(
     }
 
     // Called when the player auto-advanced onto the primed item.
-    fun confirmAdvanced() {
-        try {
+    fun confirmAdvanced() {        try {
             if (player.mediaItemCount < 2) return
             val idx = peekNextIndex() ?: return
             val got = try {
@@ -608,8 +614,8 @@ class PlayerQueue(
         order.addAll(items.indices.filter { it != cur }.shuffled())
     }
 
-    private var urlOptions: List<String> = emptyList()
-    private var urlIndex: Int = 0
+    // Retries left for the current track (403/410 recovery path).
+    private var retriesLeft: Int = 0
 
     private fun resolveAndPlay(t: YtTrack) {
         generation++
@@ -618,24 +624,20 @@ class PlayerQueue(
             resolveJob?.cancel()
         } catch (e: Exception) {
         }
+        // Instant: setMediaItem carries a lazy cresca:// URI (zero network).
+        // The googlevideo URL resolves on ExoPlayer's loader thread, usually
+        // from single-flight + disk urlCache + videoId-keyed bytes.
+        retriesLeft = 3
         resolveJob = scope.launch {
             try {
                 onResolveStart()
-                val urls = YoutubeRepository.audioUrls(t.watchUrl)
-                // Stale resolve: a newer tap already started, drop this one.
                 if (gen != generation) return@launch
-                urlOptions = urls
-                urlIndex = 0
-                val url = urls.firstOrNull()
-                if (url != null) {
-                    if (gen != generation) return@launch
-                    playUrl(t, url)
-                    scope.launch { onResolved(t) }
-                    prefetchNext()
-                } else {
-                    if (gen != generation) return@launch
+                if (t.watchUrl.isBlank()) {
                     onError("Could not resolve audio stream")
+                    return@launch
                 }
+                playUrl(t)
+                scope.launch { onResolved(t) }
             } catch (e: Exception) {
                 if (gen != generation) return@launch
                 Log.e(TAG, "resolveAndPlay failed", e)
@@ -644,21 +646,8 @@ class PlayerQueue(
         }
     }
 
-    private fun playUrl(t: YtTrack, url: String) {
-        val metaBuilder = MediaMetadata.Builder()
-            .setTitle(t.title)
-            .setArtist(t.artist)
-        try {
-            if (t.thumbUrl.isNotBlank()) {
-                metaBuilder.setArtworkUri(android.net.Uri.parse(t.thumbUrl))
-            }
-        } catch (e: Exception) {
-        }
-        val item = MediaItem.Builder()
-            .setUri(url)
-            .setMediaId(t.id)
-            .setMediaMetadata(metaBuilder.build())
-            .build()
+    private fun playUrl(t: YtTrack) {
+        val item = mediaItemFor(t)
         player.setMediaItem(item)
         player.prepare()
         if (playAllowed()) {
@@ -671,22 +660,26 @@ class PlayerQueue(
         }
     }
 
-    // 403/410 fallback: the extractor hands several hosts; try the next one.
-    // Returns false when nothing is left to try.
+    // 403/410 recovery: the loader-thread resolve hit a dead signed URL.
+    // Drop it and replay the same lazy URI for a fresh resolve (max 3).
+    // Returns false when nothing is left to try (caller auto-skips).
     fun retryWithNextUrl(): Boolean {
         val t = current ?: return false
         if (t.watchUrl.isBlank()) {
             return false
         }
-        val next = urlIndex + 1
-        if (next >= urlOptions.size) {
+        if (retriesLeft <= 0) {
             return false
         }
-urlIndex = next
-            onResolveStart()
-            try {
-                playUrl(t, urlOptions[next])
-                scope.launch { onResolved(t) }
+        retriesLeft--
+        try {
+            YoutubeRepository.dropCachedUrl(t.watchUrl)
+        } catch (e: Exception) {
+        }
+        onResolveStart()
+        try {
+            playUrl(t)
+            scope.launch { onResolved(t) }
         } catch (e: Exception) {
             Log.e(TAG, "retry play failed", e)
             return retryWithNextUrl()
@@ -703,20 +696,5 @@ urlIndex = next
         if (pos < order.lastIndex) return order[pos + 1]
         if (repeatModeState == Player.REPEAT_MODE_ALL) return order[0]
         return null
-    }
-
-    private fun prefetchNext() {
-        try {
-            val idx = peekNextIndex() ?: return
-            val t = items.getOrNull(idx) ?: return
-            if (t.watchUrl.isBlank()) return
-            scope.launch {
-                try {
-                    YoutubeRepository.audioUrl(t.watchUrl)
-                } catch (e: Exception) {
-                }
-            }
-        } catch (e: Exception) {
-        }
     }
 }

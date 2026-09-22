@@ -469,6 +469,8 @@ fun AppleMusicAppContent(
             MediaItem.Builder()
                 .setUri(url)
                 .setMediaId("v:" + t.id)
+                // Stable key: DASH manifest URLs are signed per resolve.
+                .setCustomCacheKey("ytv:" + t.id)
                 .setMediaMetadata(metaFor(t))
                 .setMimeType(androidx.media3.common.MimeTypes.APPLICATION_MPD)
                 .build()
@@ -520,10 +522,19 @@ fun AppleMusicAppContent(
     var newTracks by remember { mutableStateOf<List<YtTrack>>(emptyList()) }
     val recent = remember { mutableStateListOf<YtTrack>() }
     var liked by remember { mutableStateOf<List<YtTrack>>(emptyList()) }
-    // Likes load off the main thread (file IO must never block composition).
+    // Likes + real history load off the main thread (file IO must never
+    // block composition). Recent is the lifetime list (300, persisted).
     LaunchedEffect(Unit) {
         try {
             liked = withContext(Dispatchers.IO) { LikedStore.load(context) }
+        } catch (e: Exception) {
+        }
+        try {
+            val hist = withContext(Dispatchers.IO) { RecentStore.load(context) }
+            if (hist.isNotEmpty()) {
+                recent.clear()
+                recent.addAll(hist)
+            }
         } catch (e: Exception) {
         }
     }
@@ -534,10 +545,43 @@ fun AppleMusicAppContent(
     var lastSearchTap by remember { mutableLongStateOf(0L) }
     var loggedIn by remember { mutableStateOf(false) }
     var loginFailed by remember { mutableStateOf(false) }
+    // YT-side taste (liked + history pulled after login). Seeds for
+    // recommendations only — never merged into local liked/recent.
+    var ytSeeds by remember { mutableStateOf<List<YtTrack>>(emptyList()) }
     LaunchedEffect(Unit) {
         try {
             loggedIn = withContext(Dispatchers.IO) { YtSessionManager.isLoggedIn(context) }
         } catch (e: Exception) {
+        }
+        try {
+            val cached = withContext(Dispatchers.IO) { RecentStore.load(context, "yt_seeds.json") }
+            if (cached.isNotEmpty()) ytSeeds = cached
+        } catch (e: Exception) {
+        }
+    }
+    // After login, pull YT liked + history once for better suggestions.
+    LaunchedEffect(loggedIn) {
+        if (!loggedIn) return@LaunchedEffect
+        try {
+            val (likedYt, histYt) = withContext(Dispatchers.IO) { YoutubeRepository.ytLibrary(50) }
+            val merged = (likedYt + histYt).distinctBy { it.id }.take(100)
+            if (merged.isNotEmpty()) {
+                ytSeeds = merged
+                val snapshot = merged
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        RecentStore.save(context, snapshot, "yt_seeds.json")
+                    } catch (e: Exception) {
+                    }
+                }
+                // Fresh taste available: rebuild rails once.
+                try {
+                    homeTick++
+                } catch (e: Exception) {
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "yt library pull failed", e)
         }
     }
     var showSession by remember { mutableStateOf(false) }
@@ -545,6 +589,32 @@ fun AppleMusicAppContent(
     var showDownloads by remember { mutableStateOf(false) }
     var showProfile by remember { mutableStateOf(false) }
     var dlLoc by remember { mutableStateOf(DownloadStore.location(context)) }
+    // Playback engine: fast (on-device InnerTube, default) vs stable
+    // (NewPipe scrape fallback). Persisted; applied to YoutubeRepository
+    // on launch + toggle. Fast never strands the user: every call falls
+    // back to NewPipe on empty/failure and logs why.
+    var engineFast by remember { mutableStateOf(true) }
+    LaunchedEffect(Unit) {
+        try {
+            val v = withContext(Dispatchers.IO) {
+                try {
+                    val prefs = context.getSharedPreferences("cresca_prefs", android.content.Context.MODE_PRIVATE)
+                    // Default true for fresh installs; stored choice wins.
+                    if (prefs.contains("engine_fast")) prefs.getBoolean("engine_fast", true)
+                    else true
+                } catch (e: Exception) {
+                    true
+                }
+            }
+            engineFast = v
+            try {
+                YoutubeRepository.useInnerTube = v
+                Log.i(TAG, "engine ${if (v) "fast-InnerTube" else "stable-NewPipe"}")
+            } catch (e: Exception) {
+            }
+        } catch (e: Exception) {
+        }
+    }
 
     fun clearSongCache() {
         scope.launch(Dispatchers.IO) {
@@ -622,10 +692,19 @@ fun AppleMusicAppContent(
         }
     }
 
+    /** Real history: newest first, persisted lifetime list (300). */
     fun pushRecent(t: YtTrack) {
+        if (t.id.isEmpty()) return
         recent.removeAll { it.id == t.id }
         recent.add(0, t)
-        while (recent.size > 12) recent.removeLast()
+        while (recent.size > RecentStore.MAX) recent.removeLast()
+        val snapshot = recent.toList()
+        scope.launch(Dispatchers.IO) {
+            try {
+                RecentStore.save(context, snapshot)
+            } catch (e: Exception) {
+            }
+        }
     }
 
     fun toggleLike(t: YtTrack) {
@@ -725,9 +804,17 @@ fun AppleMusicAppContent(
                 upcomingTick++
                 // BG store next + prev + charts + taste-predicted songs
                 // (4 GB cache) so skips stream instantly, even offline-ish.
+                // Deferred 3s + same-track guard: the critical next-skip
+                // resolve must never queue behind ~30 background POSTs.
+                // (skipNext() has no own warmer; this covers every change.)
                 scope.launch(Dispatchers.IO) {
                     try {
+                        delay(3000)
                         val q = queueHolder[0] ?: return@launch
+                        try {
+                            if (q.current?.id != t.id) return@launch
+                        } catch (e: Exception) {
+                        }
                         Precache.warmPredicted(
                             context, q.upcomingIds(5),
                             try {
@@ -754,16 +841,31 @@ fun AppleMusicAppContent(
                     } catch (e: Exception) {
                     }
                 }
-                // Warm the video options so audio->video flips instantly.
-                scope.launch {
-                    try {
-                        YoutubeRepository.videoOptions(t.watchUrl)
-                    } catch (e: Exception) {
-                    }
-                }
+                // Video options resolve on demand in enterVideo() (5h cache):
+                // warming here cost 1 RTT per audio track for a sheet the user
+                // may never open. Removed for instant audio path.
                 // New track while watching video: follow it into video mode.
                 if (videoMode) {
                     videoFollowTick++
+                    // Pre-resolve the NEXT video while this one plays: the
+                    // flip then memory-hits (5h/inf caches) instead of paying
+                    // 2 fetches. On-demand still (current track only warms N+1).
+                    scope.launch(Dispatchers.IO) {
+                        try {
+                            val q = queueHolder[0] ?: return@launch
+                            val nx = q.upcomingIds(1).firstOrNull() ?: return@launch
+                            if (nx.watchUrl.isBlank()) return@launch
+                            try {
+                                YoutubeRepository.videoOptions(nx.watchUrl)
+                            } catch (e: Exception) {
+                            }
+                            try {
+                                YoutubeRepository.videoDetails(nx.watchUrl)
+                            } catch (e: Exception) {
+                            }
+                        } catch (e: Exception) {
+                        }
+                    }
                 } else {
                     // Buffer the track after this one: gapless change.
                     primeTick++
@@ -858,8 +960,12 @@ fun AppleMusicAppContent(
         upcomingJob = scope.launch {
             try {
                 val cur = queue.current ?: return@launch
-                if (queue.upcomingCount() >= 20) return@launch
-                queue.clearAutoTail()
+                // Infinite fixed-20: refill when ≤5 remain (15th of 20).
+                // Append-only (no clearAutoTail): the list the user sees is
+                // stable; fresh related-of-current tops it back to 20.
+                // (Was: refill at <10 with tail replacement — the "queue
+                // isn't persistent" churn.)
+                if (queue.upcomingCount() > 5) return@launch
                 if (queue.current?.id != cur.id) return@launch
                 val rel = withContext(Dispatchers.IO) {
                     try {
@@ -1073,17 +1179,22 @@ fun AppleMusicAppContent(
     }
 
     // Lyrics follow the current track (duration disambiguates matches).
+    // lyricsZeroDur: first fetch ran before the stream reported a duration
+    // (player.duration unknown at track change) → refetch once the real
+    // duration arrives, else mistimed records stick ("lyrics run faster").
     var lyrics by remember { mutableStateOf<LyricsState>(LyricsState.NotFound) }
+    var lyricsZeroDur by remember { mutableStateOf(false) }
     LaunchedEffect(nowPlaying) {
         val t = nowPlaying
+        lyricsZeroDur = false
         if (t == null || t.watchUrl.isBlank()) {
             lyrics = LyricsState.NotFound
         } else {
             lyrics = LyricsState.Loading
             // Player duration may still be unknown right at track change;
-            // wait briefly so duration scoring has real data.
+            // wait so duration scoring has real data (up to ~5s).
             var dur = 0L
-            for (i in 0 until 6) {
+            for (i in 0 until 10) {
                 try {
                     dur = player.duration.coerceAtLeast(0L)
                 } catch (e: Exception) {
@@ -1092,7 +1203,29 @@ fun AppleMusicAppContent(
                 delay(500)
             }
             if (nowPlaying?.id != t.id) return@LaunchedEffect
+            if (dur <= 30000L) lyricsZeroDur = true
             lyrics = LyricsRepository.fetch(t.artist, t.title, dur)
+        }
+    }
+    // Duration arrived late: one background re-match with real data; swap
+    // only on a strictly better (Synced) hit, never blank the screen.
+    LaunchedEffect(nowPlaying?.id, duration) {
+        val t = nowPlaying ?: return@LaunchedEffect
+        if (!lyricsZeroDur || duration <= 30000L) return@LaunchedEffect
+        if (lyrics !is LyricsState.Synced) {
+            lyricsZeroDur = false
+            return@LaunchedEffect
+        }
+        lyricsZeroDur = false
+        try {
+            val better = withContext(Dispatchers.IO) {
+                LyricsRepository.fetch(t.artist, t.title, duration)
+            }
+            if (nowPlaying?.id == t.id && better is LyricsState.Synced) {
+                lyrics = better
+                Log.i(TAG, "lyrics re-matched on duration")
+            }
+        } catch (e: Exception) {
         }
     }
 
@@ -1110,40 +1243,33 @@ fun AppleMusicAppContent(
                     nowPlaying = track
                     restoredPos = saved.positionMs
                     sessionRestored = true
-                    // Prime the audio URL in background so Resume is instant.
-                    // NOTE: MediaController must be touched on the app thread.
-                    scope.launch(Dispatchers.IO) {
+                    // Prime the restored track instantly: lazy cresca:// URI,
+                    // no resolve. NOTE: MediaController must be touched on
+                    // the app thread.
+                    scope.launch(Dispatchers.Main) {
                         try {
-                            val url = YoutubeRepository.audioUrl(track.watchUrl)
-                            if (url == null) return@launch
                             if (nowPlaying?.id != track.id) return@launch
-                            withContext(Dispatchers.Main) {
+                            if (player.mediaItemCount != 0) return@launch
+                            player.setMediaItem(
+                                MediaItem.Builder()
+                                    .setUri(ResolvingDataSource.uriFor(track.id))
+                                    .setMediaId(track.id)
+                                    .setCustomCacheKey("yt:" + track.id)
+                                    .setMediaMetadata(metaFor(track))
+                                    .build()
+                            )
+                            player.prepare()
+                            val seekTo = restoredPos.coerceAtLeast(0L)
+                            if (seekTo > 5000L) {
                                 try {
-                                    if (nowPlaying?.id != track.id) return@withContext
-                                    if (player.mediaItemCount != 0) return@withContext
-                                    player.setMediaItem(
-                                        MediaItem.Builder()
-                                            .setUri(url)
-                                            .setMediaId(track.id)
-                                            .setMediaMetadata(metaFor(track))
-                                            .build()
-                                    )
-                                    player.prepare()
-                                    val seekTo = restoredPos.coerceAtLeast(0L)
-                                    if (seekTo > 5000L) {
-                                        try {
-                                            player.seekTo(seekTo)
-                                        } catch (e: Exception) {
-                                        }
-                                    }
-                                    player.pause()
-                                    restoreSeekDone = true
+                                    player.seekTo(seekTo)
                                 } catch (e: Exception) {
-                                    Log.w(TAG, "restore prime failed", e)
                                 }
                             }
+                            player.pause()
+                            restoreSeekDone = true
                         } catch (e: Exception) {
-                            Log.w(TAG, "restore resolve failed", e)
+                            Log.w(TAG, "restore prime failed", e)
                         }
                     }
                     Log.i(TAG, "session restored ${track.title} @${saved.positionMs}")
@@ -1308,36 +1434,10 @@ fun AppleMusicAppContent(
                 queue.current?.let { nowPlaying = it }
             } catch (e: Exception) {
             }
-            // Top-up predictive cache for the new position.
-            scope.launch(Dispatchers.IO) {
-                try {
-                    val q = queueHolder[0] ?: return@launch
-                    Precache.warmPredicted(
-                        context, q.upcomingIds(5),
-                        try {
-                            liked
-                        } catch (e: Exception) {
-                            emptyList()
-                        },
-                        try {
-                            recent.toList()
-                        } catch (e: Exception) {
-                            emptyList()
-                        },
-                        try {
-                            q.previousIds(3)
-                        } catch (e: Exception) {
-                            emptyList()
-                        },
-                        try {
-                            homeSections["Charts Right Now"] ?: emptyList()
-                        } catch (e: Exception) {
-                            emptyList()
-                        }
-                    )
-                } catch (e: Exception) {
-                }
-            }
+            // No warmer here: onResolved() already warms (deferred 3s,
+            // same-track guard) for every track change including skips.
+            // A second warmPredicted per skip doubled background resolves
+            // (~28 POSTs) and slowed the next skip's critical resolve.
         } catch (e: Exception) {
             try {
                 queue.next()
@@ -1435,13 +1535,25 @@ fun AppleMusicAppContent(
         resolving = true
         scope.launch {
             try {
-                val opts = YoutubeRepository.videoOptions(t.watchUrl)
-                videoOpts = opts
-                var dash = ""
-                try {
-                    dash = YoutubeRepository.videoDetails(t.watchUrl)?.dashUrl ?: ""
-                } catch (e: Exception) {
+                // Parallel: options + details were 2 sequential fetchPage()
+                // calls (4-6s flips). One wave, ~1 RTT.
+                val optsDef = async(Dispatchers.IO) {
+                    try {
+                        YoutubeRepository.videoOptions(t.watchUrl)
+                    } catch (e: Exception) {
+                        emptyList()
+                    }
                 }
+                val dashDef = async(Dispatchers.IO) {
+                    try {
+                        YoutubeRepository.videoDetails(t.watchUrl)?.dashUrl ?: ""
+                    } catch (e: Exception) {
+                        ""
+                    }
+                }
+                val opts = optsDef.await()
+                videoOpts = opts
+                val dash = dashDef.await()
                 dashUrl = dash
                 val pos = player.currentPosition
                 val playing = player.isPlaying
@@ -1458,6 +1570,7 @@ fun AppleMusicAppContent(
                             MediaItem.Builder()
                                 .setUri(url)
                                 .setMediaId("v:" + t.id)
+                                .setCustomCacheKey("ytv:" + t.id)
                                 .setMediaMetadata(metaFor(t))
                                 .build()
                         )
@@ -1489,21 +1602,19 @@ fun AppleMusicAppContent(
             try {
                 val pos = player.currentPosition
                 val playing = player.isPlaying
-                // Stream-URL cache makes this a memory hit in practice.
-                val url = YoutubeRepository.audioUrl(t.watchUrl)
-                if (url != null) {
-                    player.setMediaItem(
-                        MediaItem.Builder()
-                            .setUri(url)
-                            .setMediaId(t.id)
-                            .setMediaMetadata(metaFor(t))
-                            .build()
-                    )
-                    player.prepare()
-                    player.seekTo(pos)
-                    if (resume && playing) {
-                        player.play()
-                    }
+                // Lazy URI: no resolve, instant flip back to audio.
+                player.setMediaItem(
+                    MediaItem.Builder()
+                        .setUri(ResolvingDataSource.uriFor(t.id))
+                        .setMediaId(t.id)
+                        .setCustomCacheKey("yt:" + t.id)
+                        .setMediaMetadata(metaFor(t))
+                        .build()
+                )
+                player.prepare()
+                player.seekTo(pos)
+                if (resume && playing) {
+                    player.play()
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "exit video failed", e)
@@ -1576,13 +1687,32 @@ fun AppleMusicAppContent(
                 val top = SongCache.load(context, "home_top", HOME_CACHE_TTL)
                     ?: SongCache.load(context, "home", HOME_CACHE_TTL)
                 val map = HashMap<String, List<YtTrack>>()
-                for (s in HomeFeed.CORE) {
+                for (s in HomeFeed.CORE + HomeFeed.RELEASED) {
                     try {
                         SongCache.load(context, s.cacheKey, HomeFeed.SECTION_TTL_MS)?.let {
                             if (it.isNotEmpty()) map[s.title] = it
                         }
                     } catch (e: Exception) {
                     }
+                }
+                // Fast-engine browse shelves cached under home_browse_<hash>;
+                // the hash→title map lives in prefs (titles aren't filename-safe).
+                try {
+                    val keys = context.getSharedPreferences("cresca_prefs", android.content.Context.MODE_PRIVATE)
+                        .getStringSet("home_browse_keys", emptySet()) ?: emptySet()
+                    for (entry in keys) {
+                        try {
+                            val sep = entry.indexOf("|")
+                            if (sep < 1) continue
+                            val title = entry.substring(sep + 1)
+                            if (title.isBlank() || map.containsKey(title)) continue
+                            SongCache.load(context, "home_browse_" + entry.substring(0, sep), HomeFeed.SECTION_TTL_MS)?.let {
+                                if (it.isNotEmpty()) map[title] = it
+                            }
+                        } catch (e: Exception) {
+                        }
+                    }
+                } catch (e: Exception) {
                 }
                 Pair(top, map)
             }.let { (cachedTop, cachedMap) ->
@@ -1609,9 +1739,12 @@ fun AppleMusicAppContent(
         try {
             val src = railSources.toMutableMap()
             src["Top Picks For You"] = SeeAllRequest("Top Picks For You", seed.subtitle, seed.query)
-            for (s in HomeFeed.CORE) {
+            for (s in HomeFeed.CORE + HomeFeed.RELEASED) {
                 if (s.query == "__charts__") {
                     src[s.title] = SeeAllRequest(s.title, s.subtitle, kiosk = true)
+                } else if (s.query == "__released__") {
+                    // Static playlist snapshot (filled below / from cache).
+                    src[s.title] = SeeAllRequest(s.title, s.subtitle, static = homeSections[s.title] ?: emptyList())
                 } else {
                     src[s.title] = SeeAllRequest(s.title, s.subtitle, s.query)
                 }
@@ -1621,8 +1754,11 @@ fun AppleMusicAppContent(
         }
         // 2) Network refresh: Top Picks ALWAYS reload (rotating seed), so a
         // refresh visibly changes the page. YT Music song search.
+        // Fast path: staged 2-frame write kept (software-renderer ANR guard)
+        // but breathers trimmed 300/150/200ms -> 60/40/0ms for instant paint.
         var attempt = 0
         var loaded = false
+        val homeNetT0 = try { android.os.SystemClock.elapsedRealtime() } catch (e: Exception) { 0L }
         while (attempt < 2 && !loaded) {
             attempt++
             try {
@@ -1634,12 +1770,12 @@ fun AppleMusicAppContent(
                     homeTracks = res.take(10)
                     live = true
                     try {
-                        delay(300)
+                        delay(60)
                     } catch (e: Exception) {
                     }
                     homeTracks = res
                     try {
-                        delay(150)
+                        delay(40)
                     } catch (e: Exception) {
                     }
                     if (queue.items.isEmpty() && nowPlaying == null) {
@@ -1658,18 +1794,15 @@ fun AppleMusicAppContent(
                     }
                     Log.i(TAG, "top picks loaded ${res.size} (${seed.query})")
                     loaded = true
-                    // Breathe: let input/anim run between the big first
-                    // composition and the rails burst (software renderers
-                    // can take seconds on 25 fresh images; never hold input).
                     try {
-                        delay(200)
+                        Log.d(TAG, "home top picks ${try { android.os.SystemClock.elapsedRealtime() - homeNetT0 } catch (e: Exception) { -1 }}ms")
                     } catch (e: Exception) {
                     }
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "top picks failed (attempt $attempt)", e)
                 if (attempt < 2) {
-                    delay(1500)
+                    delay(800)
                 }
             }
         }
@@ -1682,8 +1815,89 @@ fun AppleMusicAppContent(
         // 3) Other rails in background, 3 at a time: charts kiosk first,
         // then core, then related mixes + personalized (history-driven,
         // like SimpMusic's personalized shelves).
+        // Fast engine first: ONE browse call (FEmusic_home) fills several
+        // shelves at once; the per-rail jobs below only fetch titles still
+        // missing (their `continue` guards prune automatically).
+        try {
+            if (YoutubeRepository.useInnerTube) {
+                val shelves = try {
+                    withContext(Dispatchers.IO) { YoutubeRepository.homeShelves(8, 12) }
+                } catch (e: Exception) {
+                    Log.d(TAG, "home browse failed: ${e.message}")
+                    emptyMap()
+                }
+                if (shelves.isNotEmpty()) {
+                    val cur = homeSections.toMutableMap()
+                    val src = railSources.toMutableMap()
+                    val keyEntries = HashSet<String>()
+                    for ((title, tracks) in shelves) {
+                        try {
+                            if (tracks.isEmpty() || !cur[title].isNullOrEmpty()) continue
+                            cur[title] = tracks
+                            src[title] = SeeAllRequest(title, "YouTube Music", "$title songs")
+                            val h = title.hashCode().toString()
+                            keyEntries.add("$h|$title")
+                            val snapshot = tracks
+                            scope.launch(Dispatchers.IO) {
+                                try {
+                                    SongCache.save(context, "home_browse_$h", snapshot)
+                                } catch (e: Exception) {
+                                }
+                            }
+                        } catch (e: Exception) {
+                        }
+                    }
+                    if (cur.size != homeSections.size) {
+                        homeSections = cur
+                        railSources = src
+                        live = true
+                        announce()
+                    }
+                    if (keyEntries.isNotEmpty()) {
+                        scope.launch(Dispatchers.IO) {
+                            try {
+                                val prefs = context.getSharedPreferences("cresca_prefs", android.content.Context.MODE_PRIVATE)
+                                val merged = HashSet(prefs.getStringSet("home_browse_keys", emptySet()) ?: emptySet())
+                                merged.addAll(keyEntries)
+                                prefs.edit().putStringSet("home_browse_keys", merged).apply()
+                            } catch (e: Exception) {
+                            }
+                        }
+                    }
+                    Log.i(TAG, "home browse merged ${shelves.size} shelves")
+                }
+            }
+        } catch (e: Exception) {
+            Log.d(TAG, "home browse merge failed: ${e.message}")
+        }
         try {
             val jobs = ArrayList<suspend () -> Pair<String, List<YtTrack>>?>()
+            // Released: curated YT playlist (not a search). Always refreshes
+            // so new drops land; cache keeps cold starts instant.
+            if (homeSections[HomeFeed.RELEASED.title].isNullOrEmpty()) {
+                jobs.add({
+                    try {
+                        val res = YoutubeRepository.playlistTracks(HomeFeed.RELEASED_PLAYLIST_ID, 25)
+                        if (res.isNotEmpty()) {
+                            try {
+                                SongCache.save(context, HomeFeed.RELEASED.cacheKey, res)
+                            } catch (e: Exception) {
+                            }
+                            try {
+                                val src = railSources.toMutableMap()
+                                src[HomeFeed.RELEASED.title] =
+                                    SeeAllRequest(HomeFeed.RELEASED.title, HomeFeed.RELEASED.subtitle, static = res)
+                                railSources = src
+                            } catch (e: Exception) {
+                            }
+                            Pair(HomeFeed.RELEASED.title, res)
+                        } else null
+                    } catch (e: Exception) {
+                        Log.w(TAG, "released rail failed", e)
+                        null
+                    }
+                })
+            }
             if (homeSections["Charts Right Now"].isNullOrEmpty()) {
                 jobs.add({
                     try {
@@ -1705,15 +1919,7 @@ fun AppleMusicAppContent(
                 if (!homeSections[s.title].isNullOrEmpty()) continue
                 jobs.add({
                     try {
-                        // New Releases rail = true channel-feed new uploads.
-                        val res = if (s.title == "New Releases") {
-                            val artists = (HomeFeed.artistSeeds(liked + recent, 8) +
-                                listOf("Arijit Singh", "Shreya Ghoshal", "AP Dhillon"))
-                                .distinct()
-                            YoutubeRepository.newReleases(artists, 12)
-                        } else {
-                            YoutubeRepository.searchMusic(s.query, 12)
-                        }
+                        val res = YoutubeRepository.searchMusic(s.query, 12)
                         if (res.isNotEmpty()) {
                             try {
                                 SongCache.save(context, s.cacheKey, res)
@@ -1756,9 +1962,9 @@ fun AppleMusicAppContent(
                 }
             } catch (e: Exception) {
             }
-            // Personalized artist rails from library seeds.
+            // Personalized artist rails from library + YT seeds.
             try {
-                for (s in HomeFeed.personalized(liked, recent.toList())) {
+                for (s in HomeFeed.personalized(liked + ytSeeds, recent.toList())) {
                     if (!homeSections[s.title].isNullOrEmpty()) continue
                     jobs.add({
                         try {
@@ -1780,32 +1986,70 @@ fun AppleMusicAppContent(
                 }
             } catch (e: Exception) {
             }
-            // Sequential with a breather: parallel extractor bursts get
-            // throttled by YouTube; one rail at a time + one retry wins.
-            for (job in jobs) {
-                try {
-                    var done: Pair<String, List<YtTrack>>? = null
-                    var attempt = 0
-                    while (attempt < 2 && done == null) {
-                        attempt++
-                        try {
-                            done = withContext(Dispatchers.IO) { job() }
-                        } catch (e: Exception) {
-                            if (attempt < 2) delay(2000)
+            // Parallel rails in batches of 4: tuned OkHttp pool (12 conns,
+            // 16/host) sustains this without YouTube throttling; one retry
+            // wins. Was sequential + 700ms/rail (~9s for 13 rails) — now
+            // ~3 waves. UI paints incrementally per wave for instant feel.
+            val railsT0 = try { android.os.SystemClock.elapsedRealtime() } catch (e: Exception) { 0L }
+            try {
+                for (chunk in jobs.chunked(4)) {
+                    try {
+                        val doneList = coroutineScope {
+                            chunk.map { job ->
+                                async(Dispatchers.IO) {
+                                    var done: Pair<String, List<YtTrack>>? = null
+                                    var attempt = 0
+                                    while (attempt < 2 && done == null) {
+                                        attempt++
+                                        try {
+                                            done = job()
+                                        } catch (e: Exception) {
+                                            if (attempt < 2) delay(800)
+                                        }
+                                    }
+                                    done
+                                }
+                            }.awaitAll().filterNotNull()
                         }
+                        if (doneList.isNotEmpty()) {
+                            val cur = homeSections.toMutableMap()
+                            for (done in doneList) cur[done.first] = done.second
+                            homeSections = cur
+                            live = true
+                        }
+                    } catch (e: Exception) {
                     }
-                    if (done != null) {
-                        val cur = homeSections.toMutableMap()
-                        cur[done.first] = done.second
-                        homeSections = cur
-                        live = true
+                    try {
+                        delay(120)
+                    } catch (e: Exception) {
                     }
-                } catch (e: Exception) {
                 }
-                try {
-                    delay(700)
-                } catch (e: Exception) {
+            } catch (e: Exception) {
+            }
+            try {
+                Log.d(TAG, "home rails done ${try { android.os.SystemClock.elapsedRealtime() - railsT0 } catch (e: Exception) { -1 }}ms")
+            } catch (e: Exception) {
+            }
+            // Heal SeeAll sources: parallel related/personalized jobs mutate
+            // railSources off-main and can lose each other's keys (read-modify-
+            // write race). Re-register anything present in homeSections here
+            // on Main so every rail stays tappable.
+            try {
+                val src = railSources.toMutableMap()
+                var touched = false
+                for ((title, tracks) in homeSections) {
+                    if (tracks.isNullOrEmpty() || src.containsKey(title)) continue
+                    val core = try { HomeFeed.CORE.firstOrNull { it.title == title } } catch (e: Exception) { null }
+                    if (core != null) {
+                        src[title] = if (core.query == "__charts__") SeeAllRequest(title, core.subtitle, kiosk = true)
+                        else SeeAllRequest(title, core.subtitle, core.query)
+                    } else {
+                        src[title] = SeeAllRequest(title, "", "$title songs")
+                    }
+                    touched = true
                 }
+                if (touched) railSources = src
+            } catch (e: Exception) {
             }
         } catch (e: Exception) {
             Log.w(TAG, "rails refresh failed", e)
@@ -1912,12 +2156,12 @@ fun AppleMusicAppContent(
         }
     }
 
-    // Personalized rails fill in late once likes arrive (homeTick may have
-    // run before LikedStore finished loading off the main thread).
-    LaunchedEffect(liked.size) {
+    // Personalized rails fill in late once likes / YT seeds arrive
+    // (homeTick may have run before stores finished loading off-main).
+    LaunchedEffect(liked.size, ytSeeds.size) {
         try {
-            if (liked.isEmpty()) return@LaunchedEffect
-            val personal = HomeFeed.personalized(liked, recent.toList())
+            if (liked.isEmpty() && ytSeeds.isEmpty()) return@LaunchedEffect
+            val personal = HomeFeed.personalized(liked + ytSeeds, recent.toList())
                 .filter { homeSections[it.title].isNullOrEmpty() }
             if (personal.isEmpty()) return@LaunchedEffect
             // Sequential: avoids extractor throttling bursts.
@@ -2003,7 +2247,7 @@ fun AppleMusicAppContent(
             }?.let { newTracks = it }
         } catch (e: Exception) { }
         try {
-            val artists = (HomeFeed.artistSeeds(liked + recent, 8) +
+            val artists = (HomeFeed.artistSeeds(liked + recent + ytSeeds, 8) +
                 listOf("Arijit Singh", "Shreya Ghoshal", "AP Dhillon"))
                 .distinct()
             val fresh = YoutubeRepository.newReleases(artists, 12)
@@ -2120,7 +2364,7 @@ fun AppleMusicAppContent(
         Box(Modifier.padding(pad).hazeSource(state = hazeState)) {
             when (selectedTab) {
                 0 -> ListenNowScreen(
-                    tracks = homeTracks, recent = recent, fresh = newTracks, live = live,
+                    tracks = homeTracks, recent = recent, live = live,
                     loading = homeLoading, loadError = homeError,
                     sections = homeSections,
                     topPicks = if (topVibe.size >= 4) topVibe else homeTracks,
@@ -2173,7 +2417,8 @@ fun AppleMusicAppContent(
                     query = q
                     scope.launch {
                         try {
-                            val res = YoutubeRepository.searchSongs(q, 20)
+                            // Music-only: plain search leaks episodes/random videos.
+                            val res = YoutubeRepository.searchMusic(q, 20)
                             if (res.isNotEmpty()) playList(res, 0)
                         } catch (e: Exception) {
                             Log.w(TAG, "station failed", e)
@@ -2341,6 +2586,25 @@ fun AppleMusicAppContent(
     if (showProfile) {
         ProfileSheet(
             loggedIn = loggedIn,
+            engineFast = engineFast,
+            onEngine = { fast ->
+                engineFast = fast
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        context.getSharedPreferences("cresca_prefs", android.content.Context.MODE_PRIVATE)
+                            .edit().putBoolean("engine_fast", fast).apply()
+                    } catch (e: Exception) {
+                    }
+                    try {
+                        YoutubeRepository.useInnerTube = fast
+                    } catch (e: Exception) {
+                    }
+                }
+                try {
+                    Log.i(TAG, "engine switched to ${if (fast) "fast-InnerTube" else "stable-NewPipe"}")
+                } catch (e: Exception) {
+                }
+            },
             themeMode = themeMode,
             dlLoc = dlLoc,
             dlCount = dlItems.size,
@@ -3211,7 +3475,7 @@ private fun PlaylistSheet(
             val artists = playlist.tracks.take(8).map { it.artist }.distinct().take(2)
             val q = ((if (artists.isEmpty()) listOf("top") else artists) + "songs")
                 .joinToString(" ")
-            val res = YoutubeRepository.searchSongs(q, 12)
+            val res = YoutubeRepository.searchMusic(q, 12)
             sugg = res.filter { r -> playlist.tracks.none { it.id == r.id } }.take(5)
         } catch (e: Exception) {
             Log.w(TAG, "suggestions failed", e)
@@ -3442,16 +3706,10 @@ private fun IntroScreen() {
             verticalArrangement = Arrangement.Center
         ) {
             Image(
-                painter = painterResource(id = R.drawable.ic_splash),
+                painter = painterResource(id = R.drawable.cresca_logo),
                 contentDescription = "Cresca",
-                modifier = Modifier.size(128.dp)
+                modifier = Modifier.fillMaxWidth(0.72f)
                     .graphicsLayer(scaleX = scale, scaleY = scale, alpha = alpha)
-            )
-            Spacer(Modifier.height(20.dp))
-            Text(
-                "Cresca Music",
-                style = MaterialTheme.typography.displaySmall,
-                modifier = Modifier.graphicsLayer(alpha = textAlpha)
             )
             Spacer(Modifier.height(6.dp))
             Text(
@@ -4059,6 +4317,8 @@ private fun DetailRow(k: String, v: String) {
 @Composable
 private fun ProfileSheet(
     loggedIn: Boolean,
+    engineFast: Boolean = false,
+    onEngine: (Boolean) -> Unit = {},
     themeMode: String,
     dlLoc: String,
     dlCount: Int,
@@ -4087,17 +4347,15 @@ private fun ProfileSheet(
                 ) {
                     Surface(
                         shape = androidx.compose.foundation.shape.CircleShape,
-                        color = MaterialTheme.colorScheme.primary,
+                        color = Color.Black,
                         modifier = Modifier.size(56.dp)
                     ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Icon(
-                                Icons.Filled.Person,
-                                contentDescription = null,
-                                tint = Color.White,
-                                modifier = Modifier.size(32.dp)
-                            )
-                        }
+                        Image(
+                            painter = painterResource(id = R.drawable.cresca_icon),
+                            contentDescription = "Cresca",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
                     }
                     Spacer(Modifier.width(16.dp))
                     Column(Modifier.weight(1f)) {
@@ -4133,6 +4391,34 @@ private fun ProfileSheet(
                         }
                     }
                 )
+            }
+            item {
+                SectionHeader("Playback engine")
+            }
+            item {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)) {
+                    Text(
+                        if (engineFast) "Fast — on-device InnerTube (instant, needs login for best reliability)"
+                        else "Stable — NewPipe extraction (compatible everywhere)",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(
+                            selected = !engineFast,
+                            onClick = { onEngine(false) },
+                            label = { Text("Stable") },
+                            modifier = Modifier.weight(1f)
+                        )
+                        FilterChip(
+                            selected = engineFast,
+                            onClick = { onEngine(true) },
+                            label = { Text("Fast") },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
             }
             item {
                 SectionHeader("Appearance")
@@ -4306,7 +4592,7 @@ private fun LiveBadge(live: Boolean) {
 
 @Composable
 private fun ListenNowScreen(
-    tracks: List<YtTrack>, recent: List<YtTrack>, fresh: List<YtTrack>, live: Boolean,
+    tracks: List<YtTrack>, recent: List<YtTrack>, live: Boolean,
     loading: Boolean, loadError: String?,
     onRetryLoad: () -> Unit, onRefresh: () -> Unit, refreshing: Boolean,
     onLoadMoreRails: () -> Unit, loadingMore: Boolean, endlessCount: Int,
@@ -4528,61 +4814,45 @@ private fun ListenNowScreen(
             }
         }
         // Top Picks: recent-taste vibe (last 10 related, shuffled), 2X grid.
+        // Tap queues the visible dozen so Up Next is the curated list.
         item {
             val picks = if (topPicks.isNotEmpty()) topPicks else tracks
-            TopPicksGrid(tracks = picks.take(12), onPlay = onPlay)
-            SectionHeader(
-                "Recently Played",
-                onSeeAll = {
-                    onSeeAll(SeeAllRequest("Recently Played", static = recent.ifEmpty { tracks }))
-                }
+            TopPicksGrid(
+                tracks = picks.take(12),
+                onPlayList = { list, idx -> onPlayList(list, idx, false) }
             )
         }
-        // Recently Played cascade: 4 songs per column, new columns
-        // scroll horizontally (never long vertical rows).
-        item {
-            RecentCascade(
-                tracks = recent.ifEmpty { tracks }.take(16),
-                likedOf = likedOf,
-                onPlay = onPlay,
-                onPlayNext = onPlayNext,
-                onAddQueue = onAddQueue,
-                onToggleLike = onToggleLike
-            )
-        }
-        if (fresh.isNotEmpty()) {
+        // Recently Played = only songs actually played (persisted lifetime
+        // list). Never backfill with home tracks — that was the "random
+        // songs I never played" bug. Empty history hides the section.
+        if (recent.isNotEmpty()) {
             item {
                 SectionHeader(
-                    "New Releases",
+                    "Recently Played",
                     onSeeAll = {
-                        onSeeAll(
-                            railRequest("New Releases")
-                                ?: SeeAllRequest("New Releases", static = fresh)
-                        )
+                        onSeeAll(SeeAllRequest("Recently Played", static = recent.toList()))
                     }
                 )
             }
+            // Recently Played cascade: 4 songs per column, new columns
+            // scroll horizontally (never long vertical rows).
             item {
-                LazyRow(contentPadding = PaddingValues(horizontal = 16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    itemsIndexed(fresh.take(10)) { idx, t ->
-                        Column(Modifier.width(150.dp).clickable { onPlay(t) }) {
-                            TrackArt(t.thumbUrl, t.id.hashCode() + idx + 99, 150.dp, 12.dp)
-                            Spacer(Modifier.height(6.dp))
-                            Text(t.title, style = MaterialTheme.typography.bodyMedium,
-                                maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text(t.artist, style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        }
-                    }
-                }
+                RecentCascade(
+                    tracks = recent.take(16),
+                    likedOf = likedOf,
+                    onPlayList = { list, idx -> onPlayList(list, idx, false) },
+                    onPlayNext = onPlayNext,
+                    onAddQueue = onAddQueue,
+                    onToggleLike = onToggleLike
+                )
             }
         }
-        // YT Music variety rails: Charts / Trending / Punjabi / Lofi /
-        // Workout / Party / Romantic + mixes + personalized. Each See All
-        // opens a full endless page.
-        val railOrder = (HomeFeed.CORE.map { it.title } + sections.keys)
+        // (New Releases home rail removed: the curated Released playlist
+        // rail is the single fresh-drops shelf. Browse tab keeps its own.)
+        // YT Music variety rails: Released (curated playlist, pinned first) /
+        // Charts / Trending / Punjabi / Lofi / Workout / Party / Romantic +
+        // mixes + personalized. Each See All opens a full endless page.
+        val railOrder = (listOf(HomeFeed.RELEASED.title) + HomeFeed.CORE.map { it.title } + sections.keys)
             .distinct()
             .filter { it != "Top Picks For You" && it != "New Releases" }
         for (railTitle in railOrder) {
@@ -4590,7 +4860,7 @@ private fun ListenNowScreen(
             if (rail.isEmpty()) continue
             item {
                 val sub = try {
-                    HomeFeed.CORE.firstOrNull { it.title == railTitle }?.subtitle ?: ""
+                    (HomeFeed.CORE + HomeFeed.RELEASED).firstOrNull { it.title == railTitle }?.subtitle ?: ""
                 } catch (e: Exception) {
                     ""
                 }
@@ -4612,8 +4882,9 @@ private fun ListenNowScreen(
             item {
                 LazyRow(contentPadding = PaddingValues(horizontal = 16.dp),
                     horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    itemsIndexed(rail.take(12)) { idx, t ->
-                        Column(Modifier.width(150.dp).clickable { onPlay(t) }) {
+                    val railList = rail.take(12)
+                    itemsIndexed(railList) { idx, t ->
+                        Column(Modifier.width(150.dp).clickable { onPlayList(railList, idx, false) }) {
                             TrackArt(t.thumbUrl, t.id.hashCode() + idx + railTitle.hashCode(), 150.dp, 12.dp)
                             Spacer(Modifier.height(6.dp))
                             Text(t.title, style = MaterialTheme.typography.bodyMedium,
@@ -5857,6 +6128,7 @@ private fun SearchScreen(
 ) {
     var results by remember { mutableStateOf<List<YtTrack>>(emptyList()) }
     var searching by remember { mutableStateOf(false) }
+    var suggestions by remember { mutableStateOf<List<String>>(emptyList()) }
     val context = LocalContext.current
     var error by remember { mutableStateOf<String?>(null) }
     var retryTick by remember { mutableIntStateOf(0) }
@@ -5893,19 +6165,23 @@ private fun SearchScreen(
                 }
             }
         } catch (e: Exception) { }
-        delay(800)
+        // Fast debounce 250ms (was 800ms): cached paint is already on
+        // screen, network should chase typing, not lag a word behind.
+        delay(250)
         searching = true
         error = null
         var fresh: List<YtTrack> = emptyList()
+        val searchT0 = try { android.os.SystemClock.elapsedRealtime() } catch (e: Exception) { 0L }
         var attempt = 0
         while (attempt < 2 && fresh.isEmpty()) {
             attempt++
             try {
-                fresh = YoutubeRepository.searchSongs(query, 20)
+                // Music-only shelf: plain search leaks episodes/random videos.
+                fresh = YoutubeRepository.searchMusic(query, 20)
             } catch (e: Exception) {
                 Log.w(TAG, "search failed (attempt $attempt)", e)
                 if (attempt < 2) {
-                    delay(1500)
+                    delay(800)
                 }
             }
         }
@@ -5913,12 +6189,25 @@ private fun SearchScreen(
             if (fresh.isNotEmpty()) {
                 results = fresh
                 val snapshot = fresh
-                // Search fast-lane: top 4 stored instantly so taps stream
-                // from disk (4 GB budget, LRU-kept).
+                try {
+                    Log.d(TAG, "search '$query' ${snapshot.size} hits ${try { android.os.SystemClock.elapsedRealtime() - searchT0 } catch (e: Exception) { -1 }}ms")
+                } catch (e: Exception) {
+                }
+                // Persist cache on IO, then warm top-4 OFF the critical path:
+                // warmSearchTop resolves 4x audioUrls (each a fetchPage) and
+                // must not hold `searching=true` or block the paint.
                 try {
                     withContext(Dispatchers.IO) {
                         SongCache.save(context, cacheKey, snapshot)
-                        Precache.warmSearchTop(context, snapshot)
+                    }
+                } catch (e: Exception) {
+                }
+                try {
+                    searchScope.launch(Dispatchers.IO) {
+                        try {
+                            Precache.warmSearchTop(context, snapshot)
+                        } catch (e: Exception) {
+                        }
                     }
                 } catch (e: Exception) {
                 }
@@ -5931,6 +6220,25 @@ private fun SearchScreen(
             }
         } finally {
             searching = false
+        }
+    }
+
+    // As-you-type suggestions (fast engine only; silent in stable mode).
+    // 180ms chase delay — shorter than the 250ms search debounce so chips
+    // land before results and a tap narrows the query instantly.
+    LaunchedEffect(query) {
+        val q = query.trim()
+        if (q.length < 2) {
+            suggestions = emptyList()
+            return@LaunchedEffect
+        }
+        delay(180)
+        try {
+            val s = withContext(Dispatchers.IO) {
+                YoutubeRepository.suggestions(q)
+            }
+            if (query.trim() == q) suggestions = s
+        } catch (e: Exception) {
         }
     }
 
@@ -5955,6 +6263,28 @@ private fun SearchScreen(
                         color = MaterialTheme.colorScheme.error,
                         modifier = Modifier.weight(1f))
                     TextButton(onClick = { retryTick++ }) { Text("Retry") }
+                }
+            }
+            if (suggestions.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                // Horizontal chip strip (own LazyRow; parent is a LazyColumn
+                // item so nested-scroll is one-directional, no jitter).
+                androidx.compose.foundation.lazy.LazyRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    items(suggestions.size) { i ->
+                        val s = suggestions[i]
+                        FilterChip(
+                            selected = false,
+                            onClick = { onQuery(s) },
+                            label = { Text(s, maxLines = 1) },
+                            leadingIcon = {
+                                Icon(Icons.Filled.Search, contentDescription = null,
+                                    modifier = Modifier.size(16.dp))
+                            }
+                        )
+                    }
                 }
             }
             Spacer(Modifier.height(8.dp))
@@ -6007,12 +6337,13 @@ private fun SectionHeader(
     }
 }
 
-/** Recently Played cascade: 4 songs per column, horizontal columns. */
+/** Recently Played cascade: 4 songs per column, horizontal columns.
+ * Tap queues the visible history list (not a lone track). */
 @Composable
 private fun RecentCascade(
     tracks: List<YtTrack>,
     likedOf: (YtTrack) -> Boolean,
-    onPlay: (YtTrack) -> Unit,
+    onPlayList: (List<YtTrack>, Int) -> Unit,
     onPlayNext: (YtTrack) -> Unit,
     onAddQueue: (YtTrack) -> Unit,
     onToggleLike: (YtTrack) -> Unit
@@ -6033,10 +6364,10 @@ private fun RecentCascade(
         verticalArrangement = Arrangement.spacedBy(4.dp),
         modifier = Modifier.height(320.dp).fillMaxWidth()
     ) {
-        itemsIndexed(tracks, key = { i, x -> "$i-${x.id}" }) { _, t ->
+        itemsIndexed(tracks, key = { i, x -> "$i-${x.id}" }) { idx, t ->
             TrackRow(
                 track = t, isCurrent = false, liked = likedOf(t),
-                onPlay = { onPlay(t) },
+                onPlay = { onPlayList(tracks, idx) },
                 onPlayNext = { onPlayNext(t) },
                 onAddQueue = { onAddQueue(t) },
                 onToggleLike = { onToggleLike(t) },
@@ -6047,11 +6378,12 @@ private fun RecentCascade(
     }
 }
 
-/** Top Picks 2-row grid: album art only + short song name below. */
+/** Top Picks 2-row grid: album art only + short song name below.
+ * Tap queues the visible dozen (not a lone track). */
 @Composable
 private fun TopPicksGrid(
     tracks: List<YtTrack>,
-    onPlay: (YtTrack) -> Unit
+    onPlayList: (List<YtTrack>, Int) -> Unit
 ) {
     if (tracks.isEmpty()) return
     LazyHorizontalGrid(
@@ -6061,9 +6393,9 @@ private fun TopPicksGrid(
         verticalArrangement = Arrangement.spacedBy(16.dp),
         modifier = Modifier.height(420.dp).fillMaxWidth()
     ) {
-        itemsIndexed(tracks, key = { i, x -> "$i-${x.id}" }) { _, t ->
+        itemsIndexed(tracks, key = { i, x -> "$i-${x.id}" }) { idx, t ->
             Column(
-                Modifier.width(160.dp).clickable { onPlay(t) },
+                Modifier.width(160.dp).clickable { onPlayList(tracks, idx) },
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 TrackArt(t.thumbUrl, t.id.hashCode(), 160.dp, 20.dp)
@@ -6086,14 +6418,27 @@ private fun TopPicksGrid(
 private fun TrackArt(thumbUrl: String, seed: Int, size: Dp, corner: Dp = 8.dp) {
     if (thumbUrl.isNotBlank()) {
         val ctx = LocalContext.current
+        // Sharp art: thumbs arrive as hqdefault (480px, blurry on big cards).
+        // Derive maxresdefault from the video id in the URL; same hdOk flip
+        // pattern as the player art (Coil 2.6 takes no URL fallback).
+        val hd = remember(thumbUrl) {
+            try {
+                Regex("/vi/([A-Za-z0-9_-]{11})/").find(thumbUrl)
+                    ?.groupValues?.get(1)?.let { "https://i.ytimg.com/vi/$it/maxresdefault.jpg" }
+            } catch (e: Exception) {
+                null
+            }
+        }
+        var hdOk by remember(thumbUrl) { mutableStateOf(true) }
         AsyncImage(
             model = coil.request.ImageRequest.Builder(ctx)
-                .data(thumbUrl)
-                .size(320)
+                .data(if (hdOk && hd != null) hd else thumbUrl)
+                .size(640)
                 .crossfade(true)
                 .build(),
             contentDescription = null,
             contentScale = ContentScale.Crop,
+            onError = { hdOk = false },
             modifier = Modifier.size(size).clip(RoundedCornerShape(corner))
         )
     } else {

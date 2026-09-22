@@ -1,18 +1,15 @@
-<vector xmlns:android="http://schemas.android.com/apk/res/android"
-    android:width="108dp" android:height="108dp"
-    android:viewportWidth="108" android:viewportHeight="108">
-    <!-- Cresca mark: crescent cradling an eighth note -->
-    <path
-        android:fillColor="#FFFFFF"
-        android:fillType="evenOdd"
-        android:pathData="M20,54 a34,34 0 1,0 68,0 a34,34 0 1,0 -68,0 z M38,46 a28,28 0 1,1 56,0 a28,28 0 1,1 -56,0 z" />
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M53,72 a9,7 0 1,0 18,0 a9,7 0 1,0 -18,0 z" />
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M69,36 h5 v36 h-5 z" />
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M74,36 c9,2 13,7 14,17 c-6,-6 -9,-7 -14,-7 z" />
-</vector>
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Launcher foreground: new Cresca bars mark, inset into the adaptive
+     safe zone so masks never clip it. Background layer is black. -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@android:color/black" />
+    <item
+        android:left="12dp"
+        android:top="12dp"
+        android:right="12dp"
+        android:bottom="12dp">
+        <bitmap
+            android:src="@drawable/cresca_icon"
+            android:gravity="fill" />
+    </item>
+</layer-list>

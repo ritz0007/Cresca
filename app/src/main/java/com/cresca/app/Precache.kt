@@ -13,6 +13,9 @@ import coil.Coil
 import coil.request.CachePolicy
 import coil.request.ImageRequest
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 
 /**
@@ -49,27 +52,34 @@ object Precache {
         }
     }
 
-    /** Pre-store one resolved stream URL (URL cache should be warm first). */
-    suspend fun warmUrl(ctx: Context, url: String) = withContext(Dispatchers.IO) {
+    /**
+     * Pre-store one resolved stream URL (URL cache should be warm first).
+     * [trackId] keys the bytes by videoId ("yt:"+id, same as the player's
+     * customCacheKey): signed URLs change per resolve, so a full-URL key
+     * orphaned every precache on the next resolve. Legacy full-URL entries
+     * simply age out via LRU; a miss never misreads.
+     */
+    suspend fun warmUrl(ctx: Context, url: String, trackId: String = "") =
+        withContext(Dispatchers.IO) {
         try {
             if (url.isBlank()) return@withContext
             val app = ctx.applicationContext
             val cache = ExoCache.get(app)
             val http = DefaultHttpDataSource.Factory()
-                .setConnectTimeoutMs(15000)
-                .setReadTimeoutMs(15000)
+                .setConnectTimeoutMs(10000)
+                .setReadTimeoutMs(12000)
                 .setAllowCrossProtocolRedirects(true)
                 .setUserAgent("Cresca/1.0 (Android)")
             val factory = CacheDataSource.Factory()
                 .setCache(cache)
                 .setUpstreamDataSourceFactory(DefaultDataSource.Factory(app, http))
                 .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
-            val dataSpec = DataSpec(Uri.parse(url), 0, CAP_BYTES)
-            // Default cache key = the URL itself (matches CacheDataSource's
-            // default key factory for key-less specs; a miss only means we
-            // re-verify, never a wrong read).
+            val key = if (trackId.isNotBlank()) "yt:$trackId" else null
+            val dataSpec = if (key != null) DataSpec(Uri.parse(url), 0, CAP_BYTES, key)
+            else DataSpec(Uri.parse(url), 0, CAP_BYTES)
+            val probeKey = key ?: url
             val cachedBefore = try {
-                cache.getCachedBytes(url, 0, CAP_BYTES)
+                cache.getCachedBytes(probeKey, 0, CAP_BYTES)
             } catch (e: Exception) {
                 0L
             }
@@ -81,7 +91,7 @@ object Precache {
                 Log.d(TAG, "partial precache", e)
             }
             val cachedAfter = try {
-                cache.getCachedBytes(url, 0, CAP_BYTES)
+                cache.getCachedBytes(probeKey, 0, CAP_BYTES)
             } catch (e: Exception) {
                 cachedBefore
             }
@@ -91,20 +101,31 @@ object Precache {
         }
     }
 
-    /** Resolve + pre-store the next [count] tracks (skips offline ones). */
+    /** Resolve + pre-store the next [count] tracks (skips offline ones).
+     * Parallel x4: was sequential (4x fetchPage serialized) — now one wave.
+     * Fire-and-forget safe: never throws, skips cached/downloaded. */
     suspend fun warmUpcoming(ctx: Context, tracks: List<YtTrack>, count: Int = 5) =
         withContext(Dispatchers.IO) {
             try {
                 val app = ctx.applicationContext
-                for (t in tracks.take(count.coerceIn(1, 8))) {
-                    try {
-                        if (t.watchUrl.isBlank()) continue
-                        if (DownloadStore.isDownloaded(app, t.id)) continue
-                        val url = YoutubeRepository.audioUrl(t.watchUrl) ?: continue
-                        warmUrl(app, url)
-                        warmArt(app, t.thumbUrl)
-                    } catch (e: Exception) {
+                val slice = tracks.take(count.coerceIn(1, 8)).filter { it.watchUrl.isNotBlank() }
+                if (slice.isEmpty()) return@withContext
+                try {
+                    coroutineScope {
+                        slice.map { t ->
+                            async {
+                                try {
+                                    if (DownloadStore.isDownloaded(app, t.id)) return@async
+                                    val url = YoutubeRepository.audioUrl(t.watchUrl) ?: return@async
+                                    warmUrl(app, url, t.id)
+                                    warmArt(app, t.thumbUrl)
+                                } catch (e: Exception) {
+                                }
+                            }
+                        }.awaitAll()
                     }
+                } catch (e: Exception) {
+                    Log.w(TAG, "warmUpcoming failed", e)
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "warmUpcoming failed", e)
@@ -127,27 +148,53 @@ object Precache {
     ) = withContext(Dispatchers.IO) {
         try {
             val app = ctx.applicationContext
-            // 1) Up Next: the next 5 play instantly (covers rapid skipping).
-            warmUpcoming(app, upcoming, 5)
-            // 2) Previous: back-skips resolve instantly too.
-            warmUpcoming(app, previous.take(3), 3)
-            // 3) Charts the user opens (or probably opens): top of each rail.
-            warmUpcoming(app, charts.take(6), 6)
-            // 4) Taste predictions: 3 vibe picks from library seeds.
-            try {
-                val seeds = (liked.take(6) + recent.take(6)).distinctBy { it.id }
-                    .filter { it.watchUrl.isNotBlank() }.take(3)
-                for (s in seeds) {
+            // Waves run concurrently (were sequential: 5+3+6+3 resolves
+            // serialized). Up Next first wave with prev/charts; taste seeds
+            // join the same wave — single-flight audioUrl dedups overlap.
+            coroutineScope {
+                val w1 = async {
                     try {
-                        if (DownloadStore.isDownloaded(app, s.id)) continue
-                        val url = YoutubeRepository.audioUrl(s.watchUrl) ?: continue
-                        // Only top-up bytes (CacheWriter skips cached ranges).
-                        warmUrl(app, url)
-                        warmArt(app, s.thumbUrl)
+                        // 1) Up Next: the next 5 play instantly (rapid skips).
+                        warmUpcoming(app, upcoming, 5)
                     } catch (e: Exception) {
                     }
                 }
-            } catch (e: Exception) {
+                val w2 = async {
+                    try {
+                        // 2) Previous: back-skips resolve instantly too.
+                        warmUpcoming(app, previous.take(3), 3)
+                    } catch (e: Exception) {
+                    }
+                }
+                val w3 = async {
+                    try {
+                        // 3) Charts the user opens (or probably opens).
+                        warmUpcoming(app, charts.take(6), 6)
+                    } catch (e: Exception) {
+                    }
+                }
+                val w4 = async {
+                    try {
+                        // 4) Taste predictions: 3 vibe picks from library seeds.
+                        val seeds = (liked.take(6) + recent.take(6)).distinctBy { it.id }
+                            .filter { it.watchUrl.isNotBlank() }.take(3)
+                        for (s in seeds) {
+                            try {
+                                if (DownloadStore.isDownloaded(app, s.id)) continue
+                                val url = YoutubeRepository.audioUrl(s.watchUrl) ?: continue
+                                // Only top-up bytes (CacheWriter skips cached ranges).
+                                warmUrl(app, url, s.id)
+                                warmArt(app, s.thumbUrl)
+                            } catch (e: Exception) {
+                            }
+                        }
+                    } catch (e: Exception) {
+                    }
+                }
+                try {
+                    listOf(w1, w2, w3, w4).awaitAll()
+                } catch (e: Exception) {
+                }
             }
             try {
                 val pressure = budgetPressure(app)

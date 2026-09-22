@@ -43,22 +43,27 @@ class PlaybackService : MediaSessionService() {
         // Smooth + non-stop: cached datasource reuses streamed bytes on
         // replay/prefetch (SimpMusic pattern), bigger buffers survive
         // network dips, audio attributes keep focus handling sane.
+        // Instant start: 500ms buffers enough to begin (was 1000/2000ms),
+        // 30s max survives dips. Cached datasource reuses streamed bytes.
         val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(2000, 30000, 1000, 2000)
+            .setBufferDurationsMs(1500, 30000, 500, 1000)
             .setTargetBufferBytes(C.LENGTH_UNSET)
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
         val httpFactory = DefaultHttpDataSource.Factory()
-            .setConnectTimeoutMs(25000)
-            .setReadTimeoutMs(25000)
+            .setConnectTimeoutMs(10000)
+            .setReadTimeoutMs(12000)
             .setAllowCrossProtocolRedirects(true)
             .setUserAgent("Cresca/1.0 (Android)")
         val cacheSource = try {
             val cache = ExoCache.get(this)
             CacheDataSource.Factory()
                 .setCache(cache)
+                // Lazy resolve: items carry stable cresca://watch?v= URIs;
+                // the googlevideo URL resolves on the loader thread, and the
+                // outer cache keys everything by videoId (customCacheKey).
                 .setUpstreamDataSourceFactory(
-                    DefaultDataSource.Factory(this, httpFactory)
+                    ResolvingDataSourceFactory(DefaultDataSource.Factory(this, httpFactory))
                 )
                 .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
         } catch (e: Exception) {

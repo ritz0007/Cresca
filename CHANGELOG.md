@@ -1,5 +1,25 @@
 # Changelog — Cresca Music
 
+## 1.0.0 (major)
+- New brand: bars-mark launcher icon, Cresca wordmark on boot splash,
+  intro and profile
+- Instant playback engine: lazy `cresca://` URIs resolve on ExoPlayer's
+  loader thread (BitChord pattern) — taps/skips never block on network;
+  videoId-keyed 4 GB cache (replays/back-skips hit disk), disk-persisted
+  stream-URL cache, single-flight resolve dedup, raced player clients
+- Up Next that stays: fixed-20 infinite queue (refills at 15, append-only),
+  RDAMVM radio mixes, same-name/episode/Shorts junk dropped everywhere,
+  2-per-artist cap, strict 30s–10min song gate, music-only search
+- Real history: lifetime 300-song Recently Played (persisted since install);
+  YT liked + history pull after login feeds taste rails (never merged into
+  local data)
+- Released rail: curated playlist shelf, pinned first; rail taps queue the
+  whole visible list; video flips pre-resolve the next track
+- Karaoke timing fix: mistimed-record rejection, tighter duration bands,
+  re-match when stream duration arrives; sharper artwork (YTM w544 +
+  maxres fallback)
+- Home taste rails (4 personalized, YT seeds) replace filler duplicates
+
 ## 0.8.0
 - Smoother player: dropped full-screen artwork blur (was re-rendering
   every frame), single-blob ambient wash, animated play/pause morph,

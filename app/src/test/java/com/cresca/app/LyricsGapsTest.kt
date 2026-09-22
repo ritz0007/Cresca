@@ -16,6 +16,26 @@ class LyricsGapsTest {
     private fun line(ms: Long, text: String = "la") = LyricLine(ms, text)
 
     @Test
+    fun lastLineMs_readsLatestTimestamp() {
+        val lrc = "[00:09.44] a\n[00:19.02] b\n[01:02.33] c\n"
+        assertEquals(62330L, LyricsRepository.lastLineMs(lrc))
+        assertEquals(0L, LyricsRepository.lastLineMs("no tags here"))
+    }
+
+    @Test
+    fun consistencyPenalty_mistimedRecord() {
+        // Full-length lines (260s) on a 180s upload: reject hard.
+        assertEquals(-8, LyricsRepository.consistencyPenalty(260000L, 180.0))
+        // Healthy record: last line inside duration.
+        assertEquals(0, LyricsRepository.consistencyPenalty(260000L, 269.0))
+        // Partial lyrics (<60% coverage): penalize lightly.
+        assertEquals(-4, LyricsRepository.consistencyPenalty(60000L, 269.0))
+        // Unknowns: no opinion.
+        assertEquals(0, LyricsRepository.consistencyPenalty(0L, 269.0))
+        assertEquals(0, LyricsRepository.consistencyPenalty(260000L, Double.NaN))
+    }
+
+    @Test
     fun dotCount_thresholds() {
         assertEquals(0, dotCountForGap(0))
         assertEquals(0, dotCountForGap(2999))

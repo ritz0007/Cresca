@@ -15,7 +15,16 @@ object YtSessionManager {
     private const val FILE = "yt_session_enc"
     private const val KEY_COOKIES = "cookies"
     private const val KEY_VISITOR = "visitor"
+    private const val KEY_POTOKEN = "po_token"
     private const val MUSIC_URL = "https://music.youtube.com"
+
+    /**
+     * Flip to true to force login before any InnerTube fetch (user-requested
+     * mandatory login for PO-token). Default false during scaffold so
+     * logged-out users keep working via NewPipe fallback while the token
+     * path is proven; set true once BotGuard fetch is wired to WebView.
+     */
+    const val MANDATORY_LOGIN_FOR_INNERTUBE = false
 
     private fun prefs(ctx: Context): SharedPreferences {
         val app = ctx.applicationContext
@@ -38,6 +47,22 @@ object YtSessionManager {
             .apply()
     }
 
+    /** PO-token (BotGuard) from the logged-in account. Short-lived; refresh via WebView. */
+    fun savePoToken(ctx: Context, token: String) {
+        try {
+            prefs(ctx).edit().putString(KEY_POTOKEN, token).apply()
+        } catch (e: Exception) {
+        }
+    }
+
+    fun loadPoToken(ctx: Context): String {
+        return try {
+            prefs(ctx).getString(KEY_POTOKEN, "") ?: ""
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
     fun loadCookies(ctx: Context): String {
         return try {
             prefs(ctx).getString(KEY_COOKIES, "") ?: ""
@@ -57,6 +82,16 @@ object YtSessionManager {
     fun isLoggedIn(ctx: Context): Boolean {
         val c = loadCookies(ctx)
         return c.contains("SAPISID") || c.contains("SID")
+    }
+
+    /** Gate for mandatory-login mode: true when fetches may proceed. */
+    fun canFetchInnerTube(ctx: Context): Boolean {
+        if (!MANDATORY_LOGIN_FOR_INNERTUBE) return true
+        return try {
+            isLoggedIn(ctx)
+        } catch (e: Exception) {
+            false
+        }
     }
 
     fun logout(ctx: Context) {
@@ -129,6 +164,21 @@ object YtSessionManager {
         try {
             withContext(Dispatchers.IO) {
                 saveSession(app, raw, visitor)
+            }
+        } catch (e: Exception) {
+        }
+        // Session health for InnerTube fast path (never throws, never blocks).
+        try {
+            val hasLogin = try { raw.contains("SAPISID") || raw.contains("SID") } catch (e: Exception) { false }
+            val hasVisitor = visitor.isNotBlank()
+            val hasPo = try { loadPoToken(app).isNotBlank() } catch (e: Exception) { false }
+            android.util.Log.d("YtSession", "capture login=$hasLogin visitor=$hasVisitor poToken=$hasPo")
+            if (!hasPo) {
+                // BotGuard PO-token solving (zemer-cipher / WebView challenge)
+                // is TODO: player/search already attach the token when present
+                // and work without it for most content. This stub keeps the
+                // login flow unblocked while the solver is built.
+                android.util.Log.d("YtSession", "poToken absent — fast path runs without it; solver TODO")
             }
         } catch (e: Exception) {
         }
