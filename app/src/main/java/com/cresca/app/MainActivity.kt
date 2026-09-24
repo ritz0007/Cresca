@@ -589,6 +589,15 @@ fun AppleMusicAppContent(
     var showDownloads by remember { mutableStateOf(false) }
     var showProfile by remember { mutableStateOf(false) }
     var dlLoc by remember { mutableStateOf(DownloadStore.location(context)) }
+    // Motion: single kill-switch for the whole motion language.
+    // Persisted, default ON. Screens read it for press/stagger/shimmer.
+    var motionOn by remember { mutableStateOf(true) }
+    LaunchedEffect(Unit) {
+        try {
+            motionOn = withContext(Dispatchers.IO) { Motion.isOn(context) }
+        } catch (e: Exception) {
+        }
+    }
     // Playback engine: fast (on-device InnerTube, default) vs stable
     // (NewPipe scrape fallback). Persisted; applied to YoutubeRepository
     // on launch + toggle. Fast never strands the user: every call falls
@@ -2336,6 +2345,8 @@ fun AppleMusicAppContent(
         }
     }
 
+    // Ambient motion kill-switch for every row/card/skeleton below.
+    androidx.compose.runtime.CompositionLocalProvider(LocalMotion provides motionOn) {
     Box(Modifier.fillMaxSize()) {
     Scaffold(
         bottomBar = {
@@ -2390,7 +2401,18 @@ fun AppleMusicAppContent(
     ) { pad ->
         // hazeSource: the scrolling content that glass bars blur
         Box(Modifier.padding(pad).hazeSource(state = hazeState)) {
-            when (selectedTab) {
+            // Tab flow: lateral drift in swipe direction + fade (nothing
+            // when motion is off). Direction comes free from the transition.
+            androidx.compose.animation.AnimatedContent(
+                targetState = selectedTab,
+                transitionSpec = {
+                    val fwd = targetState > initialState
+                    Motion.tabEnter(motionOn, fwd) togetherWith
+                        Motion.tabExit(motionOn, fwd)
+                },
+                label = "tabs"
+            ) { tab ->
+            when (tab) {
                 0 -> ListenNowScreen(
                     tracks = homeTracks, recent = recent, live = live,
                     loading = homeLoading, loadError = homeError,
@@ -2448,7 +2470,7 @@ fun AppleMusicAppContent(
                 3 -> LibraryScreen(
                     liked = liked, recent = recent,
                     loggedIn = loggedIn, dlCount = dlItems.size,
-                    active = selectedTab == 3,
+                    active = tab == 3,
                     onPlay = ::play,
                     onPlayNext = { queue.playNext(it) },
                     onAddQueue = { queue.addToQueue(it) },
@@ -2469,6 +2491,7 @@ fun AppleMusicAppContent(
                     onOpenProfile = { showProfile = true }
                 )
             }
+            }
         }
     }
         // Animated opening screen above everything
@@ -2479,6 +2502,7 @@ fun AppleMusicAppContent(
         ) {
             IntroScreen()
         }
+    }
     }
 
     // Full Now Playing screen with lyrics
@@ -2626,6 +2650,16 @@ fun AppleMusicAppContent(
                 }
             },
             themeMode = themeMode,
+            motionOn = motionOn,
+            onMotion = { on ->
+                motionOn = on
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        Motion.setOn(context, on)
+                    } catch (e: Exception) {
+                    }
+                }
+            },
             dlLoc = dlLoc,
             dlCount = dlItems.size,
             onTheme = onThemeMode,
@@ -3175,9 +3209,15 @@ private fun FullPlayerSheet(
                 // above (single source, no duplicates below). Video mode has
                 // its own below-video block (videometa item).
                 SleekBar(positionMs = position, durationMs = duration, onSeek = onSeek)
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = error != null,
+                    enter = Motion.fadeRise(LocalMotion.current),
+                    label = "playerError"
+                ) {
                 if (error != null) {
                     Text(error, style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error)
+                }
                 }
                 // Transport: shuffle + prev + play + next + repeat — all live
                 Row(
@@ -3186,7 +3226,7 @@ private fun FullPlayerSheet(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     // 2nd tap = smart shuffle (preference-ordered Up Next).
-                    IconButton(onClick = onShuffle, modifier = Modifier.size(48.dp)) {
+                    IconButton(onClick = onShuffle, modifier = Modifier.size(48.dp).pressScale(LocalMotion.current)) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             Icon(
                                 if (smartShuffle) Icons.Filled.AutoAwesome
@@ -3203,11 +3243,11 @@ private fun FullPlayerSheet(
                             }
                         }
                     }
-                    IconButton(onClick = onPrev, modifier = Modifier.size(52.dp)) {
+                    IconButton(onClick = onPrev, modifier = Modifier.size(52.dp).pressScale(LocalMotion.current)) {
                         Icon(Icons.Filled.SkipPrevious, contentDescription = "Previous",
                             modifier = Modifier.size(38.dp))
                     }
-                    FilledIconButton(onClick = onPlayPause, modifier = Modifier.size(72.dp)) {
+                    FilledIconButton(onClick = onPlayPause, modifier = Modifier.size(72.dp).pressScale(LocalMotion.current, 0.9f)) {
                         if (buffering) CircularProgressIndicator(
                             modifier = Modifier.size(28.dp), strokeWidth = 3.dp,
                             color = Color.White)
@@ -3220,11 +3260,11 @@ private fun FullPlayerSheet(
                                 modifier = Modifier.size(40.dp))
                         }
                     }
-                    IconButton(onClick = onNext, modifier = Modifier.size(52.dp)) {
+                    IconButton(onClick = onNext, modifier = Modifier.size(52.dp).pressScale(LocalMotion.current)) {
                         Icon(Icons.Filled.SkipNext, contentDescription = "Next",
                             modifier = Modifier.size(38.dp))
                     }
-                    IconButton(onClick = onRepeat, modifier = Modifier.size(48.dp)) {
+                    IconButton(onClick = onRepeat, modifier = Modifier.size(48.dp).pressScale(LocalMotion.current)) {
                         Icon(
                             if (repeatMode == Player.REPEAT_MODE_ONE) Icons.Filled.RepeatOne
                             else Icons.Filled.Repeat,
@@ -3251,7 +3291,7 @@ private fun FullPlayerSheet(
                         Spacer(Modifier.width(6.dp))
                         Text(if (videoMode) "Audio" else "Video")
                     }
-                    IconButton(onClick = onLike) {
+                    IconButton(onClick = onLike, modifier = Modifier.pressScale(LocalMotion.current)) {
                         Icon(
                             if (liked) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
                             contentDescription = "Like",
@@ -3976,7 +4016,7 @@ private fun FancyBar(
                     }
                 }
                 // Mini-player like shortcut (no need to open the sheet).
-                IconButton(onClick = onLike, modifier = Modifier.size(40.dp)) {
+                IconButton(onClick = onLike, modifier = Modifier.size(40.dp).pressScale(LocalMotion.current)) {
                     Icon(
                         if (liked) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
                         contentDescription = if (liked) "Unlike" else "Like",
@@ -3992,7 +4032,7 @@ private fun FancyBar(
                     Surface(
                         shape = androidx.compose.foundation.shape.CircleShape,
                         color = Color(0xFFFA243C),
-                        modifier = Modifier.size(44.dp).clickable { onPlayPause() }
+                        modifier = Modifier.size(44.dp).pressScale(LocalMotion.current, 0.9f).clickable { onPlayPause() }
                     ) {
                         Box(contentAlignment = Alignment.Center) {
                             androidx.compose.animation.AnimatedContent(
@@ -4075,6 +4115,16 @@ private fun SleekBar(
     } else {
         0f
     }
+    // Scrub feel: knob swells + glow deepens while held.
+    val motion = LocalMotion.current
+    val knobR by animateFloatAsState(
+        targetValue = if (dragging && motion) 8.5f else 6f,
+        animationSpec = tween(160), label = "knob"
+    )
+    val glowR by animateFloatAsState(
+        targetValue = if (dragging && motion) 15f else 11f,
+        animationSpec = tween(160), label = "knobGlow"
+    )
     Box(
         Modifier.fillMaxWidth().height(26.dp)
             .pointerInput(durationMs) {
@@ -4131,12 +4181,12 @@ private fun SleekBar(
                 // Glowing knob.
                 drawCircle(
                     color = Color(0xFFFA243C).copy(alpha = 0.30f),
-                    radius = 11.dp.toPx(),
+                    radius = glowR.dp.toPx(),
                     center = androidx.compose.ui.geometry.Offset(fw, cy)
                 )
                 drawCircle(
                     color = Color.White,
-                    radius = 6.dp.toPx(),
+                    radius = knobR.dp.toPx(),
                     center = androidx.compose.ui.geometry.Offset(fw, cy)
                 )
             }
@@ -4384,6 +4434,8 @@ private fun ProfileSheet(
     engineFast: Boolean = false,
     onEngine: (Boolean) -> Unit = {},
     themeMode: String,
+    motionOn: Boolean = true,
+    onMotion: (Boolean) -> Unit = {},
     dlLoc: String,
     dlCount: Int,
     onTheme: (String) -> Unit,
@@ -4497,6 +4549,28 @@ private fun ProfileSheet(
                             selected = themeMode == v,
                             onClick = { onTheme(v) },
                             label = { Text(label) },
+                            modifier = Modifier.weight(1f).pressScale(motionOn)
+                        )
+                    }
+                }
+            }
+            item {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)) {
+                    Text("Motion",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(
+                            selected = motionOn,
+                            onClick = { onMotion(true) },
+                            label = { Text("On") },
+                            modifier = Modifier.weight(1f)
+                        )
+                        FilterChip(
+                            selected = !motionOn,
+                            onClick = { onMotion(false) },
+                            label = { Text("Off") },
                             modifier = Modifier.weight(1f)
                         )
                     }
@@ -4786,7 +4860,8 @@ private fun ListenNowScreen(
             )
             // Empty states: spinner while loading, retry when offline. No demo.
             if (tracks.isEmpty() && loading) {
-                Box(
+                if (LocalMotion.current) HomeSkeleton()
+                else Box(
                     Modifier.fillMaxWidth().padding(vertical = 48.dp),
                     contentAlignment = Alignment.Center
                 ) {
@@ -4799,6 +4874,11 @@ private fun ListenNowScreen(
                     }
                 }
             }
+            androidx.compose.animation.AnimatedVisibility(
+                visible = tracks.isEmpty() && !loading && loadError != null,
+                enter = Motion.fadeRise(LocalMotion.current),
+                label = "homeError"
+            ) {
             if (tracks.isEmpty() && !loading && loadError != null) {
                 Column(
                     Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 32.dp),
@@ -4810,6 +4890,7 @@ private fun ListenNowScreen(
                     Spacer(Modifier.height(12.dp))
                     Button(onClick = onRetryLoad) { Text("Retry") }
                 }
+            }
             }
             SectionHeader(
                 "Top Picks For You",
@@ -4848,11 +4929,17 @@ private fun ListenNowScreen(
         }
         if (updateTag != null) {
             item {
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = true,
+                    enter = Motion.fadeRise(LocalMotion.current),
+                    label = "updateBanner"
+                ) {
                 Surface(
                     shape = RoundedCornerShape(16.dp),
                     color = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.fillMaxWidth()
                         .padding(horizontal = 16.dp, vertical = 6.dp)
+                        .pressScale(LocalMotion.current)
                         .clickable { onUpdateTap() }
                 ) {
                     Row(
@@ -4874,6 +4961,7 @@ private fun ListenNowScreen(
                                 color = Color.White.copy(alpha = 0.85f))
                         }
                     }
+                }
                 }
             }
         }
@@ -4915,14 +5003,27 @@ private fun ListenNowScreen(
         // rail is the single fresh-drops shelf. Browse tab keeps its own.)
         // YT Music variety rails: Released (curated playlist, pinned first) /
         // Charts / Trending / Punjabi / Lofi / Workout / Party / Romantic +
-        // mixes + personalized. Each See All opens a full endless page.
+        // mixes + personalized. Staggered cascade entrance (60ms/rail).
         val railOrder = (listOf(HomeFeed.RELEASED.title) + HomeFeed.CORE.map { it.title } + sections.keys)
             .distinct()
             .filter { it != "Top Picks For You" && it != "New Releases" }
-        for (railTitle in railOrder) {
+        for ((ri, railTitle) in railOrder.withIndex()) {
             val rail = sections[railTitle] ?: continue
             if (rail.isEmpty()) continue
             item {
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = true,
+                    enter = if (LocalMotion.current) (
+                        androidx.compose.animation.fadeIn(
+                            androidx.compose.animation.core.tween(
+                                300, delayMillis = (ri * 60).coerceAtMost(420))) +
+                        androidx.compose.animation.slideInVertically(
+                            androidx.compose.animation.core.tween(
+                                300, delayMillis = (ri * 60).coerceAtMost(420))) { it / 4 }
+                    ) else androidx.compose.animation.fadeIn(
+                        androidx.compose.animation.core.tween(1)),
+                    label = "rail$ri"
+                ) {
                 val sub = try {
                     (HomeFeed.CORE + HomeFeed.RELEASED).firstOrNull { it.title == railTitle }?.subtitle ?: ""
                 } catch (e: Exception) {
@@ -4942,13 +5043,21 @@ private fun ListenNowScreen(
                             modifier = Modifier.padding(start = 16.dp, bottom = 4.dp))
                     }
                 }
+                }
             }
             item {
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = true,
+                    enter = androidx.compose.animation.fadeIn(
+                        androidx.compose.animation.core.tween(
+                            280, delayMillis = (ri * 60).coerceAtMost(420))),
+                    label = "railrow$ri"
+                ) {
                 LazyRow(contentPadding = PaddingValues(horizontal = 16.dp),
                     horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     val railList = rail.take(12)
                     itemsIndexed(railList) { idx, t ->
-                        Column(Modifier.width(150.dp).clickable { onPlayList(railList, idx, false) }) {
+                        Column(Modifier.width(150.dp).pressScale(LocalMotion.current).clickable { onPlayList(railList, idx, false) }) {
                             TrackArt(t.thumbUrl, t.id.hashCode() + idx + railTitle.hashCode(), 150.dp, 12.dp)
                             Spacer(Modifier.height(6.dp))
                             Text(t.title, style = MaterialTheme.typography.bodyMedium,
@@ -4958,6 +5067,7 @@ private fun ListenNowScreen(
                                 maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     }
+                }
                 }
             }
         }
@@ -4996,7 +5106,14 @@ private fun ListenNowScreen(
             }
         }
     }
-    // Pull indicator: grows with the hard pull, spins while refreshing.
+    // Pull indicator: grows with the hard pull, spins while refreshing,
+    // fades (not snaps) on release.
+    androidx.compose.animation.AnimatedVisibility(
+        visible = pullPx > 8f || refreshing,
+        exit = androidx.compose.animation.fadeOut(
+            androidx.compose.animation.core.tween(250)),
+        label = "pullInd"
+    ) {
     if (pullPx > 8f || refreshing) {
         val p = try {
             (pullPx / 200f).coerceIn(0f, 1f)
@@ -5037,6 +5154,7 @@ private fun ListenNowScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
+                }
             }
         }
     }
@@ -5056,8 +5174,8 @@ private fun TrackRow(
     compact: Boolean = false,
     modifier: Modifier = Modifier
 ) {
-    ListItem(
-        headlineContent = {
+    val motion = LocalMotion.current
+    ListItem(        headlineContent = {
             Text(track.title, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 color = if (isCurrent) MaterialTheme.colorScheme.primary
                 else MaterialTheme.colorScheme.onSurface)
@@ -5076,7 +5194,12 @@ private fun TrackRow(
                 onToggleLike = onToggleLike
             )
         },
-        modifier = modifier.clickable { onPlay() }
+        // Note: list placement animation (animateItem) doesn't exist in
+        // this BOM's foundation version — lists rely on stagger + fades.
+        // Only press physics here (scope-free).
+        modifier = modifier
+            .pressScale(motion)
+            .clickable { onPlay() }
     )
 }
 
@@ -5389,8 +5512,15 @@ private fun QueueRow(
     onDrag: (Float) -> Unit = {},
     onDragEnd: () -> Unit = {},
     onPlay: () -> Unit,
-    onRemove: () -> Unit
+    onRemove: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
+    val motion = LocalMotion.current
+    // Drag lift: rises + grows while held, settles on drop.
+    val lift by animateFloatAsState(
+        targetValue = if (dragging && motion) 1f else 0f,
+        animationSpec = tween(180), label = "lift"
+    )
     ListItem(
         headlineContent = {
             Text(t.title, maxLines = 1, overflow = TextOverflow.Ellipsis,
@@ -5424,11 +5554,16 @@ private fun QueueRow(
                 }
             }
         },
-        modifier = Modifier
+        modifier = modifier
             .onGloballyPositioned { onSize(it.size.height) }
+            .graphicsLayer(
+                scaleX = 1f + 0.03f * lift,
+                scaleY = 1f + 0.03f * lift,
+                shadowElevation = 12f * lift
+            )
             .let { m ->
                 val m2 = if (dragging) m.background(MaterialTheme.colorScheme.primaryContainer) else m
-                if (isCurrent) m2 else m2.clickable { onPlay() }
+                if (isCurrent) m2 else m2.pressScale(motion).clickable { onPlay() }
             }
     )
 }
@@ -5685,6 +5820,7 @@ private fun RadioScreen(onStation: (String) -> Unit) {
             Surface(
                 shape = RoundedCornerShape(20.dp),
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)
+                    .pressScale(LocalMotion.current)
                     .clickable { onStation(q) }
             ) {
                 Box(
@@ -6156,6 +6292,7 @@ private fun MoodPatternRow(onMood: (String) -> Unit) {
                 Modifier.width(150.dp).height(92.dp)
                     .clip(RoundedCornerShape(16.dp))
                     .background(Brush.linearGradient(colors))
+                    .pressScale(LocalMotion.current)
                     .clickable { onMood(q) }
                     .padding(12.dp)
             ) {
@@ -6320,6 +6457,11 @@ private fun SearchScreen(
             )
             Spacer(Modifier.height(8.dp))
             LiveBadge(live)
+            androidx.compose.animation.AnimatedVisibility(
+                visible = error != null,
+                enter = Motion.fadeRise(LocalMotion.current),
+                label = "searchError"
+            ) {
             if (error != null) {
                 Spacer(Modifier.height(4.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -6328,6 +6470,11 @@ private fun SearchScreen(
                         modifier = Modifier.weight(1f))
                     TextButton(onClick = { retryTick++ }) { Text("Retry") }
                 }
+            }
+            }
+            if (searching && results.isEmpty() && error == null) {
+                Spacer(Modifier.height(8.dp))
+                SearchSkeleton()
             }
             if (suggestions.isNotEmpty()) {
                 Spacer(Modifier.height(8.dp))
@@ -6346,7 +6493,8 @@ private fun SearchScreen(
                             leadingIcon = {
                                 Icon(Icons.Filled.Search, contentDescription = null,
                                     modifier = Modifier.size(16.dp))
-                            }
+                            },
+                            modifier = Modifier.pressScale(LocalMotion.current)
                         )
                     }
                 }
@@ -6436,6 +6584,7 @@ private fun RecentCascade(
                 onAddQueue = { onAddQueue(t) },
                 onToggleLike = { onToggleLike(t) },
                 compact = true,
+                // No grid placement anim in this foundation version.
                 modifier = Modifier.width(320.dp)
             )
         }
@@ -6459,7 +6608,7 @@ private fun TopPicksGrid(
     ) {
         itemsIndexed(tracks, key = { i, x -> "$i-${x.id}" }) { idx, t ->
             Column(
-                Modifier.width(160.dp).clickable { onPlayList(tracks, idx) },
+                Modifier.width(160.dp).pressScale(LocalMotion.current).clickable { onPlayList(tracks, idx) },
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 TrackArt(t.thumbUrl, t.id.hashCode(), 160.dp, 20.dp)
@@ -6478,6 +6627,81 @@ private fun TopPicksGrid(
 }
 
 /** Real YouTube thumbnail when available, gradient placeholder otherwise. */
+@Composable
+private fun ShimmerBox(modifier: Modifier, motion: Boolean) {
+    if (!motion) {
+        Box(modifier.background(MaterialTheme.colorScheme.surfaceVariant))
+        return
+    }
+    val inf = rememberInfiniteTransition(label = "shimmer")
+    val a by inf.animateFloat(
+        0.35f, 0.75f,
+        infiniteRepeatable(tween(900), RepeatMode.Restart), label = "shimmerA"
+    )
+    Box(modifier.background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = a)))
+}
+
+/** First-load skeleton: title bar + card rows. Replaces the lone spinner. */
+@Composable
+private fun HomeSkeleton() {
+    val motion = LocalMotion.current
+    Column(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+        ShimmerBox(
+            Modifier.padding(horizontal = 16.dp).fillMaxWidth(0.55f).height(30.dp)
+                .clip(RoundedCornerShape(8.dp)), motion
+        )
+        Spacer(Modifier.height(14.dp))
+        repeat(2) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                repeat(3) {
+                    Column(Modifier.weight(1f)) {
+                        ShimmerBox(
+                            Modifier.fillMaxWidth().aspectRatio(1f)
+                                .clip(RoundedCornerShape(12.dp)), motion
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        ShimmerBox(
+                            Modifier.fillMaxWidth(0.8f).height(14.dp)
+                                .clip(RoundedCornerShape(4.dp)), motion
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.height(16.dp))
+        }
+    }
+}
+
+/** Search first-load skeleton rows. */
+@Composable
+private fun SearchSkeleton() {
+    val motion = LocalMotion.current
+    Column(Modifier.fillMaxWidth()) {
+        repeat(5) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                ShimmerBox(Modifier.size(52.dp).clip(RoundedCornerShape(8.dp)), motion)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    ShimmerBox(
+                        Modifier.fillMaxWidth(0.7f).height(16.dp)
+                            .clip(RoundedCornerShape(4.dp)), motion
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    ShimmerBox(
+                        Modifier.fillMaxWidth(0.45f).height(13.dp)
+                            .clip(RoundedCornerShape(4.dp)), motion
+                    )
+                }
+            }
+        }
+    }
+}
 @Composable
 private fun TrackArt(thumbUrl: String, seed: Int, size: Dp, corner: Dp = 8.dp) {
     if (thumbUrl.isNotBlank()) {

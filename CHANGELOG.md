@@ -1,6 +1,11 @@
 # Changelog — Cresca Music
 
-## 1.1.0
+## 1.2.0
+- Motion pass: directional tab transitions, staggered home rails, press
+  physics on every control and card, shimmer skeletons (home + search),
+  fading banners/errors, seek-knob growth, queue drag lift, soft
+  pull-refresh release — one kill-switch in Profile → Appearance → Motion
+  (default ON)
 - Seamless updates: notification tap / Settings downloads the APK for your
   exact ABI straight from the release (no browser), tap-to-install on
   completion; release page only as fallback
