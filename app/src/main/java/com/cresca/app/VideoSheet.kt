@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -69,7 +70,10 @@ private fun Context.findActivity(): android.app.Activity? {
 /**
  * Session-driven embed (YT Music style): a bare video surface on the shared
  * session player. Play/pause/seek/prev/next all live on the music controls;
- * only expand + quality ride on the surface.
+ * expand + quality sit BELOW the picture, right side.
+ *
+ * Surface is a TextureView so periodic frame grabs can feed the blurred
+ * live-video backdrop ([onFrameGrab], ~160px, every 3s while playing).
  */
 @Composable
 fun InlineVideo(
@@ -78,11 +82,119 @@ fun InlineVideo(
     qualities: List<String>,
     currentQuality: String,
     onQuality: (String) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onFrameGrab: (android.graphics.Bitmap?) -> Unit = {},
+    videoKey: String = ""
 ) {
     val context = LocalContext.current
     var expanded by remember { mutableStateOf(false) }
     var showQuality by remember { mutableStateOf(false) }
+    // PlayerView (SurfaceView): proven auto-fit rendering — no manual
+    // matrices (the TextureView experiment stretched/froze). Live frames
+    // for the blurred bg come from PixelCopy on its surface: read-only,
+    // zero interference with the output path.
+    val pvRef = remember { arrayOfNulls<PlayerView>(1) }
+    // First-frame gate: spinner stays until pixels actually render (not
+    // just until the URL resolves), so a starved track never looks stuck.
+    var hasFrame by remember { mutableStateOf(false) }
+
+    DisposableEffect(player) {
+        val listener = object : Player.Listener {
+            override fun onRenderedFirstFrame() {
+                try {
+                    hasFrame = true
+                } catch (e: Exception) {
+                }
+            }
+        }
+        try {
+            player.addListener(listener)
+        } catch (e: Exception) {
+        }
+        onDispose {
+            try {
+                player.removeListener(listener)
+            } catch (e: Exception) {
+            }
+        }
+    }
+
+    // PixelCopy frame grabs for the blurred video backdrop (160x90,
+    // every 3s while playing). Destination bitmaps are fresh per grab and
+    // handed to Compose, never recycled here. Never throws.
+    val pcHandler = remember {
+        try {
+            android.os.Handler(android.os.Looper.getMainLooper())
+        } catch (e: Exception) {
+            null
+        }
+    }
+    LaunchedEffect(player, videoKey) {
+        // New video: wait for the first rendered frame (spinner covers it).
+        hasFrame = false
+        try {
+            while (true) {
+                kotlinx.coroutines.delay(3000)
+                try {
+                    val pv = pvRef[0] ?: continue
+                    if (!player.isPlaying) continue
+                    val sv = try {
+                        pv.videoSurfaceView as? android.view.SurfaceView
+                    } catch (e: Exception) {
+                        null
+                    } ?: continue
+                    val surf = try {
+                        sv.holder?.surface
+                    } catch (e: Exception) {
+                        null
+                    } ?: continue
+                    try {
+                        if (!surf.isValid) continue
+                    } catch (e: Exception) {
+                        continue
+                    }
+                    val h = try {
+                        pcHandler
+                    } catch (e: Exception) {
+                        null
+                    } ?: continue
+                    val dst = try {
+                        android.graphics.Bitmap.createBitmap(160, 90, android.graphics.Bitmap.Config.ARGB_8888)
+                    } catch (e: Exception) {
+                        null
+                    } ?: continue
+                    try {
+                        android.view.PixelCopy.request(
+                            surf,
+                            dst,
+                            { res ->
+                                try {
+                                    if (res == android.view.PixelCopy.SUCCESS) {
+                                        onFrameGrab(dst)
+                                    } else {
+                                        dst.recycle()
+                                    }
+                                } catch (e: Exception) {
+                                    try {
+                                        dst.recycle()
+                                    } catch (ignored: Exception) {
+                                    }
+                                }
+                            },
+                            h
+                        )
+                    } catch (e: Exception) {
+                        try {
+                            dst.recycle()
+                        } catch (ignored: Exception) {
+                        }
+                    }
+                } catch (e: Exception) {
+                }
+            }
+        } catch (e: Exception) {
+        }
+    }
 
     @Composable
     fun VideoSurface(surfaceModifier: Modifier) {
@@ -95,9 +207,16 @@ fun InlineVideo(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT
                     )
+                    pvRef[0] = this
                 }
             },
-            onRelease = { it.player = null },
+            onRelease = {
+                try {
+                    if (pvRef[0] === it) pvRef[0] = null
+                } catch (e: Exception) {
+                }
+                it.player = null
+            },
             modifier = surfaceModifier
         )
     }
@@ -160,15 +279,23 @@ fun InlineVideo(
     }
 
     if (!expanded) {
-        Box(modifier = modifier.background(Color.Black)) {
-            VideoSurface(Modifier.fillMaxSize())
-            SurfaceButtons(isExpanded = false, onToggleExpand = { expanded = true })
-            if (loading) {
-                CircularProgressIndicator(
-                    Modifier.align(Alignment.Center),
-                    color = Color.White
-                )
+        Column(modifier = modifier) {
+            Box(
+                Modifier.fillMaxWidth().aspectRatio(16f / 9f)
+                    .background(Color.Black)
+            ) {
+                VideoSurface(Modifier.fillMaxSize())
+                // Spinner until the first frame renders (resolve alone
+                // isn't enough: a starved track would look frozen).
+                if (loading || !hasFrame) {
+                    CircularProgressIndicator(
+                        Modifier.align(Alignment.Center),
+                        color = Color.White
+                    )
+                }
             }
+            // Controls live below the picture, right side (never on it).
+            SurfaceButtons(isExpanded = false, onToggleExpand = { expanded = true })
         }
     } else {
         // Fullscreen video rotates to landscape; back to portrait after.
@@ -190,17 +317,21 @@ fun InlineVideo(
                 decorFitsSystemWindows = false
             )
         ) {
-            Box(
+            Column(
                 modifier = Modifier.fillMaxSize().background(Color.Black)
             ) {
-                VideoSurface(Modifier.fillMaxSize())
-                SurfaceButtons(isExpanded = true, onToggleExpand = { expanded = false })
-                if (loading) {
-                    CircularProgressIndicator(
-                        Modifier.align(Alignment.Center),
-                        color = Color.White
-                    )
+                Box(
+                    Modifier.fillMaxWidth().weight(1f)
+                ) {
+                    VideoSurface(Modifier.fillMaxSize())
+                    if (loading || !hasFrame) {
+                        CircularProgressIndicator(
+                            Modifier.align(Alignment.Center),
+                            color = Color.White
+                        )
+                    }
                 }
+                SurfaceButtons(isExpanded = true, onToggleExpand = { expanded = false })
             }
         }
     }

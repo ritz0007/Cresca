@@ -52,8 +52,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
@@ -454,6 +457,46 @@ fun AppleMusicAppContent(
             listOf("Auto", "1080p", "720p", "480p", "360p")
         } else {
             videoOpts.map { it.label }.distinct()
+        }
+    }
+
+    // Saved ceiling: 720p default. ABR still adapts DOWN inside the cap on
+    // bottleneck (ExoPlayer treats maxVideoSize as a ceiling, not a lock).
+    fun qualityCapPref(): Int {
+        return try {
+            when (context.getSharedPreferences("cresca_prefs", android.content.Context.MODE_PRIVATE)
+                .getString("video_quality", "720p")) {
+                "1080p" -> 1080
+                "720p" -> 720
+                "480p" -> 480
+                "360p" -> 360
+                else -> 0
+            }
+        } catch (e: Exception) {
+            720
+        }
+    }
+
+    fun saveQualityPref(label: String) {
+        try {
+            context.getSharedPreferences("cresca_prefs", android.content.Context.MODE_PRIVATE)
+                .edit().putString("video_quality", label).apply()
+        } catch (e: Exception) {
+        }
+    }
+
+    /** Best muxed option at or under the ceiling (0 = uncapped best). */
+    fun pickMuxed(
+        opts: List<YoutubeRepository.VideoOption>,
+        capH: Int
+    ): YoutubeRepository.VideoOption? {
+        return try {
+            if (opts.isEmpty()) return null
+            if (capH <= 0) return opts.firstOrNull()
+            opts.filter { it.height in 1..capH }.maxByOrNull { it.height }
+                ?: opts.minByOrNull { it.height }
+        } catch (e: Exception) {
+            opts.firstOrNull()
         }
     }
 
@@ -1564,15 +1607,20 @@ fun AppleMusicAppContent(
                 videoOpts = opts
                 val dash = dashDef.await()
                 dashUrl = dash
+                Log.i(TAG, "enterVideo opts=${opts.size} dash=${dash.isNotBlank()} cap=${qualityCapPref()}")
                 val pos = player.currentPosition
                 val playing = player.isPlaying
                 if (dash.isNotBlank()) {
-                    // DASH manifest: adaptive up to 1080p+, instant start.
-                    playDash(t, dash, 0, pos, playing)
+                    // DASH manifest: adaptive under the saved ceiling
+                    // (720p default); ABR drops lower only on bottleneck.
+                    val cap = qualityCapPref()
+                    playDash(t, dash, cap, pos, playing)
                     videoQualityH = -1
                 } else {
                     dashCapH = 0
-                    val url = opts.firstOrNull()?.url
+                    val cap = qualityCapPref()
+                    val opt = pickMuxed(opts, cap)
+                    val url = opt?.url
                         ?: YoutubeRepository.videoUrl(t.watchUrl)
                     if (url != null) {
                         player.setMediaItem(
@@ -1588,7 +1636,7 @@ fun AppleMusicAppContent(
                         if (playing) {
                             player.play()
                         }
-                        videoQualityH = opts.firstOrNull()?.height ?: -1
+                        videoQualityH = opt?.height ?: -1
                     }
                 }
             } catch (e: Exception) {
@@ -1636,6 +1684,7 @@ fun AppleMusicAppContent(
     // Quality picker entry point: DASH caps when available, else muxed URLs.
     fun pickQuality(label: String) {
         val t = nowPlaying ?: return
+        saveQualityPref(label)
         val dash = dashUrl
         if (dash.isNotBlank()) {
             val cap = when (label) {
@@ -1658,6 +1707,7 @@ fun AppleMusicAppContent(
                     MediaItem.Builder()
                         .setUri(opt.url)
                         .setMediaId("v:" + ot.id)
+                        .setCustomCacheKey("ytv:" + ot.id)
                         .setMediaMetadata(metaFor(ot))
                         .build()
                 )
@@ -2209,21 +2259,89 @@ fun AppleMusicAppContent(
     var updateStatus by remember { mutableStateOf("") }
     // Seamless update: direct APK download for this device, installer on
     // completion. Release page only when no matching asset exists.
-    fun downloadUpdate(u: UpdateCheck.Update?) {
-        if (u == null) return
-        if (u.apkUrl.isBlank()) {
+    // (watchUpdateDownload first: local funs can't forward-reference.)
+    // Download watcher: live % in Settings + one-shot installer pop when
+    // the file lands (covers missed/denied notifications).
+    fun watchUpdateDownload(tag: String) {
+        scope.launch(Dispatchers.IO) {
             try {
-                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u.url)))
+                var offered = false
+                while (true) {
+                    delay(2000)
+                    try {
+                        val done = UpdateDownload.downloadedFile(context)
+                        if (done != null) {
+                            withContext(Dispatchers.Main) {
+                                updateStatus = "Downloaded — tap to install"
+                            }
+                            if (!offered) {
+                                offered = true
+                                if (UpdateDownload.takeOffer(context, tag)) {
+                                    withContext(Dispatchers.Main) {
+                                        try {
+                                            UpdateDownload.installFile(context, done)
+                                        } catch (e: Exception) {
+                                        }
+                                    }
+                                }
+                            }
+                            return@launch
+                        }
+                        if (!UpdateDownload.hasActiveDownload(context)) return@launch
+                        val p = UpdateDownload.queryProgress(context)
+                        if (p != null) {
+                            val pct = if (p.second > 0L) {
+                                ((p.first * 100L) / p.second).toInt().coerceIn(0, 100)
+                            } else -1
+                            withContext(Dispatchers.Main) {
+                                updateStatus = if (pct >= 0) "Downloading $tag… $pct%"
+                                else "Downloading $tag…"
+                            }
+                        }
+                    } catch (e: Exception) {
+                        return@launch
+                    }
+                }
             } catch (e: Exception) {
             }
-            return
         }
-        updateStatus = "Downloading ${u.tag}…"
+    }
+    fun downloadUpdate(u: UpdateCheck.Update?) {
+        if (u == null) return
         scope.launch(Dispatchers.IO) {
+            try {
+                val ready = UpdateDownload.downloadedFile(context)
+                if (ready != null) {
+                    withContext(Dispatchers.Main) {
+                        updateStatus = "Downloaded — opening installer…"
+                        try {
+                            UpdateDownload.installFile(context, ready)
+                        } catch (e: Exception) {
+                        }
+                    }
+                    return@launch
+                }
+            } catch (e: Exception) {
+            }
+            if (u.apkUrl.isBlank()) {
+                withContext(Dispatchers.Main) {
+                    try {
+                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u.url)))
+                    } catch (e: Exception) {
+                    }
+                }
+                return@launch
+            }
+            withContext(Dispatchers.Main) {
+                updateStatus = "Downloading ${u.tag}…"
+            }
             val ok = try {
                 UpdateDownload.startDownload(context, u)
             } catch (e: Exception) {
                 false
+            }
+            if (ok) {
+                watchUpdateDownload(u.tag)
             }
             if (!ok) {
                 withContext(Dispatchers.Main) {
@@ -2236,7 +2354,8 @@ fun AppleMusicAppContent(
             }
         }
     }
-    fun runUpdateCheck(manual: Boolean) {        if (updateChecking) return
+    fun runUpdateCheck(manual: Boolean) {
+        if (updateChecking) return
         updateChecking = true
         if (manual) updateStatus = "Checking…"
         scope.launch {
@@ -2274,6 +2393,32 @@ fun AppleMusicAppContent(
     }
     LaunchedEffect(Unit) {
         runUpdateCheck(false)
+        // Missed completion (notification denied/dismissed): offer the
+        // finished APK once instead of leaving it silent in Downloads.
+        scope.launch(Dispatchers.IO) {
+            try {
+                val done = UpdateDownload.downloadedFile(context)
+                if (done != null) {
+                    val prefs = context.getSharedPreferences("cresca_prefs", android.content.Context.MODE_PRIVATE)
+                    val tag = prefs.getString("update_download_tag", "") ?: ""
+                    withContext(Dispatchers.Main) {
+                        updateStatus = "Downloaded — tap to install"
+                    }
+                    if (UpdateDownload.takeOffer(context, tag)) {
+                        withContext(Dispatchers.Main) {
+                            try {
+                                UpdateDownload.installFile(context, done)
+                            } catch (e: Exception) {
+                            }
+                        }
+                    }
+                } else if (UpdateDownload.hasActiveDownload(context)) {
+                    val prefs = context.getSharedPreferences("cresca_prefs", android.content.Context.MODE_PRIVATE)
+                    watchUpdateDownload(prefs.getString("update_download_tag", "") ?: "")
+                }
+            } catch (e: Exception) {
+            }
+        }
     }
     // New releases = latest uploads from YOUR artists' channels
     // (newest-first feeds), refetched when the library changes.
@@ -2772,10 +2917,9 @@ fun AppleMusicAppContent(
     }
 }
 
-/** Single source for song name + live lyric, overlaid on artwork only. */
+/** Live lyric line overlaid on artwork (title lives below, on the blend). */
 @Composable
 private fun androidx.compose.foundation.layout.BoxScope.ThumbnailOverlay(
-    track: YtTrack,
     lyrics: LyricsState,
     position: Long,
     durationMs: Long = 0L
@@ -2818,39 +2962,8 @@ private fun androidx.compose.foundation.layout.BoxScope.ThumbnailOverlay(
             OverlayDots(frac = overlay.dotsFrac)
             Spacer(Modifier.height(4.dp))
         }
-        // Song swap choreography: title + artist roll with the same
-        // slide+fade language as the lyric ticker.
-        androidx.compose.animation.AnimatedContent(
-            targetState = track.id,
-            transitionSpec = {
-                (androidx.compose.animation.slideInVertically(
-                    androidx.compose.animation.core.tween(320)) { h -> h } +
-                    androidx.compose.animation.fadeIn(
-                        androidx.compose.animation.core.tween(320))) togetherWith
-                    (androidx.compose.animation.slideOutVertically(
-                        androidx.compose.animation.core.tween(320)) { h -> -h } +
-                        androidx.compose.animation.fadeOut(
-                            androidx.compose.animation.core.tween(320)))
-            },
-            label = "songSwap"
-        ) {
-            Column(horizontalAlignment = Alignment.Start) {
-                Text(
-                    track.title,
-                    style = MaterialTheme.typography.titleLarge.copy(
-                        fontWeight = FontWeight.Bold
-                    ),
-                    color = Color.White,
-                    maxLines = 2, overflow = TextOverflow.Ellipsis
-                )
-                Text(
-                    track.artist,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Color.White.copy(alpha = 0.75f),
-                    maxLines = 1, overflow = TextOverflow.Ellipsis
-                )
-            }
-        }
+        // Title/artist live BELOW the art now (on the blurred blend):
+        // this overlay carries the live lyric line only, never a black box.
     }
 }
 
@@ -3007,17 +3120,18 @@ private fun FullPlayerSheet(
     onDismiss: () -> Unit,
     domColor: Color = Color(0xFF3A0A12)
 ) {
+    // Ferry for the live video frame (InlineVideo grabs → bg below reads).
+    val videoFrameHolder = remember { arrayOfNulls<android.graphics.Bitmap>(1) }
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
         containerColor = Color(0xFF121212),
-        dragHandle = {
-            Box(
-                Modifier.padding(vertical = 8.dp).size(36.dp, 4.dp)
-                    .clip(RoundedCornerShape(2.dp))
-                    .background(Color.White.copy(alpha = 0.4f))
-            )
-        }
+        // Zero content insets: the artwork must bleed under the status
+        // bar (the default safe-drawing padding paints the black strip).
+        contentWindowInsets = { androidx.compose.foundation.layout.WindowInsets(0, 0, 0, 0) },
+        // No slot handle: the art owns the status bar edge-to-edge, and a
+        // floating handle rides over it (see art item below).
+        dragHandle = null
     ) {
         val dlscope = rememberCoroutineScope()
         val dlctx = LocalContext.current
@@ -3046,12 +3160,16 @@ private fun FullPlayerSheet(
                     }
                     w.statusBarColor = android.graphics.Color.TRANSPARENT
                     w.navigationBarColor = android.graphics.Color.TRANSPARENT
+                    // Icon tone from ARTWORK brightness, not the darkened
+                    // theme color: domAnimated is the boosted color × 0.5, so
+                    // scale back up. Dark art -> white icons and vice versa.
                     val lum = domAnimated.red * 0.2126f +
                         domAnimated.green * 0.7152f + domAnimated.blue * 0.0722f
+                    val artLum = (lum * 2.2f).coerceIn(0f, 1f)
                     try {
                         WindowCompat.getInsetsController(w, sheetView).apply {
-                            isAppearanceLightStatusBars = lum > 0.45f
-                            isAppearanceLightNavigationBars = lum > 0.45f
+                            isAppearanceLightStatusBars = artLum > 0.5f
+                            isAppearanceLightNavigationBars = artLum > 0.5f
                         }
                     } catch (e: Exception) {
                     }
@@ -3062,15 +3180,23 @@ private fun FullPlayerSheet(
         }
         AppleMusicTheme(darkTheme = true) {
         Box(Modifier.fillMaxWidth()) {
-            // Smooth ambience: dominant-color gradient + roaming lava blobs
-            // + bokeh layer. Clean black behind video (no orbs over picture).
-            // (The old full-bleed 70dp artwork blur re-rendered every frame
-            // and made the sheet feel clingy, especially on weak GPUs.)
-            LavaBackground(
-                base = domAnimated,
-                modifier = Modifier.fillMaxSize(),
-                ambient = !videoMode
-            )
+            // Backdrop is the blurred thumbnail itself (ArtBackdrop below);
+            // no lava wash — the sheet is pure artwork tones.
+            // Blurred-zoom backdrop: the same thumbnail, zoomed + frosted,
+            // fills the whole sheet behind name/lyrics/about so the square
+            // edge dissolves everywhere (Spotify-style). Keyed to the track:
+            // art + backdrop crossfade as one, never mismatched. In video
+            // mode the live video frame does the same job (never a still).
+            val vf = try {
+                videoFrameHolder[0]
+            } catch (e: Exception) {
+                null
+            }
+            if (videoMode && vf != null) {
+                VideoBackdrop(frame = vf)
+            } else if (!videoMode) {
+                ArtBackdrop(track = track, thumbUrl = thumbUrl)
+            }
             Surface(
                 color = Color.Transparent,
                 contentColor = Color.White,
@@ -3087,100 +3213,100 @@ private fun FullPlayerSheet(
             item(key = "art") {
                 if (videoMode && track.watchUrl.isNotBlank()) {
                     // Session-driven embed: the music transport owns this
-                    // picture. Kept clean: no overlay/scrim on the video —
-                    // name + live lyric sit BELOW it (next item).
-                    Box(
-                        Modifier.fillMaxWidth().aspectRatio(16f / 9f)
-                            .background(Color.Black)
-                    ) {
-                        InlineVideo(
-                            player = player,
-                            loading = videoLoading,
-                            qualities = qualities,
-                            currentQuality = currentQuality,
-                            onQuality = onQuality,
-                            modifier = Modifier.fillMaxSize()
-                        )
+                    // picture. Controls ride below it, right side.
+                    var videoFrame by remember(track.id) { mutableStateOf<android.graphics.Bitmap?>(null) }
+                    DisposableEffect(track.id) {
+                        onDispose {
+                            videoFrame = null
+                        }
                     }
+                    InlineVideo(
+                        player = player,
+                        loading = videoLoading,
+                        qualities = qualities,
+                        currentQuality = currentQuality,
+                        onQuality = onQuality,
+                        modifier = Modifier.fillMaxWidth(),
+                        videoKey = track.id,
+                        // Never recycle here: Compose may still be drawing
+                        // the previous frame (use-after-recycle crash).
+                        onFrameGrab = { bmp -> videoFrame = bmp }
+                    )
+                    // Live-blur video backdrop state for the sheet bg below.
+                    videoFrameHolder[0] = videoFrame
                 } else {
                     val actx = LocalContext.current
                     val hd = remember(track.id) { hdThumb(track) }
                     var hdOk by remember(track.id) { mutableStateOf(true) }
-                    // Melt tone: artwork-darkened lava color. The bottom scrim
-                    // ends in exactly this, so no square edge is ever visible.
-                    val melt = remember(domAnimated) {
-                        try {
-                            Color(
-                                (domAnimated.red * 0.30f).coerceIn(0f, 1f),
-                                (domAnimated.green * 0.30f).coerceIn(0f, 1f),
-                                (domAnimated.blue * 0.30f).coerceIn(0f, 1f)
-                            )
-                        } catch (e: Exception) {
-                            Color(0xFF121212)
-                        }
-                    }
                     Box(Modifier.fillMaxWidth()) {
-                        // Beat-sync + song-change choreography: the cover
-                        // breathes with the bass (Visualizer FFT, idle sine
-                        // fallback) and pops in on every track change.
+                        // Beat breathe (bass pulse, idle fallback). Song
+                        // changes slide below — never a pop.
                         val sessionId = try {
                             (player as? androidx.media3.exoplayer.ExoPlayer)?.audioSessionId ?: 0
                         } catch (e: Exception) {
                             0
                         }
                         val beat = rememberBeatLevel(sessionId, isPlaying)
-                        var artPop by remember(track.id) { mutableFloatStateOf(0.93f) }
-                        LaunchedEffect(track.id) { artPop = 1f }
-                        val popAnim by animateFloatAsState(
-                            targetValue = artPop,
-                            animationSpec = spring(dampingRatio = 0.7f, stiffness = 320f),
-                            label = "artPop"
-                        )
                         // Whisper-gentle: ~1% breathe on the bass pulse.
-                        val beatScale = (popAnim * (1f + 0.012f * beat)).coerceIn(0.9f, 1.04f)
-                        // Slightly transparent: roaming lava/bokeh breathe
-                        // through the art a little.
-                        AsyncImage(
-                            model = coil.request.ImageRequest.Builder(actx)
-                                .data(if (hdOk) hd else thumbUrl)
-                                .crossfade(true)
-                                .build(),
-                            contentDescription = null,
-                            contentScale = ContentScale.Crop,
-                            onError = { hdOk = false },
-                            modifier = Modifier.fillMaxWidth().aspectRatio(1f)
-                                .graphicsLayer(scaleX = beatScale, scaleY = beatScale),
-                            alpha = 0.86f
-                        )
-                        // Heavy dream veil: blurred-vision frost, no shapes.
-                        AsyncImage(
-                            model = coil.request.ImageRequest.Builder(actx)
-                                .data(if (hdOk) hd else thumbUrl)
-                                .crossfade(true)
-                                .build(),
-                            contentDescription = null,
-                            contentScale = ContentScale.Crop,
-                            onError = { hdOk = false },
-                            modifier = Modifier.fillMaxWidth().aspectRatio(1f)
-                                .blur(28.dp),
-                            alpha = 0.42f
-                        )
-                        // Feathered scrim melting art into the lava backdrop.
+                        val beatScale = (1f + 0.012f * beat).coerceIn(0.9f, 1.04f)
+                        // Floating grab handle over the art (the sheet slot
+                        // handle is gone so art owns the status edge).
                         Box(
-                            Modifier.fillMaxWidth().aspectRatio(1f)
-                                .background(
-                                    Brush.verticalGradient(
-                                        0f to Color.Transparent,
-                                        0.40f to Color.Transparent,
-                                        0.72f to melt.copy(alpha = 0.55f),
-                                        1f to melt
-                                    )
-                                )
+                            Modifier.align(Alignment.TopCenter)
+                                .windowInsetsPadding(
+                                    androidx.compose.foundation.layout.WindowInsets.statusBars)
+                                .padding(top = 6.dp)
+                                .size(36.dp, 4.dp)
+                                .clip(RoundedCornerShape(2.dp))
+                                .background(Color.White.copy(alpha = 0.55f))
                         )
-                        // Song name + live lyrics ON the thumbnail (bottom
-                        // blacked-out scrim): single source of truth.
+                        // Song change: new cover slides in from the left and
+                        // dissolves into the blurred backdrop beneath — the
+                        // sharp layer carries a bottom fade mask, so it has
+                        // no edge to seam against the background (no scrim,
+                        // no black box anywhere on the art).
+                        androidx.compose.animation.AnimatedContent(
+                            targetState = track.id,
+                            transitionSpec = {
+                                (androidx.compose.animation.slideInHorizontally(
+                                    androidx.compose.animation.core.tween(450)) { -it } +
+                                    androidx.compose.animation.fadeIn(
+                                        androidx.compose.animation.core.tween(450))) togetherWith
+                                    (androidx.compose.animation.slideOutHorizontally(
+                                        androidx.compose.animation.core.tween(450)) { it } +
+                                        androidx.compose.animation.fadeOut(
+                                            androidx.compose.animation.core.tween(450)))
+                            },
+                            label = "artSlide"
+                        ) {
+                            AsyncImage(
+                                model = coil.request.ImageRequest.Builder(actx)
+                                    .data(if (hdOk) hd else thumbUrl)
+                                    .build(),
+                                contentDescription = null,
+                                contentScale = ContentScale.Crop,
+                                onError = { hdOk = false },
+                                modifier = Modifier.fillMaxWidth().aspectRatio(1f)
+                                    .graphicsLayer(
+                                        scaleX = beatScale,
+                                        scaleY = beatScale,
+                                        alpha = 0.99f,
+                                        compositingStrategy = androidx.compose.ui.graphics.CompositingStrategy.Offscreen
+                                    )
+                                    .drawWithContent {
+                                        drawContent()
+                                        drawRect(
+                                            brush = Brush.verticalGradient(
+                                                0.58f to Color.Black,
+                                                1f to Color.Transparent
+                                            ),
+                                            blendMode = androidx.compose.ui.graphics.BlendMode.DstIn
+                                        )
+                                    }
+                            )
+                        }
+                        // Live lyric line only (title lives below, on blend).
                         ThumbnailOverlay(
-                            track = track,
                             lyrics = lyrics,
                             position = position,
                             durationMs = duration
@@ -3188,6 +3314,8 @@ private fun FullPlayerSheet(
                     }
                 }
             }
+            // (Melt tail retired: ArtBackdrop now carries the blend under
+            // the whole sheet, edge to About.)
             // Video mode: name + live lyric BELOW the video (never on it).
             if (videoMode && track.watchUrl.isNotBlank()) {
                 item(key = "videometa") {
@@ -3204,10 +3332,59 @@ private fun FullPlayerSheet(
                 Modifier.fillMaxWidth().padding(horizontal = 24.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Spacer(Modifier.height(16.dp))
-                // Song name + live lyric live ONLY on the thumbnail overlay
-                // above (single source, no duplicates below). Video mode has
-                // its own below-video block (videometa item).
+                // Name sits BELOW the art, on the blurred blend
+                // (reference-style). Skipped in video mode: VideoMeta owns
+                // the name there (no duplicates).
+                Spacer(Modifier.height(10.dp))
+                if (!videoMode) {
+                androidx.compose.animation.AnimatedContent(
+                    targetState = track.id,
+                    transitionSpec = {
+                        (androidx.compose.animation.slideInVertically(
+                            androidx.compose.animation.core.tween(320)) { h -> h } +
+                            androidx.compose.animation.fadeIn(
+                                androidx.compose.animation.core.tween(320))) togetherWith
+                            (androidx.compose.animation.slideOutVertically(
+                                androidx.compose.animation.core.tween(320)) { h -> -h } +
+                                androidx.compose.animation.fadeOut(
+                                    androidx.compose.animation.core.tween(320)))
+                    },
+                    label = "songSwap"
+                ) {
+                    Column(
+                        Modifier.fillMaxWidth(),
+                        horizontalAlignment = Alignment.Start
+                    ) {
+                        Text(
+                            track.title,
+                            style = MaterialTheme.typography.titleLarge.copy(
+                                fontWeight = FontWeight.Bold,
+                                shadow = Shadow(
+                                    color = Color.Black.copy(alpha = 0.6f),
+                                    offset = Offset(0f, 2f),
+                                    blurRadius = 8f
+                                )
+                            ),
+                            color = Color.White,
+                            maxLines = 2, overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            track.artist,
+                            style = MaterialTheme.typography.bodyMedium.copy(
+                                shadow = Shadow(
+                                    color = Color.Black.copy(alpha = 0.6f),
+                                    offset = Offset(0f, 2f),
+                                    blurRadius = 8f
+                                )
+                            ),
+                            color = Color.White.copy(alpha = 0.85f),
+                            maxLines = 1, overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+                }
+                Spacer(Modifier.height(10.dp))
+                // Video mode has its own below-video block (videometa item).
                 SleekBar(positionMs = position, durationMs = duration, onSeek = onSeek)
                 androidx.compose.animation.AnimatedVisibility(
                     visible = error != null,
@@ -4255,110 +4432,6 @@ private suspend fun dominantColor(ctx: android.content.Context, url: String): Co
         }
     }
 
-// Ambient wash: dominant-color gradient + free-roaming lava blobs +
-// a soft bokeh orb layer floating just above them. Blobs wander the full
-// backdrop on mixed-period x/y drifts (painterly, never robotic); bokeh
-// orbs use radial-gradient discs so they read as blurred light with no
-// blur pass. Behind artwork AND body — never behind video (video mode
-// passes ambient=false for a clean black backdrop).
-@Composable
-private fun LavaBackground(
-    base: Color,
-    modifier: Modifier = Modifier,
-    ambient: Boolean = true
-) {
-    Box(
-        modifier.background(
-            Brush.verticalGradient(
-                listOf(
-                    base.copy(alpha = 0.92f),
-                    Color.Black.copy(alpha = 0.78f)
-                )
-            )
-        )
-    ) {
-        if (!ambient) return@Box
-        val inf = rememberInfiniteTransition(label = "lava")
-        // 3 lava blobs, full-screen wander (x and y on mismatched periods).
-        val ax by inf.animateFloat(0.05f, 0.95f,
-            infiniteRepeatable(tween(17000), RepeatMode.Reverse), label = "lax")
-        val ay by inf.animateFloat(0.08f, 0.85f,
-            infiniteRepeatable(tween(23000), RepeatMode.Reverse), label = "lay")
-        val bx by inf.animateFloat(0.95f, 0.05f,
-            infiniteRepeatable(tween(21000), RepeatMode.Reverse), label = "lbx")
-        val by by inf.animateFloat(0.15f, 0.90f,
-            infiniteRepeatable(tween(19000), RepeatMode.Reverse), label = "lby")
-        val cx by inf.animateFloat(0.15f, 0.85f,
-            infiniteRepeatable(tween(26000), RepeatMode.Reverse), label = "lcx")
-        val cy by inf.animateFloat(0.80f, 0.10f,
-            infiniteRepeatable(tween(15000), RepeatMode.Reverse), label = "lcy")
-        // 8 bokeh orbs, each on its own wander (small x/y ranges offset so
-        // they scatter everywhere instead of marching together).
-        val bokeh = remember {
-            val rnd = kotlin.random.Random(7)
-            List(8) { i ->
-                val x0 = rnd.nextFloat() * 0.7f
-                val y0 = rnd.nextFloat() * 0.7f
-                BokehSeed(
-                    x0 = x0, x1 = (x0 + 0.25f + rnd.nextFloat() * 0.2f).coerceAtMost(1f),
-                    y0 = y0, y1 = (y0 + 0.25f + rnd.nextFloat() * 0.2f).coerceAtMost(1f),
-                    xDur = 12000 + rnd.nextInt(9000),
-                    yDur = 14000 + rnd.nextInt(9000),
-                    rDp = 9 + rnd.nextInt(26),
-                    white = i % 3 != 0,
-                    alpha = 0.07f + rnd.nextFloat() * 0.08f
-                )
-            }
-        }
-        // animateFloat calls must be unconditional: one per orb axis.
-        val bokehXY = bokeh.mapIndexed { i, s ->
-            val x by inf.animateFloat(s.x0, s.x1,
-                infiniteRepeatable(tween(s.xDur), RepeatMode.Reverse), label = "bx$i")
-            val y by inf.animateFloat(s.y0, s.y1,
-                infiniteRepeatable(tween(s.yDur), RepeatMode.Reverse), label = "by$i")
-            Triple(x, y, s)
-        }
-        Canvas(Modifier.fillMaxSize()) {
-            val r = size.minDimension * 0.22f
-            // Wash, not balls: faint large tints melting into the gradient.
-            drawCircle(base.copy(alpha = 0.16f), r,
-                androidx.compose.ui.geometry.Offset(size.width * ax, size.height * ay))
-            drawCircle(Color.White.copy(alpha = 0.03f), r * 0.7f,
-                androidx.compose.ui.geometry.Offset(size.width * bx, size.height * by))
-            drawCircle(base.copy(alpha = 0.10f), r * 0.55f,
-                androidx.compose.ui.geometry.Offset(size.width * cx, size.height * cy))
-            // Bokeh layer above the blobs: soft radial discs.
-            for ((fx, fy, s) in bokehXY) {
-                try {
-                    val rad = s.rDp.dp.toPx()
-                    val col = if (s.white) Color.White else base
-                    drawCircle(
-                        brush = Brush.radialGradient(
-                            listOf(col.copy(alpha = s.alpha), col.copy(alpha = 0f)),
-                            center = androidx.compose.ui.geometry.Offset(size.width * fx, size.height * fy),
-                            radius = rad
-                        ),
-                        radius = rad,
-                        center = androidx.compose.ui.geometry.Offset(size.width * fx, size.height * fy)
-                    )
-                } catch (e: Exception) {
-                }
-            }
-        }
-    }
-}
-
-private data class BokehSeed(
-    val x0: Float,
-    val x1: Float,
-    val y0: Float,
-    val y1: Float,
-    val xDur: Int,
-    val yDur: Int,
-    val rDp: Int,
-    val white: Boolean,
-    val alpha: Float
-)
 
 /** Shazam-like credits card. */
 @Composable
@@ -6626,10 +6699,69 @@ private fun TopPicksGrid(
     }
 }
 
+/**
+ * Full-sheet blurred-zoom backdrop for the player: the same thumbnail,
+ * zoomed past its edges and frosted, so art melts into name/lyrics/about
+ * with no square edge anywhere. Keyed to the track — art and backdrop
+ * crossfade as one on song change, never mismatched. Static layer (no
+ * per-frame work); skipped in video mode.
+ */
+@Composable
+private fun ArtBackdrop(track: YtTrack, thumbUrl: String) {
+    val ctx = LocalContext.current
+    val hd = remember(track.id) { hdThumb(track) }
+    var hdOk by remember(track.id) { mutableStateOf(true) }
+    Box(Modifier.fillMaxSize()) {
+        AsyncImage(
+            model = coil.request.ImageRequest.Builder(ctx)
+                .data(if (hdOk) hd else thumbUrl)
+                .crossfade(450)
+                .build(),
+            contentDescription = null,
+            contentScale = ContentScale.Crop,
+            onError = { hdOk = false },
+            modifier = Modifier.fillMaxSize()
+                .graphicsLayer(scaleX = 1.35f, scaleY = 1.35f)
+                .blur(60.dp)
+        )
+        // Settle it down: readable text, lava still breathing through.
+        Box(
+            Modifier.fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.45f))
+        )
+    }
+}
+
 /** Real YouTube thumbnail when available, gradient placeholder otherwise. */
 @Composable
-private fun ShimmerBox(modifier: Modifier, motion: Boolean) {
-    if (!motion) {
+private fun VideoBackdrop(frame: android.graphics.Bitmap) {
+    // Live video frame, zoomed past its edges + frosted. The bitmap object
+    // swaps every few seconds; Compose crossfades the swap (same as art).
+    // Defensive: never draw a dead bitmap (a recycled frame would kill the
+    // draw pass with IllegalStateException).
+    val safe = try {
+        !frame.isRecycled && frame.width > 0 && frame.height > 0
+    } catch (e: Exception) {
+        false
+    }
+    if (!safe) return
+    key(frame.hashCode()) {
+        Image(
+            bitmap = frame.asImageBitmap(),
+            contentDescription = null,
+            contentScale = ContentScale.Crop,
+            modifier = Modifier.fillMaxSize()
+                .graphicsLayer(scaleX = 1.35f, scaleY = 1.35f)
+                .blur(60.dp)
+        )
+    }
+    Box(
+        Modifier.fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.45f))
+    )
+}
+@Composable
+private fun ShimmerBox(modifier: Modifier, motion: Boolean) {    if (!motion) {
         Box(modifier.background(MaterialTheme.colorScheme.surfaceVariant))
         return
     }

@@ -165,6 +165,63 @@ object UpdateDownload {
         }
     }
 
+    /** (bytesSoFar, total) for the in-flight download, or null. */
+    fun queryProgress(ctx: Context): Pair<Long, Long>? {
+        return try {
+            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val id = prefs.getLong(KEY_DL_ID, -1L)
+            if (id < 0L) return null
+            val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+            val q = DownloadManager.Query().setFilterById(id)
+            dm.query(q)?.use { c ->
+                if (!c.moveToFirst()) return null
+                val status = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+                if (status != DownloadManager.STATUS_RUNNING &&
+                    status != DownloadManager.STATUS_PENDING &&
+                    status != DownloadManager.STATUS_PAUSED
+                ) return null
+                val soFar = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR))
+                val total = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
+                Pair(soFar, total)
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** True while our download is still in flight (file not on disk yet). */
+    fun hasActiveDownload(ctx: Context): Boolean {
+        return try {
+            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            if (prefs.getLong(KEY_DL_ID, -1L) < 0L) return false
+            if (downloadedFile(ctx) != null) return false
+            queryProgress(ctx) != null
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /** One-shot auto-install offer per tag (pops once, never nags). */
+    internal fun takeOffer(ctx: Context, tag: String): Boolean {
+        return try {
+            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val key = "update_offered_$tag"
+            if (tag.isBlank() || prefs.getBoolean(key, false)) return false
+            prefs.edit().putBoolean(key, true).apply()
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    internal fun cancelProgress(ctx: Context) {
+        try {
+            val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.cancel(NOTIF_ID)
+        } catch (e: Exception) {
+        }
+    }
+
     private fun ensureChannel(ctx: Context) {
         try {
             if (Build.VERSION.SDK_INT < 26) return
@@ -271,14 +328,19 @@ class UpdateActionReceiver : BroadcastReceiver() {
                         -2L
                     }
                     if (id < 0L || id != want) return
+                    // Kill the stuck "Downloading…" note first: it used to
+                    // linger forever when the ready notification couldn't
+                    // post (no permission), looking like a dead download.
+                    UpdateDownload.cancelProgress(app)
                     val tag = try {
                         app.getSharedPreferences("cresca_prefs", Context.MODE_PRIVATE)
                             .getString("update_download_tag", "") ?: ""
                     } catch (e: Exception) {
                         ""
                     }
+                    // Keep the record (don't clear): Settings tap + the
+                    // in-app auto-offer resolve the file from it.
                     val file = UpdateDownload.downloadedFile(app)
-                    UpdateDownload.clearRecord(app)
                     if (file != null) {
                         UpdateDownload.notifyReady(app, tag, file)
                     }

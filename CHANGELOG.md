@@ -1,6 +1,14 @@
 # Changelog — Cresca Music
 
-## 1.2.0
+## 1.3.0
+- Player blend rebuild: artwork dissolves into the blurred backdrop (no
+  edge, no black boxes), title lives below on the blend, lateral slide
+  song changes, 720p-default persisted video quality with all options,
+  expand/quality under the picture
+- Video reliability: controller-safe surface attach, first-frame spinner,
+  live-blur video backdrop, bitmap lifecycle crash fix
+- Updater completion: stuck-note cleanup, live % progress, tap-to-install
+  states, one-shot installer pop even with notifications off
 - Motion pass: directional tab transitions, staggered home rails, press
   physics on every control and card, shimmer skeletons (home + search),
   fading banners/errors, seek-knob growth, queue drag lift, soft
