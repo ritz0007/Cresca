@@ -47,7 +47,7 @@ data class TubeClient(
         val WEB = TubeClient(
             clientName = "WEB",
             clientVersion = "2.20260218.01.00",
-            apiKey = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX3",
+            apiKey = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30",
             userAgent = UA_WEB
         )
     }

@@ -879,4 +879,142 @@ object InnerTubeApi {
         }
         return out
     }
+
+    // ---------- captions (lyrics primary source) ----------
+
+    /** One timedtext track from the player response. */
+    data class CaptionTrack(
+        val baseUrl: String,
+        val lang: String,
+        val name: String,
+        val isAuto: Boolean
+    )
+
+    /**
+     * Timedtext tracks for a video, best-first (manual > auto, en/hi >
+     * rest). WEB_REMIX on the music host first, WEB on www as fallback.
+     * Empty on any failure (caller falls back to NewPipe/LRCLIB).
+     */
+    suspend fun captionTracks(
+        videoId: String,
+        cookies: String,
+        visitorData: String,
+        poToken: String = ""
+    ): List<CaptionTrack> = withContext(Dispatchers.IO) {
+        if (videoId.length != 11) return@withContext emptyList()
+        val attempts = listOf(
+            Pair(TubeClient.WEB_REMIX, "https://music.youtube.com"),
+            Pair(TubeClient.WEB, "https://www.youtube.com")
+        )
+        for ((client, host) in attempts) {
+            try {
+                val body = JSONObject()
+                    .put("context", contextJson(client, visitorData))
+                    .put("videoId", videoId)
+                    .put("racyCheckOk", true)
+                    .put("contentCheckOk", true)
+                val json = post("player", client, body, cookies, visitorData, poToken, host, playerHttp)
+                    ?: continue
+                val tracks = parseCaptionTracks(json)
+                if (tracks.isNotEmpty()) {
+                    try {
+                        Log.d(TAG, "captions $videoId ${tracks.size} tracks via ${client.clientName}")
+                    } catch (e: Exception) {
+                    }
+                    return@withContext rankCaptions(tracks)
+                }
+            } catch (e: Exception) {
+            }
+        }
+        emptyList()
+    }
+
+    /** Pull caption tracks out of a player response (pure, unit-friendly). */
+    internal fun parseCaptionTracks(root: JSONObject): List<CaptionTrack> {
+        val out = ArrayList<CaptionTrack>()
+        try {
+            val arr = root.optJSONObject("captions")
+                ?.optJSONObject("playerCaptionsTracklistRenderer")
+                ?.optJSONArray("captionTracks") ?: return out
+            for (i in 0 until arr.length()) {
+                try {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val baseUrl = o.optString("baseUrl", "")
+                    if (baseUrl.isBlank()) continue
+                    val lang = o.optString("languageCode", "")
+                    val kind = o.optString("kind", "")
+                    val name = runsText(o.optJSONObject("name"))
+                        ?: o.optJSONObject("name")?.optString("simpleText", "") ?: ""
+                    out.add(
+                        CaptionTrack(
+                            baseUrl = baseUrl,
+                            lang = lang,
+                            name = name,
+                            isAuto = kind.equals("asr", true) ||
+                                name.contains("auto", true)
+                        )
+                    )
+                } catch (e: Exception) {
+                }
+            }
+        } catch (e: Exception) {
+        }
+        return out
+    }
+
+    /** Manual captions first, then English/Hindi, then the rest. Pure. */
+    internal fun rankCaptions(tracks: List<CaptionTrack>): List<CaptionTrack> {
+        return try {
+            tracks.sortedWith(
+                compareByDescending<CaptionTrack> { !it.isAuto }
+                    .thenByDescending {
+                        when {
+                            it.lang.equals("en", true) -> 3
+                            it.lang.startsWith("en", true) -> 2
+                            it.lang.equals("hi", true) -> 2
+                            it.lang.startsWith("hi", true) -> 1
+                            else -> 0
+                        }
+                    }
+            )
+        } catch (e: Exception) {
+            tracks
+        }
+    }
+
+    /**
+     * Raw caption payload for a track, preferring WebVTT (simplest to
+     * parse). Falls back to the track's default format. Null on failure.
+     */
+    suspend fun fetchCaptionText(baseUrl: String): String? = withContext(Dispatchers.IO) {
+        try {
+            if (baseUrl.isBlank()) return@withContext null
+            val vtt = if (baseUrl.contains("fmt=")) {
+                baseUrl.replace(Regex("fmt=[^&]*"), "fmt=vtt")
+            } else {
+                baseUrl + (if (baseUrl.contains("?")) "&" else "?") + "fmt=vtt"
+            }
+            getText(vtt) ?: getText(baseUrl)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun getText(url: String): String? {
+        return try {
+            val req = okhttp3.Request.Builder().url(url)
+                .header(
+                    "User-Agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                )
+                .get().build()
+            playerHttp.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return null
+                resp.body?.string()?.takeIf { it.isNotBlank() }
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
 }

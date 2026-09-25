@@ -27,11 +27,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.draw.blur
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
@@ -184,6 +184,33 @@ private fun SyncedLyrics(
             0
         }
     }
+    // Tick isolation: line past/active derives from these two snapshots,
+    // which change every few seconds — never on the 150ms position tick.
+    // Rows that only read them skip recomposition between line changes.
+    val activeIsDots = remember(rows, activeRow) {
+        try {
+            rows.getOrNull(activeRow) is LyricRow.Dots
+        } catch (e: Exception) {
+            false
+        }
+    }
+    // Stabilized seek callback: the caller's lambda instance is recreated
+    // on every tick, which would defeat row skipping without this.
+    val latestClick by rememberUpdatedState(onLineClick)
+    val stableClick: ((Long) -> Unit)? = remember(onLineClick != null) {
+        if (onLineClick == null) {
+            null
+        } else {
+            { ms: Long ->
+                try {
+                    latestClick?.invoke(ms)
+                    Unit
+                } catch (e: Exception) {
+                    Unit
+                }
+            }
+        }
+    }
 
     // Manual-scroll handling: while the user drags (or within 3s after),
     // suspend auto-scroll and show every line fully readable (no blur).
@@ -224,11 +251,6 @@ private fun SyncedLyrics(
     }
     val manualMode = userHold || listState.isScrollInProgress
 
-    // Blur is the expensive effect here: while the list is moving we render
-    // alpha-only (same layout, no offscreen passes); the frosted look
-    // returns the moment scrolling settles. Beauty in stills, 60fps in motion.
-    val scrolling = listState.isScrollInProgress
-
     LaunchedEffect(activeRow) {
         if (manualMode) return@LaunchedEffect
         try {
@@ -257,7 +279,16 @@ private fun SyncedLyrics(
         state = listState,
         contentPadding = PaddingValues(horizontal = 20.dp, vertical = 64.dp)
     ) {
-        itemsIndexed(rows, key = { index, row -> "$index-${row.key()}" }) { _, row ->
+        itemsIndexed(
+            rows,
+            key = { index, row -> "$index-${row.key()}" },
+            contentType = { _, row ->
+                when (row) {
+                    is LyricRow.Line -> "line"
+                    is LyricRow.Dots -> "dots"
+                }
+            }
+        ) { _, row ->
             when (row) {
                 is LyricRow.Line -> {
                     val isActiveRow = rows.getOrNull(activeRow) == row
@@ -267,176 +298,216 @@ private fun SyncedLyrics(
                     val isAdjacent = dist == 1
                     // When dots own the active row, no line is "active".
                     val isActive = isActiveRow && (rows.getOrNull(activeRow) is LyricRow.Line)
+                    // No position read here: takeover state is precomputed,
+                    // so settled lines skip every 150ms tick.
                     val isPast = when {
                         manualMode -> false
                         isActive -> false
-                        else -> try {
-                            row.index < activeIdx ||
-                                (row.index == activeIdx && isDotsActiveAfter(rows, row.index, safePos))
-                        } catch (e: Exception) {
-                            row.index < activeIdx
-                        }
+                        else -> row.index < activeIdx ||
+                            (row.index == activeIdx && activeIsDots)
                     }
-                    // Gentle zoom: soft spring, runs only when the active line
-                    // changes (every few seconds), never per-frame.
-                    val targetScale = when {
-                        isActive && isPlaying -> 1.07f
-                        isActive -> 1.04f
-                        isAdjacent -> 1.0f
-                        else -> 0.98f
-                    }
-                    val scale by animateFloatAsState(
-                        targetValue = targetScale,
-                        animationSpec = spring(dampingRatio = 0.85f, stiffness = 400f),
-                        label = "lyricScale"
-                    )
-                    val targetAlpha = when {
-                        manualMode -> 1f
-                        isActive -> 1f
-                        isAdjacent -> 0.95f
-                        isPast -> 0.60f
-                        else -> 0.80f
-                    }
-                    val alphaAnim by animateFloatAsState(
-                        targetValue = targetAlpha,
-                        animationSpec = tween(300),
-                        label = "lyricAlpha"
-                    )
-                    // Constant gentle pan: past lines rest lifted, upcoming
-                    // settle from below — always applied, eased, never jumpy.
-                    val targetShift = when {
-                        isActive -> 0f
-                        isPast -> -8f
-                        else -> 8f
-                    }
-                    val shift by animateFloatAsState(
-                        targetValue = targetShift,
-                        animationSpec = tween(320),
-                        label = "lyricPan"
-                    )
-                    // Frosted depth for far lines, crisp prev/next. Blur is
-                    // skipped while scrolling (perf) — alpha carries it.
-                    val blurDp = when {
-                        manualMode || scrolling || isActive || isAdjacent -> 0.dp
-                        dist == 2 -> 2.dp
-                        else -> 4.dp
-                    }
-                    var mod = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 12.dp)
-                        .graphicsLayer(scaleX = scale, scaleY = scale, translationY = shift)
-                        .alpha(alphaAnim)
-                    if (blurDp.value > 0.01f) mod = mod.blur(blurDp)
-                    if (onLineClick != null) {
-                        val seekTo = row.ms
-                        mod = mod.clickable {
-                            try {
-                                onLineClick(seekTo)
-                            } catch (e: Exception) {
-                            }
-                        }
-                    }
-                    Text(
+                    // Separate composable with stable params: unchanged rows
+                    // skip recomposition entirely (the 60fps fix).
+                    LyricLineRow(
                         text = row.text,
-                        fontSize = if (isActive) 24.sp else if (isAdjacent) 21.sp else 20.sp,
-                        lineHeight = 30.sp,
-                        fontWeight = if (isActive) FontWeight.Bold else if (isAdjacent) FontWeight.SemiBold else FontWeight.Normal,
-                        // Neon glow on the sung line only (one shadowed layer
-                        // at a time — cheap; per-line shadows were the jank).
-                        style = if (isActive) TextStyle(
-                            shadow = Shadow(
-                                color = Color(0xFFFA243C).copy(alpha = 0.85f),
-                                offset = Offset.Zero,
-                                blurRadius = 18f
-                            )
-                        ) else TextStyle.Default,
-                        color = when {
-                            isActive -> Color.White
-                            isPast -> Color.White.copy(alpha = 0.62f)
-                            isAdjacent -> Color.White.copy(alpha = 0.90f)
-                            else -> Color.White.copy(alpha = 0.72f)
-                        },
-                        modifier = mod
+                        seekMs = row.ms,
+                        isActive = isActive,
+                        isPast = isPast,
+                        isAdjacent = isAdjacent,
+                        isPlaying = isPlaying,
+                        manualMode = manualMode,
+                        onSeek = stableClick
                     )
                 }
                 is LyricRow.Dots -> {
-                    val dotsTotal = 3
-                    val span = (row.toMs - row.fromMs).coerceAtLeast(1)
-                    // Direct drive, no easing animation on the fraction: the
-                    // position already polls at 150ms, and re-triggered tweens
-                    // never finished — that's what made dots look stuck.
-                    val frac = try {
-                        ((safePos - row.fromMs).toFloat() / span.toFloat()).coerceIn(0f, 1f)
+                    val isActiveDots = rows.getOrNull(activeRow) == row
+                    // Position-free past/future: the authoritative active row
+                    // decides, so settled dots skip every 150ms tick.
+                    val rowPos = try {
+                        rows.indexOf(row)
                     } catch (e: Exception) {
+                        -1
+                    }
+                    val isPastDots = rowPos >= 0 && rowPos < activeRow
+                    val isFutureDots = rowPos >= 0 && rowPos > activeRow
+                    // Direct drive, no easing on the fraction: the position
+                    // already polls at 150ms, and re-triggered tweens never
+                    // finished — that's what made dots look stuck. Only the
+                    // live row reads the ticking position.
+                    val span = (row.toMs - row.fromMs).coerceAtLeast(1)
+                    val frac = if (isActiveDots) {
+                        try {
+                            ((safePos - row.fromMs).toFloat() / span.toFloat())
+                                .coerceIn(0f, 1f)
+                        } catch (e: Exception) {
+                            0f
+                        }
+                    } else if (isPastDots) {
+                        1f
+                    } else {
                         0f
                     }
-                    val filled = (frac * dotsTotal).toInt().coerceIn(0, dotsTotal)
-                    val isActiveDots = rows.getOrNull(activeRow) == row
-                    val isPastDots = try {
-                        safePos >= (row.toMs + LYRIC_HOLD_MS)
-                    } catch (e: Exception) {
-                        false
-                    }
-                    val isFutureDots = try {
-                        safePos < row.fromMs
-                    } catch (e: Exception) {
-                        false
-                    }
-                    // Past/future dots dim like past/future lyrics — never
-                    // shiny white after passing.
-                    val rowAlphaTarget = when {
-                        manualMode -> 1f
-                        isActiveDots -> 1f
-                        isPastDots -> 0.55f
-                        isFutureDots -> 0.70f
-                        else -> 0.8f
-                    }
-                    val rowAlpha by animateFloatAsState(
-                        targetValue = rowAlphaTarget, animationSpec = tween(300), label = "dotsAlpha"
+                    LyricDotsRow(
+                        frac = frac,
+                        isActiveDots = isActiveDots,
+                        isPastDots = isPastDots,
+                        isFutureDots = isFutureDots,
+                        isPlaying = isPlaying,
+                        manualMode = manualMode
                     )
-                    val glowTarget = when {
-                        !isPlaying -> 0.45f
-                        isActiveDots -> 1f
-                        else -> 0.3f
-                    }
-                    val glow by animateFloatAsState(
-                        targetValue = glowTarget, animationSpec = tween(300), label = "dotsGlow"
-                    )
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 14.dp)
-                            .alpha(rowAlpha),
-                        horizontalArrangement = Arrangement.spacedBy(
-                            8.dp, Alignment.CenterHorizontally
-                        ),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        for (d in 0 until dotsTotal) {
-                            val on = d < filled && isActiveDots
-                            // Fixed size + scale pop (scale never re-lays-out,
-                            // so no cracking); glow carried by brightness.
-                            Box(
-                                modifier = Modifier
-                                    .size(10.dp)
-                                    .graphicsLayer(
-                                        scaleX = if (on) 1.3f else 1f,
-                                        scaleY = if (on) 1.3f else 1f
-                                    )
-                                    .background(
-                                        color = when {
-                                            on -> Color.White.copy(alpha = 0.60f + 0.40f * glow)
-                                            isPastDots -> Color.White.copy(alpha = 0.30f)
-                                            isFutureDots -> Color.White.copy(alpha = 0.30f)
-                                            else -> Color.White.copy(alpha = 0.22f)
-                                        },
-                                        shape = androidx.compose.foundation.shape.CircleShape
-                                    )
-                            )
-                        }
-                    }
                 }
             }
+        }
+    }
+}
+
+/**
+ * One karaoke line. All params are stable snapshots, so Compose skips this
+ * entirely unless the line's own visual state changes (the 60fps fix).
+ *
+ * Perf notes: exactly ONE animation (the active-line zoom spring). Alpha
+ * and pan are direct values — per-line tweens re-emitted on every tick
+ * were a major frame cost for a visually negligible ease. No blur anywhere:
+ * each blurred line costs an offscreen render pass per frame, and alpha
+ * depth reads identically at 60fps.
+ */
+@Composable
+private fun LyricLineRow(
+    text: String,
+    seekMs: Long,
+    isActive: Boolean,
+    isPast: Boolean,
+    isAdjacent: Boolean,
+    isPlaying: Boolean,
+    manualMode: Boolean,
+    onSeek: ((Long) -> Unit)?
+) {
+    // Gentle zoom: soft spring, runs only when the active line
+    // changes (every few seconds), never per-frame.
+    val targetScale = when {
+        isActive && isPlaying -> 1.07f
+        isActive -> 1.04f
+        isAdjacent -> 1.0f
+        else -> 0.98f
+    }
+    val scale by animateFloatAsState(
+        targetValue = targetScale,
+        animationSpec = spring(dampingRatio = 0.85f, stiffness = 400f),
+        label = "lyricScale"
+    )
+    val alpha = when {
+        manualMode -> 1f
+        isActive -> 1f
+        isAdjacent -> 0.95f
+        isPast -> 0.60f
+        else -> 0.80f
+    }
+    // Past lines rest lifted, upcoming settle from below.
+    val shift = when {
+        isActive -> 0f
+        isPast -> -8f
+        else -> 8f
+    }
+    var mod = Modifier
+        .fillMaxWidth()
+        .padding(vertical = 12.dp)
+        .graphicsLayer(scaleX = scale, scaleY = scale, translationY = shift)
+        .alpha(alpha)
+    if (onSeek != null) {
+        mod = mod.clickable {
+            try {
+                onSeek(seekMs)
+            } catch (e: Exception) {
+            }
+        }
+    }
+    Text(
+        text = text,
+        fontSize = if (isActive) 24.sp else if (isAdjacent) 21.sp else 20.sp,
+        lineHeight = 30.sp,
+        fontWeight = if (isActive) FontWeight.Bold else if (isAdjacent) FontWeight.SemiBold else FontWeight.Normal,
+        // Neon glow on the sung line only (one shadowed layer
+        // at a time — cheap; per-line shadows were the jank).
+        style = if (isActive) TextStyle(
+            shadow = Shadow(
+                color = Color(0xFFFA243C).copy(alpha = 0.85f),
+                offset = Offset.Zero,
+                blurRadius = 18f
+            )
+        ) else TextStyle.Default,
+        color = when {
+            isActive -> Color.White
+            isPast -> Color.White.copy(alpha = 0.62f)
+            isAdjacent -> Color.White.copy(alpha = 0.90f)
+            else -> Color.White.copy(alpha = 0.72f)
+        },
+        modifier = mod
+    )
+}
+
+/** One 3-dot waiting row. Only the live row ticks; settled rows are static. */
+@Composable
+private fun LyricDotsRow(
+    frac: Float,
+    isActiveDots: Boolean,
+    isPastDots: Boolean,
+    isFutureDots: Boolean,
+    isPlaying: Boolean,
+    manualMode: Boolean
+) {
+    val dotsTotal = 3
+    val filled = (frac * dotsTotal).toInt().coerceIn(0, dotsTotal)
+    // Past/future dots dim like past/future lyrics — never
+    // shiny white after passing.
+    val rowAlphaTarget = when {
+        manualMode -> 1f
+        isActiveDots -> 1f
+        isPastDots -> 0.55f
+        isFutureDots -> 0.70f
+        else -> 0.8f
+    }
+    val rowAlpha by animateFloatAsState(
+        targetValue = rowAlphaTarget, animationSpec = tween(300), label = "dotsAlpha"
+    )
+    val glowTarget = when {
+        !isPlaying -> 0.45f
+        isActiveDots -> 1f
+        else -> 0.3f
+    }
+    val glow by animateFloatAsState(
+        targetValue = glowTarget, animationSpec = tween(300), label = "dotsGlow"
+    )
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 14.dp)
+            .alpha(rowAlpha),
+        horizontalArrangement = Arrangement.spacedBy(
+            8.dp, Alignment.CenterHorizontally
+        ),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        for (d in 0 until dotsTotal) {
+            val on = d < filled && isActiveDots
+            // Fixed size + scale pop (scale never re-lays-out,
+            // so no cracking); glow carried by brightness.
+            Box(
+                modifier = Modifier
+                    .size(10.dp)
+                    .graphicsLayer(
+                        scaleX = if (on) 1.3f else 1f,
+                        scaleY = if (on) 1.3f else 1f
+                    )
+                    .background(
+                        color = when {
+                            on -> Color.White.copy(alpha = 0.60f + 0.40f * glow)
+                            isPastDots -> Color.White.copy(alpha = 0.30f)
+                            isFutureDots -> Color.White.copy(alpha = 0.30f)
+                            else -> Color.White.copy(alpha = 0.22f)
+                        },
+                        shape = androidx.compose.foundation.shape.CircleShape
+                    )
+            )
         }
     }
 }

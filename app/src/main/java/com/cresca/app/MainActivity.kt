@@ -1256,11 +1256,13 @@ fun AppleMusicAppContent(
             }
             if (nowPlaying?.id != t.id) return@LaunchedEffect
             if (dur <= 30000L) lyricsZeroDur = true
-            lyrics = LyricsRepository.fetch(t.artist, t.title, dur)
+            lyrics = LyricsRepository.fetch(t.id, t.artist, t.title, dur)
         }
     }
     // Duration arrived late: one background re-match with real data; swap
     // only on a strictly better (Synced) hit, never blank the screen.
+    // Caption-sourced lyrics are video-timed (no duration disambiguation
+    // needed), so they skip the re-match entirely.
     LaunchedEffect(nowPlaying?.id, duration) {
         val t = nowPlaying ?: return@LaunchedEffect
         if (!lyricsZeroDur || duration <= 30000L) return@LaunchedEffect
@@ -1268,10 +1270,14 @@ fun AppleMusicAppContent(
             lyricsZeroDur = false
             return@LaunchedEffect
         }
+        if ((lyrics as LyricsState.Synced).source == LyricSource.YOUTUBE_CAPTIONS) {
+            lyricsZeroDur = false
+            return@LaunchedEffect
+        }
         lyricsZeroDur = false
         try {
             val better = withContext(Dispatchers.IO) {
-                LyricsRepository.fetch(t.artist, t.title, duration)
+                LyricsRepository.fetch(t.id, t.artist, t.title, duration)
             }
             if (nowPlaying?.id == t.id && better is LyricsState.Synced) {
                 lyrics = better
@@ -2974,23 +2980,40 @@ private data class OverlayState(
     val showDots: Boolean
 )
 
-private fun overlayState(
-    lyrics: LyricsState,
-    positionMs: Long,
-    durationMs: Long
-): OverlayState {
-    if (lyrics !is LyricsState.Synced || lyrics.lines.isEmpty()) {
-        return OverlayState("", 0f, false)
-    }
-    val pos = positionMs.coerceAtLeast(0L)
-    val sorted = lyrics.lines.filter { it.text.isNotBlank() }.sortedBy { it.ms }
-    if (sorted.isEmpty()) return OverlayState("", 0f, false)
-    val line = sorted.indexOfLast { it.ms <= pos }
-        .takeIf { it >= 0 }?.let { sorted[it].text } ?: ""
+/** Sorted, non-blank lines for the overlay (memoized by the caller). */
+private fun sortedLyricLines(lyrics: LyricsState): List<LyricLine> {
     return try {
-        val rows = buildLyricRows(sorted, durationMs)
-        val ai = sorted.indexOfLast { it.ms <= pos }
-        val ar = activeRowIndex(rows, ai, pos)
+        val raw = (lyrics as? LyricsState.Synced)?.lines ?: return emptyList()
+        raw.filter { it.text.isNotBlank() }.sortedBy { it.ms }
+    } catch (e: Exception) {
+        emptyList()
+    }
+}
+
+/** Overlay from precomputed rows: O(log n) per tick, no rebuilds. */
+private fun overlayFor(
+    sorted: List<LyricLine>,
+    rows: List<LyricRow>,
+    positionMs: Long
+): OverlayState {
+    if (sorted.isEmpty()) return OverlayState("", 0f, false)
+    val pos = positionMs.coerceAtLeast(0L)
+    // Binary search: overlay ticks 6x/sec, linear scan is waste heat.
+    var lo = 0
+    var hi = sorted.size - 1
+    var found = -1
+    while (lo <= hi) {
+        val mid = (lo + hi) ushr 1
+        if (sorted[mid].ms <= pos) {
+            found = mid
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    val line = if (found >= 0) sorted[found].text else ""
+    return try {
+        val ar = activeRowIndex(rows, found, pos)
         val dots = rows.getOrNull(ar) as? LyricRow.Dots
         if (dots != null) {
             val span = (dots.toMs - dots.fromMs).coerceAtLeast(1L)
@@ -2999,6 +3022,20 @@ private fun overlayState(
         } else OverlayState(line, 0f, false)
     } catch (e: Exception) {
         OverlayState(line, 0f, false)
+    }
+}
+
+private fun overlayState(
+    lyrics: LyricsState,
+    positionMs: Long,
+    durationMs: Long
+): OverlayState {
+    val sorted = sortedLyricLines(lyrics)
+    if (sorted.isEmpty()) return OverlayState("", 0f, false)
+    return try {
+        overlayFor(sorted, buildLyricRows(sorted, durationMs), positionMs)
+    } catch (e: Exception) {
+        OverlayState("", 0f, false)
     }
 }
 
@@ -3641,7 +3678,11 @@ private fun FullPlayerSheet(
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically) {
                     Text("Lyrics", style = MaterialTheme.typography.titleMedium)
-                    Text("karaoke • via lrclib", style = MaterialTheme.typography.bodySmall,
+                    val srcLabel = when ((lyrics as? LyricsState.Synced)?.source) {
+                        LyricSource.YOUTUBE_CAPTIONS -> "karaoke • via YouTube captions"
+                        else -> "karaoke • via lrclib"
+                    }
+                    Text(srcLabel, style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 Spacer(Modifier.height(4.dp))
