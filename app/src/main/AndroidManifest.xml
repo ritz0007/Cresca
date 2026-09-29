@@ -15,11 +15,19 @@
         android:usesCleartextTraffic="false">
         <activity android:name=".MainActivity" android:exported="true"
             android:theme="@style/Theme.Cresca.Splash"
+            android:launchMode="singleTop"
             android:screenOrientation="portrait"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|density|fontScale">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Spotify OAuth redirect (PKCE, no secret): cresca://spotify-callback?code=… -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="cresca" android:host="spotify-callback" />
             </intent-filter>
         </activity>
         <receiver

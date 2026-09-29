@@ -915,6 +915,11 @@ object InnerTubeApi {
                     .put("contentCheckOk", true)
                 val json = post("player", client, body, cookies, visitorData, poToken, host, playerHttp)
                     ?: continue
+                try {
+                    val status = json.optJSONObject("playabilityStatus")?.optString("status") ?: ""
+                    Log.d(TAG, "captions $videoId ${client.clientName} status=$status")
+                } catch (e: Exception) {
+                }
                 val tracks = parseCaptionTracks(json)
                 if (tracks.isNotEmpty()) {
                     try {

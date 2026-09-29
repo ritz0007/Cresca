@@ -11,7 +11,11 @@ data class Playlist(
     val id: String,
     val name: String,
     val tracks: List<YtTrack>,
-    val createdAt: Long
+    val createdAt: Long,
+    /** Custom cover image path (filesDir). Blank = auto mosaic. */
+    val coverPath: String = "",
+    /** Spotify playlist id for live sync ("" = manual list). Rename-safe link. */
+    val spotifyId: String = ""
 )
 
 /**
@@ -102,6 +106,16 @@ object PlaylistStore {
                                 o.optLong("createdAt", 0L)
                             } catch (e: Exception) {
                                 0L
+                            },
+                            coverPath = try {
+                                o.optString("cover", "")
+                            } catch (e: Exception) {
+                                ""
+                            },
+                            spotifyId = try {
+                                o.optString("spotifyId", "")
+                            } catch (e: Exception) {
+                                ""
                             }
                         )
                     )
@@ -125,6 +139,8 @@ object PlaylistStore {
                     o.put("id", p.id)
                     o.put("name", p.name.take(120))
                     o.put("createdAt", p.createdAt)
+                    if (p.coverPath.isNotBlank()) o.put("cover", p.coverPath)
+                    if (p.spotifyId.isNotBlank()) o.put("spotifyId", p.spotifyId)
                     val tarr = JSONArray()
                     val seen = HashSet<String>()
                     for (t in p.tracks) {
@@ -247,7 +263,7 @@ object PlaylistStore {
         }
     }
 
-    fun create(ctx: Context, name: String): Playlist {
+    fun create(ctx: Context, name: String, spotifyId: String = ""): Playlist {
         val clean = try {
             name.trim().take(120).ifEmpty { "My Playlist" }
         } catch (e: Exception) {
@@ -262,7 +278,12 @@ object PlaylistStore {
             },
             name = clean,
             tracks = emptyList(),
-            createdAt = now
+            createdAt = now,
+            spotifyId = try {
+                spotifyId.trim()
+            } catch (e: Exception) {
+                ""
+            }
         )
         try {
             val all = list(ctx)
@@ -272,6 +293,90 @@ object PlaylistStore {
             Log.w(TAG, "create failed", e)
         }
         return p
+    }
+
+    /** Applies fn to one playlist, persists when non-null is returned. */
+    private fun update(ctx: Context, id: String, fn: (Playlist) -> Playlist?): Boolean {
+        try {
+            if (id.isBlank()) return false
+            val all = list(ctx)
+            val idx = all.indexOfFirst { it.id == id }
+            if (idx < 0) return false
+            val next = try {
+                fn(all[idx])
+            } catch (e: Exception) {
+                null
+            } ?: return false
+            all[idx] = next
+            saveAll(ctx, all)
+            return true
+        } catch (e: Exception) {
+            Log.w(TAG, "update failed", e)
+            return false
+        }
+    }
+
+    /** Renames a playlist. False when blank/unchanged/missing. */
+    fun rename(ctx: Context, id: String, name: String): Boolean {
+        val clean = try {
+            name.trim().take(120)
+        } catch (e: Exception) {
+            ""
+        }
+        if (clean.isBlank()) return false
+        return update(ctx, id) { p ->
+            if (p.name == clean) null else p.copy(name = clean)
+        }
+    }
+
+    /** Sets (or clears with "") a custom cover image path. */
+    fun setCover(ctx: Context, id: String, path: String): Boolean {
+        val clean = try {
+            path.trim()
+        } catch (e: Exception) {
+            ""
+        }
+        return update(ctx, id) { p ->
+            if (p.coverPath == clean) null else p.copy(coverPath = clean)
+        }
+    }
+
+    /** Links a local mirror to its Spotify playlist id (rename-safe sync). */
+    fun setSpotifyId(ctx: Context, id: String, spotifyId: String): Boolean {
+        return update(ctx, id) { p ->
+            p.copy(spotifyId = try {
+                spotifyId.trim()
+            } catch (e: Exception) {
+                ""
+            })
+        }
+    }
+
+    /**
+     * Stores gallery bytes as this playlist's cover (filesDir/covers,
+     * downscaled side-effect free: caller passes raw bytes, we cap size).
+     * Returns the stored path, or null on failure.
+     */
+    fun saveCoverFile(ctx: Context, playlistId: String, bytes: ByteArray): String? {
+        try {
+            if (playlistId.isBlank() || bytes.isEmpty()) return null
+            val safe = bytes.take(3 * 1024 * 1024).toByteArray()
+            val dir = File(ctx.filesDir, "covers")
+            try {
+                if (!dir.exists()) dir.mkdirs()
+            } catch (e: Exception) {
+            }
+            val dst = File(dir, playlistId.replace(Regex("[^A-Za-z0-9_-]"), "_").take(48) + ".jpg")
+            try {
+                dst.writeBytes(safe)
+            } catch (e: Exception) {
+                return null
+            }
+            return dst.absolutePath
+        } catch (e: Exception) {
+            Log.w(TAG, "cover save failed", e)
+            return null
+        }
     }
 
     fun delete(ctx: Context, id: String) {

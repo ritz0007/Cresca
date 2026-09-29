@@ -581,6 +581,110 @@ object YoutubeRepository {
         }
 
     /**
+     * Plain video search (music videos live here, not in music_songs).
+     * Same song gates as everything else (duration, lives, shorts, junk).
+     */
+    suspend fun searchVideos(query: String, max: Int = 20): List<YtTrack> =
+        withContext(Dispatchers.IO) {
+            ensureInit()
+            try {
+                val qh = YouTube.searchQHFactory.fromQuery(query, listOf("videos"), "")
+                val info = SearchInfo.getInfo(YouTube, qh)
+                info.relatedItems.filterIsInstance<StreamInfoItem>()
+                    .mapNotNull { toTrack(it) }
+                    .distinctBy { it.id }
+                    .take(max)
+                    .also {
+                        try {
+                            Log.d(TAG, "searchVideos '$query' ${it.size} hits")
+                        } catch (e: Exception) {
+                        }
+                    }
+            } catch (e: Exception) {
+                Log.w(TAG, "searchVideos failed ($query)", e)
+                emptyList()
+            }
+        }
+
+    /**
+     * Top charts flattened (Top 100 page): every charts shelf in order,
+     * distinct. Falls back to trending songs when charts are empty.
+     */
+    suspend fun chartTopVideos(max: Int = 100): List<YtTrack> =
+        withContext(Dispatchers.IO) {
+            if (innerTubeAllowed()) {
+                try {
+                    val shelves = com.cresca.app.innertube.InnerTubeApi.browseShelves(
+                        "FEmusic_charts", sessionCookies(), sessionVisitor(), sessionPoToken(),
+                        maxShelves = 8, perShelf = 25
+                    )
+                    val out = shelves.values.flatten().distinctBy { it.id }.take(max)
+                    if (out.isNotEmpty()) {
+                        Log.d(TAG, "chart top ${out.size} via InnerTube")
+                        return@withContext out
+                    }
+                } catch (e: Exception) {
+                    Log.d(TAG, "chart top failed: ${e.message}")
+                }
+            }
+            try {
+                trendingMusic(max.coerceAtMost(25))
+            } catch (e: Exception) {
+                emptyList()
+            }
+        }
+
+    /**
+     * Trending MUSIC VIDEOS (not art-tracks): charts shelves already carry
+     * real video watch pages — prefer a "video" shelf, else first shelf.
+     * Fallback resolves chart songs to official videos (slower).
+     */
+    suspend fun trendingVideoTracks(max: Int = 10): List<YtTrack> =
+        withContext(Dispatchers.IO) {
+            if (innerTubeAllowed()) {
+                try {
+                    val shelves = com.cresca.app.innertube.InnerTubeApi.browseShelves(
+                        "FEmusic_charts", sessionCookies(), sessionVisitor(), sessionPoToken(),
+                        maxShelves = 5, perShelf = max
+                    )
+                    val ranked = try {
+                        shelves.entries.sortedByDescending { (title, _) ->
+                            if (title.lowercase().contains("video")) 1 else 0
+                        }.flatMap { it.value }
+                    } catch (e: Exception) {
+                        shelves.values.flatten()
+                    }
+                    val out = ranked.distinctBy { it.id }.take(max)
+                    if (out.isNotEmpty()) {
+                        Log.d(TAG, "trending videos ${out.size} via InnerTube charts")
+                        return@withContext out
+                    }
+                    Log.d(TAG, "trending videos InnerTube empty, falling back")
+                } catch (e: Exception) {
+                    Log.d(TAG, "trending videos InnerTube failed, fallback: ${e.message}")
+                }
+            }
+            try {
+                val songs = trendingMusic(6)
+                val out = ArrayList<YtTrack>()
+                val seen = HashSet<String>()
+                for (s in songs) {
+                    if (out.size >= max) break
+                    val v = try {
+                        resolveMusicVideo(s)
+                    } catch (e: Exception) {
+                        null
+                    } ?: continue
+                    if (seen.add(v.id)) out.add(v)
+                }
+                out
+            } catch (e: Exception) {
+                Log.w(TAG, "trending videos fallback failed", e)
+                emptyList()
+            }
+        }
+
+    /**
      * True new releases: latest uploads from the artists' own channels
      * (channel feeds are newest-first), round-robin interleaved.
      * Falls back to a "new songs" music search when the library is empty.
@@ -1158,6 +1262,120 @@ object YoutubeRepository {
                 audioFlight.remove(watchUrl, mine)
             } catch (e: Exception) {
             }
+        }
+    }
+
+    /**
+     * YTM-style music→video switch: the queue holds the ART-TRACK id
+     * (static thumbnail audio), but video mode must play the OFFICIAL
+     * MUSIC VIDEO (a different videoId). Searches
+     * "<title> <artist> official music video", scores candidates by
+     * song-core overlap + video signals, returns the best distinct id.
+     * Null when the seed already looks like a video or nothing matches
+     * (caller falls back to same-id muxed streams).
+     */
+    suspend fun resolveMusicVideo(seed: YtTrack, max: Int = 10): YtTrack? =
+        withContext(Dispatchers.IO) {
+            try {
+                if (seed.title.isBlank()) return@withContext null
+                val seedLow = seed.title.lowercase()
+                // Already a video: don't bounce to a different upload.
+                if (seedLow.contains("official video") || seedLow.contains("music video") ||
+                    seedLow.contains("official mv") || Regex("""\bmv\b""").containsMatchIn(seedLow)
+                ) return@withContext seed
+                val queries = listOf(
+                    "${seed.title} ${seed.artist} official music video",
+                    "${seed.title} ${seed.artist} music video"
+                )
+                val seen = HashSet<String>()
+                val pool = ArrayList<YtTrack>()
+                for (q in queries) {
+                    try {
+                        val hits = searchMusic(q, max)
+                        for (h in hits) {
+                            if (seen.add(h.id)) pool.add(h)
+                        }
+                        if (pool.any { scoreVideoCandidate(seed, it) >= 10 }) break
+                    } catch (e: Exception) {
+                    }
+                }
+                pool.filter { it.id != seed.id }
+                    .sortedByDescending { scoreVideoCandidate(seed, it) }
+                    .firstOrNull { scoreVideoCandidate(seed, it) > 0 }
+                    .also {
+                        try {
+                            Log.d(TAG, "resolveMusicVideo '${seed.title}' -> '${it?.title}' score=${if (it != null) scoreVideoCandidate(seed, it) else "none"}")
+                        } catch (e: Exception) {
+                        }
+                    }
+            } catch (e: Exception) {
+                null
+            }
+        }
+
+    /**
+     * Pure score for music-video candidates (unit-tested). Positive =
+     * same song + looks like an official video; <=0 = reject.
+     */
+    internal fun scoreVideoCandidate(seed: YtTrack, c: YtTrack): Int {
+        return try {
+            if (c.id == seed.id) return -100
+            var s = 0
+            // Song-core overlap: same song is mandatory.
+            if (isSameName(c, seed)) {
+                s += 6
+            } else {
+                fun words(t: String): Set<String> {
+                    var x = t.lowercase().replace(Regex("""[\(\[].*?[\)\]]"""), " ")
+                    x = x.replace(Regex("""[^a-z0-9 ]"""), " ")
+                    return x.split(Regex("""\s+""")).map { it.trim() }
+                        .filter { it.length > 2 }
+                        .filterNot {
+                            it in setOf(
+                                "official", "video", "music", "audio", "lyrics",
+                                "lyric", "visualizer", "song", "songs", "full",
+                                "the", "feat", "featuring"
+                            )
+                        }.toSet()
+                }
+                val sw = words(seed.title)
+                val cw = words(c.title)
+                if (sw.isEmpty() || cw.isEmpty()) return -10
+                val overlap = sw.intersect(cw).size
+                when {
+                    overlap >= 2 -> s += 3
+                    overlap == 1 -> s += 1
+                    else -> return -10
+                }
+            }
+            // Artist token match helps; mismatch is NOT penalized
+            // (official uploads are often under a label, not the singer).
+            try {
+                val st = seed.artist.lowercase().split(Regex("""\s+"""))
+                    .map { it.trim() }.filter { it.length > 2 }.toSet()
+                val ct = (c.artist.lowercase() + " " + c.title.lowercase())
+                if (st.isNotEmpty() && st.any { ct.contains(it) }) s += 3
+            } catch (e: Exception) {
+            }
+            val t = c.title.lowercase()
+            when {
+                t.contains("official music video") || t.contains("official video") -> s += 4
+                t.contains("music video") -> s += 3
+                t.contains("official") -> s += 2
+                Regex("""\bmv\b""").containsMatchIn(t) -> s += 1
+            }
+            // Art-track / non-video signals sink hard.
+            if (t.contains("lyric")) s -= 4
+            if (t.contains("audio") && !t.contains("video")) s -= 3
+            if (t.contains("slowed") || t.contains("reverb")) s -= 5
+            if (t.contains("cover")) s -= 5
+            if (t.contains("remix")) s -= 3
+            if (t.contains("karaoke")) s -= 5
+            if (t.contains("reaction")) s -= 5
+            if (t.contains("live") && !seed.title.lowercase().contains("live")) s -= 2
+            s
+        } catch (e: Exception) {
+            -10
         }
     }
 

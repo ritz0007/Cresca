@@ -4,6 +4,28 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+import java.util.Properties
+import java.util.Base64
+
+// Spotify client ID: read from gitignored local.properties
+// (spotify.clientId=…), baked into BuildConfig XOR+Base64 so the APK
+// never holds it plaintext and the repo never holds it at all.
+val spotifyIdRaw: String = try {
+    Properties().let { p ->
+        val f = rootProject.file("local.properties")
+        if (f.exists()) f.inputStream().use { p.load(it) }
+        p.getProperty("spotify.clientId", "") ?: ""
+    }
+} catch (e: Exception) { "" }
+
+fun obfSpotify(s: String): String {
+    if (s.isEmpty()) return ""
+    val key = "cresca-spotify-obf".toByteArray(Charsets.UTF_8)
+    val b = s.toByteArray(Charsets.UTF_8)
+    for (i in b.indices) b[i] = (b[i].toInt() xor key[i % key.size].toInt()).toByte()
+    return Base64.getEncoder().encodeToString(b)
+}
+
 android {
     namespace = "com.cresca.app"
     compileSdk = 36
@@ -11,8 +33,9 @@ android {
         applicationId = "com.cresca.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 17
-        versionName = "1.3.0"
+        versionCode = 18
+        versionName = "1.4.0"
+        buildConfigField("String", "SPOTIFY_CLIENT_ID_OBF", "\"${obfSpotify(spotifyIdRaw)}\"")
     }
     // Per-device APKs (arm64 for modern phones, armv7 for old 32-bit,
     // x86_64 for emulators/Chromebooks) + one universal fallback.
@@ -24,7 +47,7 @@ android {
             isUniversalApk = true
         }
     }
-    buildFeatures { compose = true }
+    buildFeatures { compose = true; buildConfig = true }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -59,7 +82,6 @@ dependencies {
     implementation("dev.chrisbanes.haze:haze-materials:1.7.2")
     debugImplementation("androidx.compose.ui:ui-tooling")
     testImplementation("junit:junit:4.13.2")
-    // Real org.json for JVM unit tests (Android stub throws "not mocked").
     testImplementation("org.json:json:20240303")
 }
 

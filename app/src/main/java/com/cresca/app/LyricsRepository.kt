@@ -441,12 +441,14 @@ object LyricsRepository {
                 val lines = withTimeoutOrNull(8000L) {
                     YoutubeRepository.captionLines(videoId)
                 }
+                Log.d(TAG, "lyrics newpipe fallback: lines=${lines?.size ?: "null"}")
                 if (lines != null && lines.size >= 3) {
                     return@withContext LyricsState.Synced(
                         lines, LyricSource.YOUTUBE_CAPTIONS
                     )
                 }
             } catch (e: Exception) {
+                Log.d(TAG, "lyrics newpipe error: ${e.message}")
             }
             LyricsState.NotFound
         }
