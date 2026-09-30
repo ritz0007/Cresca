@@ -1,5 +1,40 @@
 # Changelog — Cresca Music
 
+## 1.4.1
+- Updater reliability: verified-complete installs only (partial files no
+  longer reach the installer — no more "problem parsing the package"),
+  failed downloads are cleaned with their record, unknown-apps permission
+  is checked first with a deep-link to the exact settings page + auto-
+  continue on return, releases-list fallback + no-cache + manual retry,
+  live download % bar in Profile, stale banners cleared
+- Library + Profile redesign: gradient hero with counts, quick-action
+  tiles, full-bleed overlay playlist cards with stagger, grouped iOS-
+  style settings cards with staggered entrances
+- Clean artist names everywhere ("Video"/"Song" uploaders resolve to the
+  real singer or Unknown Artist, never junk)
+- Real artist search (multiple artists with art per query), Artists row
+  in search, rich artist pages (stats, Play/Shuffle, favorite heart),
+  Favorite Artists strip in Library
+- Song Radio rework: radios persist as square cards (like, save as
+  playlist, endless songs sheet), player 3-dot menu gains Start radio
+
+## 1.4.0
+- Spotify import + live sync: one-tap login (baked client ID, PKCE, no
+  secret in repo/APK), background import with live Library growth,
+  kill-safe resume, 6-hour mirror sync (adds/removes), taste seeds
+- Music-video toggle fix: music→video now resolves the official music
+  video (YTM parity) instead of replaying the art-track
+- Trending videos: home rail after Top Picks (muted autoplay + mute
+  toggle, tap plays the video) + new Trending tab (Top 100 Global,
+  Hindi, International, Telugu, Punjabi, weekly cache)
+- Song Radio: endless chained radio from any 3-dot menu, lives in the
+  Radio tab and grows as you scroll (200/session cap)
+- Artist pages: tap any artist name (rows, player, search Artists row)
+  for top songs + Play/Shuffle; label-ish names filtered
+- Playlist rename + custom gallery covers; Apple-style playlist header
+  (big art, round Play, Shuffle, edit)
+- Search results now include an Artists row
+
 ## 1.3.0
 - Player blend rebuild: artwork dissolves into the blurred backdrop (no
   edge, no black boxes), title lives below on the blend, lateral slide

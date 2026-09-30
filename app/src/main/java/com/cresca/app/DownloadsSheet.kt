@@ -81,7 +81,7 @@ fun DownloadsSheet(
                             )
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Text(
-                                    text = track.artist,
+                                    text = track.displayArtist(),
                                     style = MaterialTheme.typography.bodySmall,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,

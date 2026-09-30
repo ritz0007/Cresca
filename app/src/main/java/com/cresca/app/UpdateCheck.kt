@@ -78,54 +78,98 @@ object UpdateCheck {
 
     suspend fun latest(): Update? =
         withContext(Dispatchers.IO) {
+            // Primary: latest non-draft release. Fallback: newest entry of
+            // the releases list (covers API hiccups on the /latest alias).
             try {
-                val client = OkHttpClient.Builder()
-                    .connectTimeout(15, TimeUnit.SECONDS)
-                    .readTimeout(15, TimeUnit.SECONDS)
-                    .build()
-                val req = Request.Builder()
-                    .url("https://api.github.com/repos/" + REPO + "/releases/latest")
-                    .header("User-Agent", "Cresca")
-                    .header("Accept", "application/vnd.github+json")
-                    .get().build()
-                client.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) {
-                        return@withContext null
-                    }
-                    val json = JSONObject(resp.body?.string() ?: "")
-                    val tag = json.optString("tag_name", "")
-                    val url = json.optString("html_url", "")
-                    if (tag.isBlank() || url.isBlank()) {
-                        return@withContext null
-                    }
-                    // Direct APK asset for this device (seamless download).
-                    var apkUrl = ""
-                    var apkName = ""
-                    try {
-                        val assets = json.optJSONArray("assets")
-                        if (assets != null) {
-                            val names = ArrayList<Pair<String, String>>()
-                            for (i in 0 until assets.length()) {
-                                val a = assets.optJSONObject(i) ?: continue
-                                val n = a.optString("name", "")
-                                val u = a.optString("browser_download_url", "")
-                                if (n.endsWith(".apk") && u.isNotBlank()) names.add(Pair(n, u))
-                            }
-                            val pick = pickApkAsset(names)
-                            if (pick != null) {
-                                apkName = pick.first
-                                apkUrl = pick.second
-                            }
-                        }
-                    } catch (e: Exception) {
-                    }
-                    Update(tag, url, apkUrl, apkName)
-                }
+                fetchRelease(
+                    "https://api.github.com/repos/" + REPO + "/releases/latest",
+                    single = true
+                )?.let { return@withContext it }
+            } catch (e: Exception) {
+            }
+            try {
+                fetchRelease(
+                    "https://api.github.com/repos/" + REPO + "/releases?per_page=5",
+                    single = false
+                )
             } catch (e: Exception) {
                 Log.w(TAG, "update check failed", e)
                 null
             }
         }
+
+    private fun client(): OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .build()
+
+    private fun fetchRelease(url: String, single: Boolean): Update? {
+        return try {
+            val req = Request.Builder()
+                .url(url)
+                .header("User-Agent", "Cresca")
+                .header("Accept", "application/vnd.github+json")
+                .header("Cache-Control", "no-cache")
+                .get().build()
+            client().newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return null
+                val text = resp.body?.string() ?: return null
+                if (single) {
+                    parseRelease(JSONObject(text))
+                } else {
+                    val arr = try {
+                        org.json.JSONArray(text)
+                    } catch (e: Exception) {
+                        return null
+                    }
+                    for (i in 0 until arr.length()) {
+                        try {
+                            parseRelease(arr.optJSONObject(i) ?: continue)?.let { return it }
+                        } catch (e: Exception) {
+                        }
+                    }
+                    null
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "update fetch failed", e)
+            null
+        }
+    }
+
+    /** Pure: one release JSON → Update, or null (drafts/missing fields). Testable. */
+    internal fun parseRelease(json: JSONObject): Update? {
+        return try {
+            if (json.optBoolean("draft", false)) return null
+            val tag = json.optString("tag_name", "")
+            val url = json.optString("html_url", "")
+            if (tag.isBlank() || url.isBlank()) return null
+            // Direct APK asset for this device (seamless download).
+            var apkUrl = ""
+            var apkName = ""
+            try {
+                val assets = json.optJSONArray("assets")
+                if (assets != null) {
+                    val names = ArrayList<Pair<String, String>>()
+                    for (i in 0 until assets.length()) {
+                        val a = assets.optJSONObject(i) ?: continue
+                        val n = a.optString("name", "")
+                        val u = a.optString("browser_download_url", "")
+                        if (n.endsWith(".apk") && u.isNotBlank()) names.add(Pair(n, u))
+                    }
+                    val pick = pickApkAsset(names)
+                    if (pick != null) {
+                        apkName = pick.first
+                        apkUrl = pick.second
+                    }
+                }
+            } catch (e: Exception) {
+            }
+            Update(tag, url, apkUrl, apkName)
+        } catch (e: Exception) {
+            null
+        }
+    }
 
     // True when latest is a higher dotted version than current.
     fun isNewer(current: String, latest: String): Boolean {

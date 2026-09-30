@@ -51,4 +51,54 @@ class UpdateCheckTest {
         assertFalse(UpdateCheck.isNewer("1.1.0", "1.0.0"))
         assertTrue(UpdateCheck.isNewer("1.0.0", "v1.0.1"))
     }
+
+    @Test
+    fun isNewer_edges() {
+        assertFalse(UpdateCheck.isNewer("1.4.0", "v1.4.0"))
+        assertTrue(UpdateCheck.isNewer("1.4", "1.4.1"))
+        assertFalse(UpdateCheck.isNewer("1.4.1", "1.4"))
+        assertTrue(UpdateCheck.isNewer("1.9.9", "1.10.0"))
+        assertFalse(UpdateCheck.isNewer("", ""))
+        assertFalse(UpdateCheck.isNewer("1.4.0", ""))
+    }
+
+    private fun releaseJson(
+        tag: String = "v1.4.0",
+        url: String = "https://github.com/x/y/releases/tag/v1.4.0",
+        draft: Boolean = false,
+        apkName: String = "Cresca-1.4.0-universal.apk"
+    ): org.json.JSONObject {
+        val assets = org.json.JSONArray().put(
+            org.json.JSONObject()
+                .put("name", apkName)
+                .put("browser_download_url", "https://x/$apkName")
+        )
+        return org.json.JSONObject()
+            .put("tag_name", tag)
+            .put("html_url", url)
+            .put("draft", draft)
+            .put("assets", assets)
+    }
+
+    @Test
+    fun parseRelease_roundTrip() {
+        val u = UpdateCheck.parseRelease(releaseJson())!!
+        assertEquals("v1.4.0", u.tag)
+        assertEquals("Cresca-1.4.0-universal.apk", u.apkName)
+        assertEquals("https://x/Cresca-1.4.0-universal.apk", u.apkUrl)
+    }
+
+    @Test
+    fun parseRelease_rejectsDraftAndBlanks() {
+        assertNull(UpdateCheck.parseRelease(releaseJson(draft = true)))
+        assertNull(UpdateCheck.parseRelease(releaseJson(tag = "")))
+        assertNull(UpdateCheck.parseRelease(releaseJson(url = "")))
+    }
+
+    @Test
+    fun parseRelease_noApkStillUsable() {
+        val u = UpdateCheck.parseRelease(releaseJson(apkName = "notes.txt"))!!
+        assertEquals("v1.4.0", u.tag)
+        assertEquals("", u.apkUrl)
+    }
 }

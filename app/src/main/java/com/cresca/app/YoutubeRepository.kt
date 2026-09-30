@@ -60,6 +60,40 @@ internal fun isMusicJunk(title: String, artist: String): Boolean {
     }
 }
 
+/** True for label-ish uploader names that are never real artists. */
+internal fun isArtistLike(name: String): Boolean {
+    return try {
+        val low = name.trim().lowercase()
+        if (low.isEmpty()) return false
+        !(low == "youtube" || low == "song" || low == "songs" ||
+            low == "video" || low == "videos" || low == "episode" ||
+            low == "episodes" || low == "podcast" || low == "music" ||
+            low == "unknown artist" ||
+            low.contains("official") || low.contains("films") ||
+            low.contains("records"))
+    } catch (e: Exception) {
+        false
+    }
+}
+
+/**
+ * Display artist: label-ish uploaders ("Video", "Song") resolve to the
+ * "Artist - Title" prefix when sane, else "Unknown Artist". Never blank.
+ */
+internal fun YtTrack.displayArtist(): String {
+    return try {
+        val a = artist.trim()
+        if (isArtistLike(a)) return a.ifBlank { "Unknown Artist" }
+        val dash = title.indexOf(" - ")
+        if (dash in 2..80) {
+            val cand = title.substring(0, dash).trim()
+            if (cand.length in 2..60 && isArtistLike(cand)) return cand
+        }
+        "Unknown Artist"
+    } catch (e: Exception) {
+        "Unknown Artist"
+    }
+}
 /** True for YouTube Shorts URLs (never songs-in-queue material). */
 internal fun isShortsUrl(url: String): Boolean {
     return try {
@@ -99,6 +133,27 @@ private class OkHttpDownloader(private val client: OkHttpClient) : Downloader() 
                 request.url()
             )
         }
+    }
+}
+
+/** One artist hit: name + art + subscriber label. */
+data class YtArtist(
+    val name: String,
+    val thumbUrl: String,
+    val subs: String = ""
+)
+
+internal fun fmtSubs(count: Long): String {
+    return try {
+        when {
+            count <= 0L -> ""
+            count >= 1_000_000_000L -> "${(count / 100_000_000L) / 10.0}B"
+            count >= 1_000_000L -> "${(count / 100_000L) / 10.0}M"
+            count >= 1_000L -> "${(count / 100L) / 10.0}K"
+            else -> count.toString()
+        }
+    } catch (e: Exception) {
+        ""
     }
 }
 
@@ -576,6 +631,57 @@ object YoutubeRepository {
                     .take(max)
             } catch (e: Exception) {
                 Log.w(TAG, "trending failed", e)
+                emptyList()
+            }
+        }
+
+    /**
+     * Real artist results (YT Music artist shelf): channel hits with art
+     * + subscriber counts — multiple artists per query, not one echo.
+     */
+    suspend fun searchArtists(query: String, max: Int = 8): List<YtArtist> =
+        withContext(Dispatchers.IO) {
+            ensureInit()
+            try {
+                val qh = YouTube.searchQHFactory.fromQuery(
+                    query, listOf("music_artists"), ""
+                )
+                val info = SearchInfo.getInfo(YouTube, qh)
+                info.relatedItems.filterIsInstance<ChannelInfoItem>()
+                    .mapNotNull { c ->
+                        try {
+                            val name = try {
+                                c.name?.trim() ?: ""
+                            } catch (e: Exception) {
+                                ""
+                            }
+                            if (name.isBlank()) return@mapNotNull null
+                            val thumb = try {
+                                c.thumbnails.maxByOrNull { it.height }?.url ?: ""
+                            } catch (e: Exception) {
+                                ""
+                            }
+                            val subs = try {
+                                val n = c.subscriberCount
+                                if (n > 0L) fmtSubs(n) + " subscribers" else ""
+                            } catch (e: Exception) {
+                                ""
+                            }
+                            YtArtist(name, thumb, subs)
+                        } catch (e: Exception) {
+                            null
+                        }
+                    }
+                    .distinctBy { it.name.lowercase() }
+                    .take(max)
+                    .also {
+                        try {
+                            Log.d(TAG, "searchArtists '$query' ${it.size} hits")
+                        } catch (e: Exception) {
+                        }
+                    }
+            } catch (e: Exception) {
+                Log.w(TAG, "searchArtists failed ($query)", e)
                 emptyList()
             }
         }

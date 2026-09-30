@@ -33,8 +33,8 @@ android {
         applicationId = "com.cresca.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 18
-        versionName = "1.4.0"
+        versionCode = 19
+        versionName = "1.4.1"
         buildConfigField("String", "SPOTIFY_CLIENT_ID_OBF", "\"${obfSpotify(spotifyIdRaw)}\"")
     }
     // Per-device APKs (arm64 for modern phones, armv7 for old 32-bit,

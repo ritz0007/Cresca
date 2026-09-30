@@ -189,13 +189,54 @@ object UpdateDownload {
         }
     }
 
-    /** True while our download is still in flight (file not on disk yet). */
+    /** True while our download is still in flight (status-gated, so a
+     * half-written file never counts as "not active"). */
     fun hasActiveDownload(ctx: Context): Boolean {
         return try {
             val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             if (prefs.getLong(KEY_DL_ID, -1L) < 0L) return false
-            if (downloadedFile(ctx) != null) return false
             queryProgress(ctx) != null
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * True only when our download verifiably finished. A present-but-
+     * partial file (killed/failed download) is deleted with its record
+     * instead of being offered to the installer (which then shows the
+     * misleading "problem parsing the package" dialog).
+     */
+    fun isDownloadComplete(ctx: Context): Boolean {
+        return try {
+            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val id = prefs.getLong(KEY_DL_ID, -1L)
+            if (id >= 0L) {
+                try {
+                    val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                    dm.query(DownloadManager.Query().setFilterById(id))?.use { c ->
+                        if (c.moveToFirst()) {
+                            val status = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+                            if (status == DownloadManager.STATUS_SUCCESSFUL) return true
+                            if (status == DownloadManager.STATUS_RUNNING ||
+                                status == DownloadManager.STATUS_PENDING ||
+                                status == DownloadManager.STATUS_PAUSED
+                            ) return false
+                            // FAILED or unknown end-state: drop the (likely
+                            // partial) file + record so nothing stale lingers.
+                            try {
+                                downloadedFile(ctx)?.delete()
+                            } catch (e: Exception) {
+                            }
+                            clearRecord(ctx)
+                            return false
+                        }
+                    }
+                } catch (e: Exception) {
+                }
+            }
+            // No record (very old installs): a silent finished file counts.
+            downloadedFile(ctx) != null
         } catch (e: Exception) {
             false
         }
@@ -339,8 +380,14 @@ class UpdateActionReceiver : BroadcastReceiver() {
                         ""
                     }
                     // Keep the record (don't clear): Settings tap + the
-                    // in-app auto-offer resolve the file from it.
-                    val file = UpdateDownload.downloadedFile(app)
+                    // in-app auto-offer resolve the file from it. Only a
+                    // VERIFIED finish earns the installer (partials fail
+                    // parsing and look like a broken updater).
+                    val file = if (UpdateDownload.isDownloadComplete(app)) {
+                        UpdateDownload.downloadedFile(app)
+                    } else {
+                        null
+                    }
                     if (file != null) {
                         UpdateDownload.notifyReady(app, tag, file)
                     }

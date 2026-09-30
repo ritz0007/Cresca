@@ -150,25 +150,10 @@ private fun hdThumb(t: YtTrack): String {
     return t.thumbUrl
 }
 
-// Label-ish uploader names are never artists (same blocklist as the
-// autoplay filler): tapping them must not open junk artist pages.
-private fun isArtistLike(name: String): Boolean {
-    return try {
-        val low = name.trim().lowercase()
-        if (low.isEmpty()) return false
-        !(low == "youtube" || low == "song" || low == "songs" ||
-            low == "video" || low == "videos" || low == "episode" ||
-            low == "episodes" || low == "podcast" || low == "music" ||
-            low.contains("official") || low.contains("films") ||
-            low.contains("records"))
-    } catch (e: Exception) {
-        false
-    }
-}
 private fun metaFor(t: YtTrack): androidx.media3.common.MediaMetadata {
     val b = androidx.media3.common.MediaMetadata.Builder()
         .setTitle(t.title)
-        .setArtist(t.artist)
+        .setArtist(t.displayArtist())
     try {
         if (t.thumbUrl.isNotBlank()) {
             b.setArtworkUri(android.net.Uri.parse(t.thumbUrl))
@@ -623,11 +608,16 @@ fun AppleMusicAppContent(
     var newTracks by remember { mutableStateOf<List<YtTrack>>(emptyList()) }
     val recent = remember { mutableStateListOf<YtTrack>() }
     var liked by remember { mutableStateOf<List<YtTrack>>(emptyList()) }
+    var likedArtists by remember { mutableStateOf<List<LikedArtist>>(emptyList()) }
     // Likes + real history load off the main thread (file IO must never
     // block composition). Recent is the lifetime list (300, persisted).
     LaunchedEffect(Unit) {
         try {
             liked = withContext(Dispatchers.IO) { LikedStore.load(context) }
+        } catch (e: Exception) {
+        }
+        try {
+            likedArtists = withContext(Dispatchers.IO) { LikedArtists.load(context) }
         } catch (e: Exception) {
         }
         try {
@@ -855,6 +845,173 @@ fun AppleMusicAppContent(
             }
         }
     }
+    // Update check: once a day automatically (banner + system
+    // notification), plus a manual "Check for updates" in Settings that
+    // bypasses the daily gate and reports the result on screen.
+    var update by remember { mutableStateOf<UpdateCheck.Update?>(null) }
+    var updateChecking by remember { mutableStateOf(false) }
+    var updateStatus by remember { mutableStateOf("") }
+    // Live download fraction (null = not downloading) + unknown-apps
+    // permission + a parked update waiting on that permission.
+    var updateProgress by remember { mutableStateOf<Float?>(null) }
+    var updateCanInstall by remember { mutableStateOf(true) }
+    var updatePending by remember { mutableStateOf(false) }
+    fun refreshUpdateInstallState() {
+        try {
+            updateCanInstall = UpdateInstall.canInstall(context)
+        } catch (e: Exception) {
+        }
+    }
+    /** Drops a banner for a version we already run (stale across installs). */
+    fun dropStaleUpdate() {
+        try {
+            val u = update ?: return
+            val current = try {
+                UpdateCheck.currentVersion(context)
+            } catch (e: Exception) {
+                return
+            }
+            if (!UpdateCheck.isNewer(current, u.tag)) update = null
+        } catch (e: Exception) {
+        }
+    }
+    // Seamless update: direct APK download for this device, installer on
+    // completion. Release page only when no matching asset exists.
+    // (watchUpdateDownload first: local funs can't forward-reference.)
+    // Download watcher: live % in Settings + one-shot installer pop when
+    // the file lands (covers missed/denied notifications).
+    fun watchUpdateDownload(tag: String) {
+        scope.launch(Dispatchers.IO) {
+            try {
+                var offered = false
+                while (true) {
+                    delay(2000)
+                    try {
+                        // Verified finish only: a half-written file must
+                        // never reach the installer (parse-error dialog).
+                        val done = if (UpdateDownload.isDownloadComplete(context)) {
+                            UpdateDownload.downloadedFile(context)
+                        } else {
+                            null
+                        }
+                        if (done != null) {
+                            withContext(Dispatchers.Main) {
+                                updateProgress = 1f
+                                updateStatus = "Downloaded — tap to install"
+                            }
+                            if (!offered) {
+                                offered = true
+                                if (UpdateDownload.takeOffer(context, tag)) {
+                                    withContext(Dispatchers.Main) {
+                                        try {
+                                            if (UpdateInstall.canInstall(context)) {
+                                                UpdateDownload.installFile(context, done)
+                                            } else {
+                                                updateStatus = "Downloaded — allow installs to continue"
+                                                updatePending = true
+                                                UpdateInstall.openUnknownAppsSettings(context)
+                                            }
+                                        } catch (e: Exception) {
+                                        }
+                                    }
+                                }
+                            }
+                            return@launch
+                        }
+                        if (!UpdateDownload.hasActiveDownload(context)) {
+                            withContext(Dispatchers.Main) {
+                                updateProgress = null
+                            }
+                            return@launch
+                        }
+                        val p = UpdateDownload.queryProgress(context)
+                        if (p != null) {
+                            val pct = if (p.second > 0L) {
+                                ((p.first * 100L) / p.second).toInt().coerceIn(0, 100)
+                            } else -1
+                            withContext(Dispatchers.Main) {
+                                updateProgress = if (pct >= 0) pct / 100f else null
+                                updateStatus = if (pct >= 0) "Downloading $tag… $pct%"
+                                else "Downloading $tag…"
+                            }
+                        }
+                    } catch (e: Exception) {
+                        try {
+                            withContext(Dispatchers.Main) { updateProgress = null }
+                        } catch (e2: Exception) {
+                        }
+                        return@launch
+                    }
+                }
+            } catch (e: Exception) {
+            }
+        }
+    }
+    fun downloadUpdate(u: UpdateCheck.Update?) {
+        if (u == null) return
+        // Unknown-apps permission first: without it the installer intent
+        // dies silently and the download looks broken. Park + deep-link.
+        if (!UpdateInstall.canInstall(context)) {
+            updatePending = true
+            updateStatus = "Allow installs from Cresca to continue…"
+            try {
+                UpdateInstall.openUnknownAppsSettings(context)
+            } catch (e: Exception) {
+            }
+            return
+        }
+        scope.launch(Dispatchers.IO) {
+            try {
+                val ready = if (UpdateDownload.isDownloadComplete(context)) {
+                    UpdateDownload.downloadedFile(context)
+                } else {
+                    null
+                }
+                if (ready != null) {
+                    withContext(Dispatchers.Main) {
+                        updateStatus = "Downloaded — opening installer…"
+                        try {
+                            UpdateDownload.installFile(context, ready)
+                        } catch (e: Exception) {
+                        }
+                    }
+                    return@launch
+                }
+            } catch (e: Exception) {
+            }
+            if (u.apkUrl.isBlank()) {
+                withContext(Dispatchers.Main) {
+                    try {
+                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u.url)))
+                    } catch (e: Exception) {
+                    }
+                }
+                return@launch
+            }
+            withContext(Dispatchers.Main) {
+                updateProgress = 0f
+                updateStatus = "Downloading ${u.tag}…"
+            }
+            val ok = try {
+                UpdateDownload.startDownload(context, u)
+            } catch (e: Exception) {
+                false
+            }
+            if (ok) {
+                watchUpdateDownload(u.tag)
+            }
+            if (!ok) {
+                withContext(Dispatchers.Main) {
+                    updateProgress = null
+                    updateStatus = "Download failed — opening release page"
+                    try {
+                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u.url)))
+                    } catch (e: Exception) {
+                    }
+                }
+            }
+        }
+    }
     LaunchedEffect(showProfile) {
         if (!showProfile) return@LaunchedEffect
         try {
@@ -863,6 +1020,23 @@ fun AppleMusicAppContent(
         }
         try {
             maybeResumeSpotifyImport()
+        } catch (e: Exception) {
+        }
+        // Update hygiene on every Profile open: permission state, stale
+        // banner, and a parked update waiting on the permission grant.
+        try {
+            refreshUpdateInstallState()
+        } catch (e: Exception) {
+        }
+        try {
+            dropStaleUpdate()
+        } catch (e: Exception) {
+        }
+        try {
+            if (updatePending && updateCanInstall && update != null) {
+                updatePending = false
+                downloadUpdate(update)
+            }
         } catch (e: Exception) {
         }
     }
@@ -893,6 +1067,19 @@ fun AppleMusicAppContent(
                     }
                     try {
                         maybeResumeSpotifyImport()
+                    } catch (e2: Exception) {
+                    }
+                    // Back from the unknown-apps settings page: refresh the
+                    // permission and auto-continue a parked update.
+                    try {
+                        refreshUpdateInstallState()
+                    } catch (e2: Exception) {
+                    }
+                    try {
+                        if (updatePending && updateCanInstall && update != null) {
+                            updatePending = false
+                            downloadUpdate(update)
+                        }
                     } catch (e2: Exception) {
                     }
                 }
@@ -1050,6 +1237,29 @@ fun AppleMusicAppContent(
     }
 
     fun isLiked(t: YtTrack) = liked.any { it.id == t.id }
+
+    fun toggleArtistLike(name: String, thumb: String = "", subs: String = "") {
+        val clean = try {
+            name.trim()
+        } catch (e: Exception) {
+            ""
+        }
+        if (clean.isBlank()) return
+        likedArtists = if (likedArtists.any { it.name.equals(clean, true) }) {
+            likedArtists.filter { !it.name.equals(clean, true) }
+        } else {
+            listOf(LikedArtist(clean, thumb, subs)) + likedArtists
+        }
+        val snapshot = likedArtists
+        scope.launch(Dispatchers.IO) {
+            try {
+                LikedArtists.save(context, snapshot)
+            } catch (e: Exception) {
+            }
+        }
+    }
+
+    fun isArtistLiked(name: String) = likedArtists.any { it.name.equals(name.trim(), true) }
 
     fun startPlaybackService() {
         // Crash gate: starting playback mid-call kills the app — the player
@@ -1650,7 +1860,7 @@ fun AppleMusicAppContent(
             nowPlaying = t
             val metaBuilder = androidx.media3.common.MediaMetadata.Builder()
                 .setTitle(t.title)
-                .setArtist(t.artist)
+                .setArtist(t.displayArtist())
             try {
                 if (t.thumbUrl.isNotBlank()) {
                     metaBuilder.setArtworkUri(Uri.parse(t.thumbUrl))
@@ -1774,6 +1984,43 @@ fun AppleMusicAppContent(
     var radioSeed by remember { mutableStateOf<YtTrack?>(null) }
     val radioTracks = remember { mutableStateListOf<YtTrack>() }
     var radioLoadingMore by remember { mutableStateOf(false) }
+    // Persisted radio cards (Radio tab).
+    var radioCards by remember { mutableStateOf<List<SavedRadio>>(emptyList()) }
+    var radioSheetSeed by remember { mutableStateOf<String?>(null) }
+    fun refreshRadioCards() {
+        scope.launch(Dispatchers.IO) {
+            val loaded = try {
+                RadioStore.list(context)
+            } catch (e: Exception) {
+                emptyList()
+            }
+            try {
+                withContext(Dispatchers.Main) { radioCards = loaded }
+            } catch (e: Exception) {
+            }
+        }
+    }
+    fun saveRadioCard(seed: YtTrack, tracks: List<YtTrack>) {
+        scope.launch(Dispatchers.IO) {
+            try {
+                RadioStore.upsert(
+                    context,
+                    SavedRadio(
+                        id = "radio_" + seed.id + "_" + System.currentTimeMillis(),
+                        seed = seed,
+                        title = "Song Radio: ${seed.title}".take(120),
+                        subtitle = seed.displayArtist(),
+                        thumbUrl = seed.thumbUrl,
+                        tracks = tracks.toList(),
+                        createdAt = System.currentTimeMillis(),
+                        updatedAt = System.currentTimeMillis()
+                    )
+                )
+            } catch (e: Exception) {
+            }
+            refreshRadioCards()
+        }
+    }
     fun startRadio(track: YtTrack) {
         if (track.id.isBlank()) return
         radioSeed = track
@@ -1795,6 +2042,7 @@ fun AppleMusicAppContent(
                 }
             } catch (e: Exception) {
             }
+            saveRadioCard(track, all)
             try {
                 playList(all, 0, false)
             } catch (e: Exception) {
@@ -1826,10 +2074,18 @@ fun AppleMusicAppContent(
                         } catch (e: Exception) {
                         }
                     }
+                    var grown = 0
                     for (t in more) {
-                        if (known.add(t.id)) radioTracks.add(t)
+                        if (known.add(t.id)) {
+                            radioTracks.add(t)
+                            grown++
+                        }
                     }
                     radioLoadingMore = false
+                    if (grown > 0) {
+                        val s = radioSeed
+                        if (s != null) saveRadioCard(s, radioTracks.toList())
+                    }
                 }
             } catch (e: Exception) {
                 try {
@@ -1837,6 +2093,56 @@ fun AppleMusicAppContent(
                 } catch (e2: Exception) {
                 }
             }
+        }
+    }
+
+    // Save a radio card's snapshot as a Library playlist, then open it.
+    // Radio heart: toggles + refreshes the cards.
+    fun toggleRadioLike(seedId: String) {
+        scope.launch(Dispatchers.IO) {
+            try {
+                RadioStore.toggleLike(context, seedId)
+            } catch (e: Exception) {
+            }
+            refreshRadioCards()
+        }
+    }
+    fun saveRadioAsPlaylist(radio: SavedRadio) {
+        val snap = try {
+            if (radioSeed?.id == radio.seed.id) radioTracks.toList() else radio.tracks
+        } catch (e: Exception) {
+            radio.tracks
+        }
+        if (snap.isEmpty()) return
+        scope.launch(Dispatchers.IO) {
+            try {
+                val created = PlaylistStore.create(
+                    context, "Radio • ${radio.seed.title}".take(120)
+                )
+                for (t in snap) {
+                    try {
+                        PlaylistStore.add(context, created.id, t)
+                    } catch (e: Exception) {
+                    }
+                }
+                val id = created.id
+                withContext(Dispatchers.Main) {
+                    try {
+                        openPlaylist(id)
+                    } catch (e: Exception) {
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "radio save failed", e)
+            }
+        }
+    }
+    // Radio cards refresh whenever the tab opens.
+    LaunchedEffect(selectedTab) {
+        if (selectedTab != 2) return@LaunchedEffect
+        try {
+            refreshRadioCards()
+        } catch (e: Exception) {
         }
     }
 
@@ -2778,109 +3084,6 @@ fun AppleMusicAppContent(
         }
     }
 
-    // Update check: once a day automatically (banner + system
-    // notification), plus a manual "Check for updates" in Settings that
-    // bypasses the daily gate and reports the result on screen.
-    var update by remember { mutableStateOf<UpdateCheck.Update?>(null) }
-    var updateChecking by remember { mutableStateOf(false) }
-    var updateStatus by remember { mutableStateOf("") }
-    // Seamless update: direct APK download for this device, installer on
-    // completion. Release page only when no matching asset exists.
-    // (watchUpdateDownload first: local funs can't forward-reference.)
-    // Download watcher: live % in Settings + one-shot installer pop when
-    // the file lands (covers missed/denied notifications).
-    fun watchUpdateDownload(tag: String) {
-        scope.launch(Dispatchers.IO) {
-            try {
-                var offered = false
-                while (true) {
-                    delay(2000)
-                    try {
-                        val done = UpdateDownload.downloadedFile(context)
-                        if (done != null) {
-                            withContext(Dispatchers.Main) {
-                                updateStatus = "Downloaded — tap to install"
-                            }
-                            if (!offered) {
-                                offered = true
-                                if (UpdateDownload.takeOffer(context, tag)) {
-                                    withContext(Dispatchers.Main) {
-                                        try {
-                                            UpdateDownload.installFile(context, done)
-                                        } catch (e: Exception) {
-                                        }
-                                    }
-                                }
-                            }
-                            return@launch
-                        }
-                        if (!UpdateDownload.hasActiveDownload(context)) return@launch
-                        val p = UpdateDownload.queryProgress(context)
-                        if (p != null) {
-                            val pct = if (p.second > 0L) {
-                                ((p.first * 100L) / p.second).toInt().coerceIn(0, 100)
-                            } else -1
-                            withContext(Dispatchers.Main) {
-                                updateStatus = if (pct >= 0) "Downloading $tag… $pct%"
-                                else "Downloading $tag…"
-                            }
-                        }
-                    } catch (e: Exception) {
-                        return@launch
-                    }
-                }
-            } catch (e: Exception) {
-            }
-        }
-    }
-    fun downloadUpdate(u: UpdateCheck.Update?) {
-        if (u == null) return
-        scope.launch(Dispatchers.IO) {
-            try {
-                val ready = UpdateDownload.downloadedFile(context)
-                if (ready != null) {
-                    withContext(Dispatchers.Main) {
-                        updateStatus = "Downloaded — opening installer…"
-                        try {
-                            UpdateDownload.installFile(context, ready)
-                        } catch (e: Exception) {
-                        }
-                    }
-                    return@launch
-                }
-            } catch (e: Exception) {
-            }
-            if (u.apkUrl.isBlank()) {
-                withContext(Dispatchers.Main) {
-                    try {
-                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u.url)))
-                    } catch (e: Exception) {
-                    }
-                }
-                return@launch
-            }
-            withContext(Dispatchers.Main) {
-                updateStatus = "Downloading ${u.tag}…"
-            }
-            val ok = try {
-                UpdateDownload.startDownload(context, u)
-            } catch (e: Exception) {
-                false
-            }
-            if (ok) {
-                watchUpdateDownload(u.tag)
-            }
-            if (!ok) {
-                withContext(Dispatchers.Main) {
-                    updateStatus = "Download failed — opening release page"
-                    try {
-                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u.url)))
-                    } catch (e: Exception) {
-                    }
-                }
-            }
-        }
-    }
     fun runUpdateCheck(manual: Boolean) {
         if (updateChecking) return
         updateChecking = true
@@ -2890,7 +3093,18 @@ fun AppleMusicAppContent(
                 if (!manual && !UpdateCheck.dueForCheck(context)) {
                     return@launch
                 }
-                val latest = UpdateCheck.latest()
+                // Manual taps retry once (flaky networks shouldn't need two taps).
+                var latest: UpdateCheck.Update? = null
+                val tries = if (manual) 2 else 1
+                var attempt = 0
+                while (attempt < tries && latest == null) {
+                    attempt++
+                    try {
+                        latest = UpdateCheck.latest()
+                    } catch (e: Exception) {
+                    }
+                    if (latest == null && attempt < tries) delay(1500)
+                }
                 UpdateCheck.markChecked(context)
                 val current = try {
                     UpdateCheck.currentVersion(context)
@@ -2915,6 +3129,10 @@ fun AppleMusicAppContent(
                 if (manual) updateStatus = "Couldn't reach updates — try again"
             } finally {
                 updateChecking = false
+                try {
+                    dropStaleUpdate()
+                } catch (e: Exception) {
+                }
             }
         }
     }
@@ -2924,7 +3142,11 @@ fun AppleMusicAppContent(
         // finished APK once instead of leaving it silent in Downloads.
         scope.launch(Dispatchers.IO) {
             try {
-                val done = UpdateDownload.downloadedFile(context)
+                val done = if (UpdateDownload.isDownloadComplete(context)) {
+                    UpdateDownload.downloadedFile(context)
+                } else {
+                    null
+                }
                 if (done != null) {
                     val prefs = context.getSharedPreferences("cresca_prefs", android.content.Context.MODE_PRIVATE)
                     val tag = prefs.getString("update_download_tag", "") ?: ""
@@ -3143,18 +3365,10 @@ fun AppleMusicAppContent(
                             }
                         }
                     },
-                    radioTitle = radioSeed?.let { "Song Radio: ${it.title}" },
-                    radioTracks = radioTracks.toList(),
-                    radioLoadingMore = radioLoadingMore,
-                    isCurrentId = { queue.current?.id == it.id },
-                    likedOf = { isLiked(it) },
-                    onRadioPlay = { idx -> playList(radioTracks.toList(), idx, false) },
-                    onPlayNext = { queue.playNext(it) },
-                    onAddQueue = { queue.addToQueue(it) },
-                    onToggleLike = { toggleLike(it) },
-                    onArtist = { openArtist(it) },
-                    onRadio = { startRadio(it) },
-                    onExtend = { extendRadio() }
+                    radios = radioCards,
+                    onResumeRadio = { startRadio(it) },
+                    onOpenRadio = { radioSheetSeed = it.seed.id },
+                    onToggleLikeRadio = { toggleRadioLike(it) }
                 )
                 3 -> LibraryScreen(
                     liked = liked, recent = recent,
@@ -3179,7 +3393,8 @@ fun AppleMusicAppContent(
                     onOpenPlaylist = { openPlaylist(it) },
                     onOpenProfile = { showProfile = true },
                     onArtist = { openArtist(it) },
-                    onRadio = { startRadio(it) }
+                    onRadio = { startRadio(it) },
+                    favArtists = likedArtists
                 )
             }
             }
@@ -3234,6 +3449,7 @@ fun AppleMusicAppContent(
                 onQueue = { showQueue = true },
                 onPlayNext = { queue.playNext(t) },
                 onAddQueue = { queue.addToQueue(t) },
+                onRadio = { startRadio(t) },
                 onSeek = { player.seekTo(it) },
                 onArtist = { openArtist(it) },
                 domColor = playerDom,
@@ -3417,6 +3633,14 @@ fun AppleMusicAppContent(
             updateTag = update?.tag,
             updateChecking = updateChecking,
             updateStatus = updateStatus,
+            updateProgress = updateProgress,
+            canInstallApps = updateCanInstall,
+            onAllowInstall = {
+                try {
+                    UpdateInstall.openUnknownAppsSettings(context)
+                } catch (e: Exception) {
+                }
+            },
             onCheckUpdate = { runUpdateCheck(true) },
             onUpdateTap = {
                 downloadUpdate(update)
@@ -3517,8 +3741,50 @@ fun AppleMusicAppContent(
             onToggleLike = { toggleLike(it) },
             onArtist = { openArtist(it) },
             onRadio = { startRadio(it) },
+            isFav = isArtistLiked(aname),
+            onToggleFav = { toggleArtistLike(aname) },
             onDismiss = { artistPage = null }
         )
+    }
+
+    // One radio's songs (from its card).
+    radioSheetSeed?.let { sid ->
+        val radio = radioCards.find { it.seed.id == sid }
+        if (radio != null) {
+            val live = try {
+                radioSeed?.id == sid
+            } catch (e: Exception) {
+                false
+            }
+            val shown = if (live) {
+                try {
+                    radioTracks.toList()
+                } catch (e: Exception) {
+                    radio.tracks
+                }
+            } else {
+                radio.tracks
+            }
+            RadioSheet(
+                radio = radio,
+                tracks = shown,
+                loadingMore = live && radioLoadingMore,
+                isCurrentId = { queue.current?.id == it.id },
+                likedOf = { isLiked(it) },
+                onPlayList = { list, idx, sh -> playList(list, idx, sh) },
+                onPlayNext = { queue.playNext(it) },
+                onAddQueue = { queue.addToQueue(it) },
+                onToggleLike = { toggleLike(it) },
+                onArtist = { openArtist(it) },
+                onRadio = { startRadio(it) },
+                onPlayAll = { startRadio(radio.seed) },
+                onSave = { saveRadioAsPlaylist(radio) },
+                isLiked = radio.liked,
+                onToggleLikeRadio = { toggleRadioLike(radio.seed.id) },
+                onExtend = { if (live) extendRadio() },
+                onDismiss = { radioSheetSeed = null }
+            )
+        }
     }
 }
 
@@ -3712,7 +3978,7 @@ private fun VideoMeta(
             textAlign = TextAlign.Center
         )
         Text(
-            track.artist,
+            track.displayArtist(),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             maxLines = 1, overflow = TextOverflow.Ellipsis,
@@ -3752,6 +4018,7 @@ private fun FullPlayerSheet(
     onQueue: () -> Unit,
     onPlayNext: () -> Unit = {},
     onAddQueue: () -> Unit = {},
+    onRadio: () -> Unit = {},
     onSeek: (Long) -> Unit,
     onArtist: (String) -> Unit = {},
     onDismiss: () -> Unit,
@@ -4006,7 +4273,7 @@ private fun FullPlayerSheet(
                             maxLines = 2, overflow = TextOverflow.Ellipsis
                         )
                         Text(
-                            track.artist,
+                            track.displayArtist(),
                             style = MaterialTheme.typography.bodyMedium.copy(
                                 shadow = Shadow(
                                     color = Color.Black.copy(alpha = 0.6f),
@@ -4184,6 +4451,13 @@ private fun FullPlayerSheet(
                                     Icon(Icons.Filled.QueueMusic, contentDescription = null)
                                 },
                                 onClick = { moreOpen = false; onAddQueue() }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Start radio") },
+                                leadingIcon = {
+                                    Icon(Icons.Filled.Radio, contentDescription = null)
+                                },
+                                onClick = { moreOpen = false; onRadio() }
                             )
                             DropdownMenuItem(
                                 text = { Text("Download") },
@@ -4552,7 +4826,7 @@ private fun PlaylistSheet(
                 itemsIndexed(sugg, key = { i, x -> "$i-${x.id}" }) { _, t ->
                     ListItem(
                         headlineContent = { Text(t.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                        supportingContent = { Text(t.artist, maxLines = 1) },
+                        supportingContent = { Text(t.displayArtist(), maxLines = 1) },
                         leadingContent = { TrackArt(t.thumbUrl, t.id.hashCode(), 52.dp, 8.dp) },
                         trailingContent = {
                             FilledTonalIconButton(onClick = { onAddSuggested(t) }) {
@@ -4642,12 +4916,22 @@ private fun ArtistSheet(
     onToggleLike: (YtTrack) -> Unit,
     onArtist: (String) -> Unit,
     onRadio: (YtTrack) -> Unit,
+    isFav: Boolean = false,
+    onToggleFav: () -> Unit = {},
     onDismiss: () -> Unit
 ) {
     var tracks by remember(name) { mutableStateOf<List<YtTrack>>(emptyList()) }
     var loading by remember(name) { mutableStateOf(true) }
+    var info by remember(name) { mutableStateOf<YtArtist?>(null) }
     LaunchedEffect(name) {
         loading = true
+        try {
+            val got = withContext(Dispatchers.IO) {
+                YoutubeRepository.searchArtists(name, 1)
+            }
+            info = got.firstOrNull()
+        } catch (e: Exception) {
+        }
         try {
             tracks = withContext(Dispatchers.IO) {
                 YoutubeRepository.searchMusic("$name songs", 20)
@@ -4664,67 +4948,102 @@ private fun ArtistSheet(
     ) {
         LazyColumn(Modifier.fillMaxWidth()) {
             item {
-                Column(
-                    Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    val art = tracks.firstOrNull()?.thumbUrl ?: ""
-                    if (art.isNotBlank()) {
-                        AsyncImage(
-                            model = art, contentDescription = null,
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.size(140.dp).clip(androidx.compose.foundation.shape.CircleShape)
+                // Hero: gradient backdrop, big round art, stats, actions.
+                Box(
+                    Modifier.fillMaxWidth()
+                        .background(
+                            Brush.verticalGradient(
+                                listOf(
+                                    MaterialTheme.colorScheme.surfaceVariant,
+                                    MaterialTheme.colorScheme.surface
+                                )
+                            )
                         )
-                    } else {
-                        Surface(
-                            shape = androidx.compose.foundation.shape.CircleShape,
-                            color = MaterialTheme.colorScheme.surfaceVariant,
-                            modifier = Modifier.size(140.dp)
-                        ) {
-                            Box(contentAlignment = Alignment.Center,
-                                modifier = Modifier.fillMaxSize()) {
-                                Icon(Icons.Filled.Person, contentDescription = null,
-                                    modifier = Modifier.size(64.dp))
+                        .padding(horizontal = 20.dp, vertical = 16.dp)
+                ) {
+                    Column(
+                        Modifier.fillMaxWidth(),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        val art = info?.thumbUrl?.takeIf { it.isNotBlank() }
+                            ?: tracks.firstOrNull()?.thumbUrl ?: ""
+                        if (art.isNotBlank()) {
+                            AsyncImage(
+                                model = art, contentDescription = null,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.size(148.dp)
+                                    .clip(androidx.compose.foundation.shape.CircleShape)
+                            )
+                        } else {
+                            Surface(
+                                shape = androidx.compose.foundation.shape.CircleShape,
+                                color = MaterialTheme.colorScheme.surfaceVariant,
+                                modifier = Modifier.size(148.dp)
+                            ) {
+                                Box(contentAlignment = Alignment.Center,
+                                    modifier = Modifier.fillMaxSize()) {
+                                    Icon(Icons.Filled.Person, contentDescription = null,
+                                        modifier = Modifier.size(64.dp))
+                                }
                             }
                         }
-                    }
-                    Spacer(Modifier.height(12.dp))
-                    Text("Artist", style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(name, style = MaterialTheme.typography.headlineSmall,
-                        maxLines = 2, overflow = TextOverflow.Ellipsis,
-                        textAlign = TextAlign.Center)
-                    Text(if (loading) "Loading…" else "${tracks.size} top songs",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Spacer(Modifier.height(12.dp))
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        FilledIconButton(
-                            onClick = { onPlayList(tracks, 0, false) },
-                            enabled = tracks.isNotEmpty(),
-                            modifier = Modifier.size(56.dp),
-                            colors = IconButtonDefaults.filledIconButtonColors(
-                                containerColor = Color(0xFFFA243C),
-                                contentColor = Color.White,
-                                disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant
-                            )
-                        ) {
-                            Icon(Icons.Filled.PlayArrow, contentDescription = "Play",
-                                modifier = Modifier.size(28.dp))
+                        Spacer(Modifier.height(12.dp))
+                        Text("Artist", style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(name, style = MaterialTheme.typography.headlineMedium,
+                            maxLines = 2, overflow = TextOverflow.Ellipsis,
+                            textAlign = TextAlign.Center)
+                        val meta = try {
+                            // Subscriber counts from the extractor inflate
+                            // ~10x — show song count only, never bad numbers.
+                            if (loading) "Loading…"
+                            else if (tracks.isNotEmpty()) "${tracks.size} top songs"
+                            else "Top songs"
+                        } catch (e: Exception) {
+                            "Top songs"
                         }
-                        FilledTonalButton(
-                            onClick = { onPlayList(tracks, 0, true) },
-                            enabled = tracks.isNotEmpty(),
-                            modifier = Modifier.weight(1f)
+                        Text(meta, style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.height(12.dp))
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Icon(Icons.Filled.Shuffle, contentDescription = null,
-                                modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text("Shuffle")
+                            FilledIconButton(
+                                onClick = { onPlayList(tracks, 0, false) },
+                                enabled = tracks.isNotEmpty(),
+                                modifier = Modifier.size(56.dp),
+                                colors = IconButtonDefaults.filledIconButtonColors(
+                                    containerColor = Color(0xFFFA243C),
+                                    contentColor = Color.White,
+                                    disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant
+                                )
+                            ) {
+                                Icon(Icons.Filled.PlayArrow, contentDescription = "Play",
+                                    modifier = Modifier.size(28.dp))
+                            }
+                            FilledTonalButton(
+                                onClick = { onPlayList(tracks, 0, true) },
+                                enabled = tracks.isNotEmpty(),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(Icons.Filled.Shuffle, contentDescription = null,
+                                    modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("Shuffle")
+                            }
+                            OutlinedIconButton(
+                                onClick = onToggleFav,
+                                modifier = Modifier.size(56.dp)
+                            ) {
+                                Icon(
+                                    if (isFav) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
+                                    contentDescription = if (isFav) "Unfavorite artist" else "Favorite artist",
+                                    tint = if (isFav) Color(0xFFFA243C)
+                                    else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
                         }
                     }
                 }
@@ -5080,7 +5399,7 @@ private fun FancyBar(
                         when {
                             buffering -> "Loading…"
                             error != null -> error
-                            else -> track.artist
+                            else -> track.displayArtist()
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = if (error != null) MaterialTheme.colorScheme.error
@@ -5355,7 +5674,7 @@ private fun DetailsCard(track: YtTrack) {
                 style = MaterialTheme.typography.titleSmall,
                 color = Color.White.copy(alpha = 0.6f))
             Spacer(Modifier.height(8.dp))
-            DetailRow("Artist", track.artist)
+            DetailRow("Artist", track.displayArtist())
             details?.let { d ->
                 if (d.views >= 0) {
                     DetailRow("Plays", fmtCompact(d.views))
@@ -5396,6 +5715,36 @@ private fun DetailRow(k: String, v: String) {
     }
 }
 
+/** iOS-style grouped card for Profile sections. */
+@Composable
+private fun ProfileCard(content: @Composable ColumnScope.() -> Unit) {
+    Surface(
+        shape = RoundedCornerShape(20.dp),
+        tonalElevation = 2.dp,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
+    ) {
+        Column(Modifier.padding(vertical = 4.dp), content = content)
+    }
+}
+
+/** Staggered entrance for Profile rows (honors the motion kill-switch). */
+@Composable
+private fun ProfileEnter(delayMs: Int, content: @Composable () -> Unit) {
+    androidx.compose.animation.AnimatedVisibility(
+        visible = true,
+        enter = if (LocalMotion.current) (
+            androidx.compose.animation.fadeIn(
+                androidx.compose.animation.core.tween(250, delayMillis = delayMs)) +
+            androidx.compose.animation.slideInVertically(
+                androidx.compose.animation.core.tween(250, delayMillis = delayMs)) { it / 6 }
+        ) else androidx.compose.animation.fadeIn(
+            androidx.compose.animation.core.tween(1)),
+        label = "prof$delayMs"
+    ) {
+        content()
+    }
+}
+
 /** Profile + settings: account, appearance, downloads, storage, about. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -5424,6 +5773,9 @@ private fun ProfileSheet(
     updateTag: String? = null,
     updateChecking: Boolean = false,
     updateStatus: String = "",
+    updateProgress: Float? = null,
+    canInstallApps: Boolean = true,
+    onAllowInstall: () -> Unit = {},
     onCheckUpdate: () -> Unit = {},
     onUpdateTap: () -> Unit = {},
     onDismiss: () -> Unit
@@ -5434,30 +5786,43 @@ private fun ProfileSheet(
     ) {
         LazyColumn(Modifier.fillMaxWidth()) {
             item {
-                Row(
-                    Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Surface(
-                        shape = androidx.compose.foundation.shape.CircleShape,
-                        color = Color.Black,
-                        modifier = Modifier.size(56.dp)
+                ProfileEnter(0) {
+                    // Hero: gradient identity panel.
+                    Box(
+                        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)
+                            .clip(RoundedCornerShape(24.dp))
+                            .background(
+                                Brush.linearGradient(
+                                    listOf(Color(0xFFFA243C), Color(0xFF7D0018), Color(0xFF1A0208))
+                                )
+                            )
+                            .padding(20.dp)
                     ) {
-                        Image(
-                            painter = painterResource(id = R.drawable.cresca_icon),
-                            contentDescription = "Cresca",
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize()
-                        )
-                    }
-                    Spacer(Modifier.width(16.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text("My Profile", style = MaterialTheme.typography.titleLarge)
-                        Text(
-                            if (loggedIn) "YouTube connected" else "Guest — not signed in",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Surface(
+                                shape = androidx.compose.foundation.shape.CircleShape,
+                                color = Color.White.copy(alpha = 0.18f),
+                                modifier = Modifier.size(64.dp)
+                            ) {
+                                Image(
+                                    painter = painterResource(id = R.drawable.cresca_icon),
+                                    contentDescription = "Cresca",
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            }
+                            Spacer(Modifier.width(16.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text("My Profile",
+                                    style = MaterialTheme.typography.headlineSmall,
+                                    color = Color.White)
+                                Text(
+                                    if (loggedIn) "YouTube connected" else "Guest — not signed in",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = Color.White.copy(alpha = 0.8f)
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -5465,33 +5830,39 @@ private fun ProfileSheet(
                 SectionHeader("Account")
             }
             item {
-                ListItem(
-                    headlineContent = {
-                        Text(if (loggedIn) "Sign out of YouTube" else "Sign in with YouTube")
-                    },
-                    supportingContent = {
-                        Text(if (loggedIn) "Session lives only on this device"
-                        else "Unlock your real library")
-                    },
-                    leadingContent = {
-                        Icon(Icons.Filled.AccountCircle, contentDescription = null)
-                    },
-                    modifier = Modifier.clickable {
-                        if (loggedIn) {
-                            onSignOut()
-                        } else {
-                            onSignIn()
-                        }
+                ProfileEnter(60) {
+                    ProfileCard {
+                        ListItem(
+                            headlineContent = {
+                                Text(if (loggedIn) "Sign out of YouTube" else "Sign in with YouTube")
+                            },
+                            supportingContent = {
+                                Text(if (loggedIn) "Session lives only on this device"
+                                else "Unlock your real library")
+                            },
+                            leadingContent = {
+                                Icon(Icons.Filled.AccountCircle, contentDescription = null)
+                            },
+                            modifier = Modifier.clickable {
+                                if (loggedIn) {
+                                    onSignOut()
+                                } else {
+                                    onSignIn()
+                                }
+                            }
+                        )
                     }
-                )
+                }
             }
             item {
                 SectionHeader("Spotify")
             }
             item {
-                var clientIdDraft by remember(spotifyClientId) {
-                    mutableStateOf(spotifyClientId)
-                }
+                ProfileEnter(100) {
+                    ProfileCard {
+                        var clientIdDraft by remember(spotifyClientId) {
+                            mutableStateOf(spotifyClientId)
+                        }
                 // Built-in baked ID: one-tap login, field stays hidden
                 // (manual entry only on clones built without local.properties).
                 val hasBuiltIn = remember {
@@ -5562,13 +5933,17 @@ private fun ProfileSheet(
                             Text("Disconnect Spotify")
                         }
                     }
+                        }
+                    }
                 }
             }
             item {
                 SectionHeader("Playback engine")
             }
             item {
-                Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)) {
+                ProfileEnter(120) {
+                    ProfileCard {
+                        Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
                     Text(
                         if (engineFast) "Fast — on-device InnerTube (instant, needs login for best reliability)"
                         else "Stable — NewPipe extraction (compatible everywhere)",
@@ -5590,45 +5965,60 @@ private fun ProfileSheet(
                             modifier = Modifier.weight(1f)
                         )
                     }
+                        }
+                    }
                 }
             }
             item {
                 SectionHeader("Appearance")
             }
             item {
-                Row(
-                    Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    listOf("system" to "System", "light" to "Light", "dark" to "Dark").forEach { (v, label) ->
-                        FilterChip(
-                            selected = themeMode == v,
-                            onClick = { onTheme(v) },
-                            label = { Text(label) },
-                            modifier = Modifier.weight(1f).pressScale(motionOn)
-                        )
+                ProfileEnter(160) {
+                    ProfileCard {
+                        Row(
+                            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            listOf("system" to "System", "light" to "Light", "dark" to "Dark").forEach { (v, label) ->
+                                FilterChip(
+                                    selected = themeMode == v,
+                                    onClick = { onTheme(v) },
+                                    label = { Text(label) },
+                                    modifier = Modifier.weight(1f).pressScale(motionOn)
+                                )
+                            }
+                        }
                     }
                 }
             }
             item {
-                Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)) {
-                    Text("Motion",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Spacer(Modifier.height(8.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        FilterChip(
-                            selected = motionOn,
-                            onClick = { onMotion(true) },
-                            label = { Text("On") },
-                            modifier = Modifier.weight(1f)
-                        )
-                        FilterChip(
-                            selected = !motionOn,
-                            onClick = { onMotion(false) },
-                            label = { Text("Off") },
-                            modifier = Modifier.weight(1f)
-                        )
+                ProfileEnter(200) {
+                    ProfileCard {
+                        Column(
+                            Modifier.fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 8.dp)
+                        ) {
+                            Text(
+                                "Motion",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(Modifier.height(8.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                FilterChip(
+                                    selected = motionOn,
+                                    onClick = { onMotion(true) },
+                                    label = { Text("On") },
+                                    modifier = Modifier.weight(1f)
+                                )
+                                FilterChip(
+                                    selected = !motionOn,
+                                    onClick = { onMotion(false) },
+                                    label = { Text("Off") },
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -5636,34 +6026,47 @@ private fun ProfileSheet(
                 SectionHeader("Downloads")
             }
             item {
-                ListItem(
-                    headlineContent = { Text("Saved songs ($dlCount)") },
-                    supportingContent = { Text("Open offline library") },
-                    leadingContent = {
-                        Icon(Icons.Filled.DownloadForOffline, contentDescription = null)
-                    },
-                    modifier = Modifier.clickable { onOpenDownloads() }
-                )
+                ProfileEnter(220) {
+                    ProfileCard {
+                        ListItem(
+                            headlineContent = { Text("Saved songs ($dlCount)") },
+                            supportingContent = { Text("Open offline library") },
+                            leadingContent = {
+                                Icon(Icons.Filled.DownloadForOffline, contentDescription = null)
+                            },
+                            modifier = Modifier.clickable { onOpenDownloads() }
+                        )
+                    }
+                }
             }
             item {
-                Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)) {
-                    Text("Save new downloads to",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Spacer(Modifier.height(8.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        FilterChip(
-                            selected = dlLoc != "device",
-                            onClick = { onLoc("app") },
-                            label = { Text("In-app") },
-                            modifier = Modifier.weight(1f)
-                        )
-                        FilterChip(
-                            selected = dlLoc == "device",
-                            onClick = { onLoc("device") },
-                            label = { Text("Device Music folder") },
-                            modifier = Modifier.weight(1f)
-                        )
+                ProfileEnter(240) {
+                    ProfileCard {
+                        Column(
+                            Modifier.fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 8.dp)
+                        ) {
+                            Text(
+                                "Save new downloads to",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(Modifier.height(8.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                FilterChip(
+                                    selected = dlLoc != "device",
+                                    onClick = { onLoc("app") },
+                                    label = { Text("In-app") },
+                                    modifier = Modifier.weight(1f)
+                                )
+                                FilterChip(
+                                    selected = dlLoc == "device",
+                                    onClick = { onLoc("device") },
+                                    label = { Text("Device Music folder") },
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -5671,14 +6074,18 @@ private fun ProfileSheet(
                 SectionHeader("Storage")
             }
             item {
-                ListItem(
-                    headlineContent = { Text("Clear song cache") },
-                    supportingContent = { Text("Frees space; songs reload from YouTube") },
-                    leadingContent = {
-                        Icon(Icons.Filled.CleaningServices, contentDescription = null)
-                    },
-                    modifier = Modifier.clickable { onClearCache() }
-                )
+                ProfileEnter(260) {
+                    ProfileCard {
+                        ListItem(
+                            headlineContent = { Text("Clear song cache") },
+                            supportingContent = { Text("Frees space; songs reload from YouTube") },
+                            leadingContent = {
+                                Icon(Icons.Filled.CleaningServices, contentDescription = null)
+                            },
+                            modifier = Modifier.clickable { onClearCache() }
+                        )
+                    }
+                }
             }
             item {
                 SectionHeader("About")
@@ -5704,20 +6111,22 @@ private fun ProfileSheet(
                         ""
                     }
                 }
-                ListItem(
-                    headlineContent = {
-                        Text(
-                            if (appVer.isNotBlank()) "Cresca Music $appVer"
-                            else "Cresca Music"
+                ProfileEnter(280) {
+                    ProfileCard {
+                        ListItem(
+                            headlineContent = {
+                                Text(
+                                    if (appVer.isNotBlank()) "Cresca Music $appVer"
+                                    else "Cresca Music"
+                                )
+                            },
+                            supportingContent = {
+                                Text("Live YouTube audio • karaoke lyrics • offline mode")
+                            },
+                            leadingContent = {
+                                Icon(Icons.Filled.Info, contentDescription = null)
+                            }
                         )
-                    },
-                    supportingContent = {
-                        Text("Live YouTube audio • karaoke lyrics • offline mode")
-                    },
-                    leadingContent = {
-                        Icon(Icons.Filled.Info, contentDescription = null)
-                    }
-                )
                 if (updateTag != null) {
                     ListItem(
                         headlineContent = { Text("Update available: $updateTag") },
@@ -5728,16 +6137,37 @@ private fun ProfileSheet(
                         modifier = Modifier.clickable { onUpdateTap() }
                     )
                 }
+                if (!canInstallApps) {
+                    ListItem(
+                        headlineContent = { Text("Allow app installs") },
+                        supportingContent = {
+                            Text("Needed before any update can install — opens system settings")
+                        },
+                        leadingContent = {
+                            Icon(Icons.Filled.Security, contentDescription = null)
+                        },
+                        modifier = Modifier.clickable { onAllowInstall() }
+                    )
+                }
                 ListItem(
                     headlineContent = { Text("Check for updates") },
                     supportingContent = {
-                        Text(
-                            when {
-                                updateChecking -> "Checking…"
-                                updateStatus.isNotBlank() -> updateStatus
-                                else -> "Latest check: automatic, once a day"
+                        Column {
+                            Text(
+                                when {
+                                    updateChecking -> "Checking…"
+                                    updateStatus.isNotBlank() -> updateStatus
+                                    else -> "Latest check: automatic, once a day"
+                                }
+                            )
+                            if (updateProgress != null) {
+                                Spacer(Modifier.height(6.dp))
+                                LinearProgressIndicator(
+                                    progress = updateProgress ?: 0f,
+                                    modifier = Modifier.fillMaxWidth()
+                                )
                             }
-                        )
+                        }
                     },
                     leadingContent = {
                         if (updateChecking) {
@@ -5768,6 +6198,8 @@ private fun ProfileSheet(
                             }
                         }
                     )
+                }
+                    }
                 }
                 Spacer(Modifier.height(32.dp))
             }
@@ -6109,10 +6541,10 @@ private fun ListenNowScreen(
                             Spacer(Modifier.height(6.dp))
                             Text(t.title, style = MaterialTheme.typography.bodyMedium,
                                 maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text(t.artist, style = MaterialTheme.typography.bodySmall,
+                            Text(t.displayArtist(), style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1, overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.clickable { onArtist(t.artist) })
+                                modifier = Modifier.clickable { onArtist(t.displayArtist()) })
                         }
                     }
                 }
@@ -6231,11 +6663,12 @@ private fun TrackRow(
                 else MaterialTheme.colorScheme.onSurface)
         },
         supportingContent = {
+            val da = track.displayArtist()
             if (isArtistLike(track.artist)) {
-                Text(track.artist, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.clickable { onArtist(track.artist) })
+                Text(da, maxLines = 1, overflow = TextOverflow.Ellipsis)
             } else {
-                Text(track.artist, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(da, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.clickable { onArtist(track.artist) })
             }
         },
         leadingContent = {
@@ -6590,7 +7023,7 @@ private fun QueueRow(
                 color = if (isCurrent) MaterialTheme.colorScheme.primary
                 else MaterialTheme.colorScheme.onSurface)
         },
-        supportingContent = { Text(t.artist, maxLines = 1) },
+        supportingContent = { Text(t.displayArtist(), maxLines = 1) },
         leadingContent = { TrackArt(t.thumbUrl, t.id.hashCode(), 48.dp, 8.dp) },
         trailingContent = {
             if (isCurrent) {
@@ -6863,7 +7296,7 @@ private fun TrendingVideosScreen(
                             Spacer(Modifier.height(6.dp))
                             Text(t.title, style = MaterialTheme.typography.bodyMedium,
                                 maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text(t.artist, style = MaterialTheme.typography.bodySmall,
+                            Text(t.displayArtist(), style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
@@ -6877,82 +7310,82 @@ private fun TrendingVideosScreen(
 @Composable
 private fun RadioScreen(
     onStation: (String) -> Unit,
-    radioTitle: String? = null,
-    radioTracks: List<YtTrack> = emptyList(),
-    radioLoadingMore: Boolean = false,
-    isCurrentId: (YtTrack) -> Boolean = { false },
-    likedOf: (YtTrack) -> Boolean = { false },
-    onRadioPlay: (Int) -> Unit = {},
-    onPlayNext: (YtTrack) -> Unit = {},
-    onAddQueue: (YtTrack) -> Unit = {},
-    onToggleLike: (YtTrack) -> Unit = {},
-    onArtist: (String) -> Unit = {},
-    onRadio: (YtTrack) -> Unit = {},
-    onExtend: () -> Unit = {}
+    radios: List<SavedRadio> = emptyList(),
+    onResumeRadio: (YtTrack) -> Unit = {},
+    onOpenRadio: (SavedRadio) -> Unit = {},
+    onToggleLikeRadio: (String) -> Unit = {}
 ) {
-    // Endless: reaching the tail grows the radio via the chained
-    // autoplay graph (append-only, distinct ids).
-    LaunchedEffect(radioTracks.size) {
-        if (radioTracks.isNotEmpty() && !radioLoadingMore) onExtend()
-    }
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 16.dp)) {
         item {
             Text("Radio", style = MaterialTheme.typography.displaySmall,
                 modifier = Modifier.padding(start = 16.dp, top = 8.dp, end = 16.dp))
-            Text("Endless stations built from live YouTube results. Tap to play.",
+            Text("Your radios plus endless stations. Tap a radio to play it.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
         }
-        if (radioTitle != null && radioTracks.isNotEmpty()) {
+        if (radios.isNotEmpty()) {
             item {
-                Surface(
-                    shape = RoundedCornerShape(20.dp),
-                    color = Color(0xFFFA243C),
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)
-                        .pressScale(LocalMotion.current)
-                        .clickable { onRadioPlay(0) }
+                Text("Your radios", style = MaterialTheme.typography.titleLarge,
+                    modifier = Modifier.padding(start = 16.dp, top = 8.dp, bottom = 4.dp))
+            }
+            item {
+                androidx.compose.foundation.lazy.LazyRow(
+                    contentPadding = PaddingValues(horizontal = 16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    Row(
-                        Modifier.padding(20.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        MosaicArt(radioTracks, 64.dp, 12.dp)
-                        Spacer(Modifier.width(16.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text(radioTitle, style = MaterialTheme.typography.titleLarge,
-                                color = Color.White, maxLines = 2,
-                                overflow = TextOverflow.Ellipsis)
-                            Text("${radioTracks.size} relevant songs • endless",
+                    itemsIndexed(radios, key = { i, x -> "sr$i-${x.seed.id}" }) { _, r ->
+                        Column(
+                            Modifier.width(150.dp).pressScale(LocalMotion.current)
+                                .clickable { onOpenRadio(r) }
+                        ) {
+                            Box(
+                                Modifier.fillMaxWidth().aspectRatio(1f)
+                                    .clip(RoundedCornerShape(16.dp)).background(Color.Black)
+                            ) {
+                                if (r.thumbUrl.isNotBlank()) {
+                                    AsyncImage(
+                                        model = r.thumbUrl, contentDescription = null,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                } else {
+                                    Box(
+                                        Modifier.fillMaxSize(),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(Icons.Filled.Radio, contentDescription = null,
+                                            tint = Color.White.copy(alpha = 0.8f),
+                                            modifier = Modifier.size(48.dp))
+                                    }
+                                }
+                                Surface(
+                                    shape = androidx.compose.foundation.shape.CircleShape,
+                                    color = Color.Black.copy(alpha = 0.6f),
+                                    modifier = Modifier.align(Alignment.TopEnd).padding(8.dp)
+                                        .size(32.dp).clickable { onToggleLikeRadio(r.seed.id) }
+                                ) {
+                                    Box(
+                                        contentAlignment = Alignment.Center,
+                                        modifier = Modifier.fillMaxSize()
+                                    ) {
+                                        Icon(
+                                            if (r.liked) Icons.Filled.Favorite
+                                            else Icons.Filled.FavoriteBorder,
+                                            contentDescription = if (r.liked) "Unlike radio" else "Like radio",
+                                            tint = if (r.liked) Color(0xFFFA243C) else Color.White,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                }
+                            }
+                            Spacer(Modifier.height(6.dp))
+                            Text(r.title, style = MaterialTheme.typography.bodyMedium,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text("${r.tracks.size} songs",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = Color.White.copy(alpha = 0.8f))
-                        }
-                        Icon(Icons.Filled.PlayArrow, contentDescription = "Play radio",
-                            tint = Color.White, modifier = Modifier.size(40.dp))
-                    }
-                }
-            }
-            itemsIndexed(radioTracks, key = { i, x -> "r$i-${x.id}" }) { idx, t ->
-                TrackRow(
-                    track = t, isCurrent = isCurrentId(t), liked = likedOf(t),
-                    onPlay = { onRadioPlay(idx) },
-                    onPlayNext = { onPlayNext(t) },
-                    onAddQueue = { onAddQueue(t) },
-                    onToggleLike = { onToggleLike(t) },
-                    onArtist = onArtist,
-                    onRadio = { onRadio(t) }
-                )
-            }
-            if (radioLoadingMore) {
-                item {
-                    Box(Modifier.fillMaxWidth().padding(16.dp),
-                        contentAlignment = Alignment.Center) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            CircularProgressIndicator(modifier = Modifier.size(28.dp))
-                            Spacer(Modifier.height(8.dp))
-                            Text("Growing your radio…",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     }
                 }
@@ -6985,6 +7418,181 @@ private fun RadioScreen(
     }
 }
 
+/** Small gradient quick-action tile for the Library hero row. */
+@Composable
+private fun LibQuickTile(
+    label: String,
+    sub: String,
+    icon: ImageVector,
+    colors: List<Color>,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier
+            .clip(RoundedCornerShape(20.dp))
+            .background(Brush.linearGradient(colors))
+            .pressScale(LocalMotion.current)
+            .clickable { onClick() }
+            .padding(14.dp)
+    ) {
+        Column {
+            Icon(icon, contentDescription = null, tint = Color.White,
+                modifier = Modifier.size(26.dp))
+            Spacer(Modifier.height(8.dp))
+            Text(label, style = MaterialTheme.typography.titleSmall, color = Color.White,
+                maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(sub, style = MaterialTheme.typography.bodySmall,
+                color = Color.White.copy(alpha = 0.8f),
+                maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+    }
+}
+
+/** One radio's songs: endless auto-extend, Play, Save as playlist, Like. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun RadioSheet(
+    radio: SavedRadio,
+    tracks: List<YtTrack>,
+    loadingMore: Boolean,
+    isCurrentId: (YtTrack) -> Boolean,
+    likedOf: (YtTrack) -> Boolean,
+    onPlayList: (List<YtTrack>, Int, Boolean) -> Unit,
+    onPlayNext: (YtTrack) -> Unit,
+    onAddQueue: (YtTrack) -> Unit,
+    onToggleLike: (YtTrack) -> Unit,
+    onArtist: (String) -> Unit,
+    onRadio: (YtTrack) -> Unit,
+    onPlayAll: () -> Unit,
+    onSave: () -> Unit,
+    isLiked: Boolean,
+    onToggleLikeRadio: () -> Unit,
+    onExtend: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    // Endless: tail growth via the chained autoplay graph.
+    LaunchedEffect(tracks.size) {
+        if (tracks.isNotEmpty() && !loadingMore) onExtend()
+    }
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ) {
+        LazyColumn(Modifier.fillMaxWidth()) {
+            item {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (radio.thumbUrl.isNotBlank()) {
+                        AsyncImage(
+                            model = radio.thumbUrl, contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.size(88.dp).clip(RoundedCornerShape(16.dp))
+                        )
+                    } else {
+                        Box(
+                            Modifier.size(88.dp).clip(RoundedCornerShape(16.dp))
+                                .background(
+                                    Brush.linearGradient(
+                                        listOf(Color(0xFFFA243C), Color(0xFF7D0018))
+                                    )
+                                ),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(Icons.Filled.Radio, contentDescription = null,
+                                tint = Color.White, modifier = Modifier.size(40.dp))
+                        }
+                    }
+                    Spacer(Modifier.width(16.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("Radio", style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(radio.title, style = MaterialTheme.typography.titleLarge,
+                            maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        Text("${tracks.size} relevant songs • endless",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    FilledIconButton(
+                        onClick = onPlayAll,
+                        enabled = tracks.isNotEmpty(),
+                        modifier = Modifier.size(56.dp),
+                        colors = IconButtonDefaults.filledIconButtonColors(
+                            containerColor = Color(0xFFFA243C),
+                            contentColor = Color.White,
+                            disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant
+                        )
+                    ) {
+                        Icon(Icons.Filled.PlayArrow, contentDescription = "Play radio",
+                            modifier = Modifier.size(28.dp))
+                    }
+                    OutlinedButton(
+                        onClick = onSave,
+                        enabled = tracks.isNotEmpty(),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Filled.PlaylistAdd, contentDescription = null,
+                            modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Save")
+                    }
+                            OutlinedIconButton(
+                                onClick = onToggleLikeRadio,
+                                modifier = Modifier.size(56.dp)
+                            ) {
+                                Icon(
+                                    if (isLiked) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
+                                    contentDescription = if (isLiked) "Unlike radio" else "Like radio",
+                                    tint = if (isLiked) Color(0xFFFA243C)
+                                    else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                }
+            }
+            itemsIndexed(tracks, key = { i, x -> "rs$i-${x.id}" }) { _, t ->
+                TrackRow(
+                    track = t, isCurrent = isCurrentId(t), liked = likedOf(t),
+                    onPlay = {
+                        onPlayList(
+                            tracks,
+                            tracks.indexOfFirst { it.id == t.id }.coerceAtLeast(0),
+                            false
+                        )
+                    },
+                    onPlayNext = { onPlayNext(t) },
+                    onAddQueue = { onAddQueue(t) },
+                    onToggleLike = { onToggleLike(t) },
+                    onArtist = onArtist,
+                    onRadio = { onRadio(t) }
+                )
+            }
+            if (loadingMore) {
+                item {
+                    Box(Modifier.fillMaxWidth().padding(16.dp),
+                        contentAlignment = Alignment.Center) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            CircularProgressIndicator(modifier = Modifier.size(28.dp))
+                            Spacer(Modifier.height(8.dp))
+                            Text("Growing your radio…",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                }
+            }
+            item { Spacer(Modifier.height(32.dp)) }
+        }
+    }
+}
+
 @Composable
 private fun LibraryScreen(
     liked: List<YtTrack>,
@@ -7003,7 +7611,8 @@ private fun LibraryScreen(
     onOpenPlaylist: (String) -> Unit,
     onOpenProfile: () -> Unit,
     onArtist: (String) -> Unit,
-    onRadio: (YtTrack) -> Unit
+    onRadio: (YtTrack) -> Unit,
+    favArtists: List<LikedArtist> = emptyList()
 ) {
     val ctx = LocalContext.current
     val libScope = rememberCoroutineScope()
@@ -7022,108 +7631,85 @@ private fun LibraryScreen(
     }
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 16.dp)) {
         item {
-            Text("Your Library", style = MaterialTheme.typography.displaySmall,
-                modifier = Modifier.padding(start = 16.dp, top = 8.dp, end = 16.dp))
-        }
-        item {
-            Surface(
-                shape = RoundedCornerShape(16.dp),
-                tonalElevation = 2.dp,
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)
-                    .clickable { onOpenProfile() }
+            // Hero: gradient panel with library counts.
+            val playlistCount = try {
+                lists.size + 2
+            } catch (e: Exception) {
+                2
+            }
+            val likedCount = try {
+                liked.size
+            } catch (e: Exception) {
+                0
+            }
+            Box(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)
+                    .clip(RoundedCornerShape(24.dp))
+                    .background(
+                        Brush.linearGradient(
+                            listOf(Color(0xFFFA243C), Color(0xFF7D0018), Color(0xFF1A0208))
+                        )
+                    )
+                    .padding(20.dp)
             ) {
-                Row(
-                    Modifier.padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
                     Surface(
                         shape = androidx.compose.foundation.shape.CircleShape,
-                        color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(48.dp)
+                        color = Color.White.copy(alpha = 0.18f),
+                        modifier = Modifier.size(56.dp)
                     ) {
-                        Box(contentAlignment = Alignment.Center) {
+                        Box(contentAlignment = Alignment.Center,
+                            modifier = Modifier.fillMaxSize()) {
                             Icon(
-                                Icons.Filled.Person,
+                                Icons.Filled.LibraryMusic,
                                 contentDescription = null,
                                 tint = Color.White,
-                                modifier = Modifier.size(28.dp)
+                                modifier = Modifier.size(30.dp)
                             )
                         }
                     }
-                    Spacer(Modifier.width(12.dp))
+                    Spacer(Modifier.width(16.dp))
                     Column(Modifier.weight(1f)) {
-                        Text("Profile & settings", style = MaterialTheme.typography.titleMedium)
-                        Text("Account, appearance, downloads",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    Icon(Icons.Filled.ChevronRight, contentDescription = null)
-                }
-            }
-        }
-        // YouTube account session
-        item {
-            Surface(
-                shape = RoundedCornerShape(16.dp),
-                tonalElevation = 2.dp,
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)
-            ) {
-                Row(
-                    Modifier.padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        Icons.Filled.AccountCircle, contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(40.dp)
-                    )
-                    Spacer(Modifier.width(12.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text(
-                            if (loggedIn) "YouTube connected" else "Connect YouTube",
-                            style = MaterialTheme.typography.titleMedium
-                        )
-                        Text(
-                            if (loggedIn) "Session lives only on this device"
-                            else "Sign in for your real library",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    if (loggedIn) {
-                        TextButton(onClick = onSignOut) { Text("Sign out") }
-                    } else {
-                        Button(onClick = onSignIn) { Text("Sign in") }
+                        Text("Library", style = MaterialTheme.typography.displaySmall,
+                            color = Color.White)
+                        Text("$playlistCount playlists • $likedCount liked • $dlCount offline",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Color.White.copy(alpha = 0.8f))
                     }
                 }
             }
         }
-        // Offline downloads entry
         item {
-            Surface(
-                shape = RoundedCornerShape(16.dp),
-                tonalElevation = 2.dp,
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)
-                    .clickable { onOpenDownloads() }
+            // Quick actions: profile, YouTube session, downloads.
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Row(
-                    Modifier.padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        Icons.Filled.DownloadForOffline, contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(40.dp)
-                    )
-                    Spacer(Modifier.width(12.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text("Downloads", style = MaterialTheme.typography.titleMedium)
-                        Text("$dlCount songs offline",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    Icon(Icons.Filled.ChevronRight, contentDescription = null)
-                }
+                LibQuickTile(
+                    label = "Profile",
+                    sub = "Settings",
+                    icon = Icons.Filled.Person,
+                    colors = listOf(Color(0xFF5E5CE6), Color(0xFF1B1B6B)),
+                    onClick = onOpenProfile,
+                    modifier = Modifier.weight(1f)
+                )
+                LibQuickTile(
+                    label = "YouTube",
+                    sub = if (loggedIn) "Connected" else "Sign in",
+                    icon = Icons.Filled.AccountCircle,
+                    colors = if (loggedIn) listOf(Color(0xFF30D158), Color(0xFF0B5C2A))
+                    else listOf(Color(0xFFFF9F0A), Color(0xFFB25000)),
+                    onClick = { if (!loggedIn) onSignIn() },
+                    modifier = Modifier.weight(1f)
+                )
+                LibQuickTile(
+                    label = "Downloads",
+                    sub = "$dlCount offline",
+                    icon = Icons.Filled.DownloadForOffline,
+                    colors = listOf(Color(0xFF64D2FF), Color(0xFF0A84FF)),
+                    onClick = onOpenDownloads,
+                    modifier = Modifier.weight(1f)
+                )
             }
         }
         item {
@@ -7188,7 +7774,20 @@ private fun LibraryScreen(
                 )
             } else {
                 Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
-                    allFolders.chunked(2).forEach { row ->
+                    allFolders.chunked(2).forEachIndexed { ri, row ->
+                        androidx.compose.animation.AnimatedVisibility(
+                            visible = true,
+                            enter = if (LocalMotion.current) (
+                                androidx.compose.animation.fadeIn(
+                                    androidx.compose.animation.core.tween(
+                                        280, delayMillis = (ri * 70).coerceAtMost(420))) +
+                                androidx.compose.animation.slideInVertically(
+                                    androidx.compose.animation.core.tween(
+                                        280, delayMillis = (ri * 70).coerceAtMost(420))) { it / 5 }
+                            ) else androidx.compose.animation.fadeIn(
+                                androidx.compose.animation.core.tween(1)),
+                            label = "librow$ri"
+                        ) {
                         Row(
                             Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(12.dp)
@@ -7198,7 +7797,8 @@ private fun LibraryScreen(
                                 val isRecentFolder = p.id == "__recent__"
                                 Column(
                                     Modifier.weight(1f)
-                                        .clip(RoundedCornerShape(16.dp))
+                                        .clip(RoundedCornerShape(20.dp))
+                                        .pressScale(LocalMotion.current)
                                         .clickable {
                                             try {
                                                 if (isLikedFolder) {
@@ -7207,41 +7807,122 @@ private fun LibraryScreen(
                                                     showRecentFolder = true
                                                 } else {
                                                     onOpenPlaylist(p.id)
-                                                }
+    }
                                             } catch (e: Exception) {
                                             }
                                         }
                                 ) {
-                                    if (isLikedFolder) {
-                                        LikedFolderArt(
-                                            count = p.tracks.size,
-                                            size = 130.dp
-                                        )
-                                    } else if (isRecentFolder) {
-                                        RecentFolderArt(
-                                            tracks = p.tracks,
-                                            size = 130.dp
-                                        )
-                                    } else {
-                                        MosaicArt(p.tracks, 130.dp, 16.dp, p.coverPath)
+                                    // Full-bleed art with gradient scrim +
+                                    // white overlay text (Apple-style card).
+                                    Box(
+                                        Modifier.fillMaxWidth().aspectRatio(1f)
+                                            .clip(RoundedCornerShape(20.dp))
+                                            .background(MaterialTheme.colorScheme.surfaceVariant)
+                                    ) {
+                                        Box(
+                                            Modifier.fillMaxSize(),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            if (isLikedFolder) {
+                                                LikedFolderArt(
+                                                    count = p.tracks.size,
+                                                    size = 400.dp,
+                                                    showCount = false
+                                                )
+                                            } else if (isRecentFolder) {
+                                                RecentFolderArt(
+                                                    tracks = p.tracks,
+                                                    size = 400.dp
+                                                )
+                                            } else {
+                                                MosaicArt(p.tracks, 400.dp, 0.dp, p.coverPath)
+                                            }
+                                        }
+                                        // Bottom scrim (55% band) + white overlay text.
+                                        Box(
+                                            Modifier.align(Alignment.BottomCenter)
+                                                .fillMaxWidth()
+                                                .fillMaxHeight(0.55f)
+                                                .background(
+                                                    Brush.verticalGradient(
+                                                        listOf(
+                                                            Color.Transparent,
+                                                            Color.Black.copy(alpha = 0.82f)
+                                                        )
+                                                    )
+                                                )
+                                                .padding(12.dp),
+                                            contentAlignment = Alignment.BottomStart
+                                        ) {
+                                            Column {
+                                                Text(
+                                                    p.name,
+                                                    style = MaterialTheme.typography.titleMedium,
+                                                    color = Color.White,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                                Text(
+                                                    "${p.tracks.size} songs",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = Color.White.copy(alpha = 0.8f),
+                                                    maxLines = 1
+                                                )
+                                            }
+                                        }
                                     }
-                                    Spacer(Modifier.height(8.dp))
-                                    Text(
-                                        p.name,
-                                        style = MaterialTheme.typography.titleMedium,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                    Text(
-                                        "${p.tracks.size} songs",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        maxLines = 1
-                                    )
                                     Spacer(Modifier.height(12.dp))
                                 }
                             }
                             if (row.size == 1) Spacer(Modifier.weight(1f))
+                        }
+                        }
+                    }
+                }
+            }
+        }
+        // Favorite artists strip (hearted from any artist page).
+        if (favArtists.isNotEmpty()) {
+            item {
+                Text("Favorite Artists", style = MaterialTheme.typography.titleLarge,
+                    modifier = Modifier.padding(start = 16.dp, top = 16.dp, bottom = 4.dp))
+            }
+            item {
+                androidx.compose.foundation.lazy.LazyRow(
+                    contentPadding = PaddingValues(horizontal = 16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    itemsIndexed(favArtists, key = { i, x -> "fa$i-${x.name}" }) { _, a ->
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier.width(76.dp)
+                                .pressScale(LocalMotion.current)
+                                .clickable { onArtist(a.name) }
+                        ) {
+                            if (a.thumbUrl.isNotBlank()) {
+                                AsyncImage(
+                                    model = a.thumbUrl, contentDescription = null,
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier.size(68.dp)
+                                        .clip(androidx.compose.foundation.shape.CircleShape)
+                                )
+                            } else {
+                                Surface(
+                                    shape = androidx.compose.foundation.shape.CircleShape,
+                                    color = MaterialTheme.colorScheme.surfaceVariant,
+                                    modifier = Modifier.size(68.dp)
+                                ) {
+                                    Box(contentAlignment = Alignment.Center,
+                                        modifier = Modifier.fillMaxSize()) {
+                                        Icon(Icons.Filled.Person, contentDescription = null,
+                                            modifier = Modifier.size(30.dp))
+                                    }
+                                }
+                            }
+                            Spacer(Modifier.height(4.dp))
+                            Text(a.name, style = MaterialTheme.typography.bodySmall,
+                                maxLines = 2, overflow = TextOverflow.Ellipsis,
+                                textAlign = TextAlign.Center)
                         }
                     }
                 }
@@ -7365,7 +8046,7 @@ private fun LibraryScreen(
 
 /** Big heart-gradient art for the Liked Songs folder (130dp, 2.5x). */
 @Composable
-private fun LikedFolderArt(count: Int, size: Dp) {
+private fun LikedFolderArt(count: Int, size: Dp, showCount: Boolean = true) {
     Box(
         Modifier.size(size).clip(RoundedCornerShape(16.dp))
             .background(
@@ -7382,12 +8063,14 @@ private fun LikedFolderArt(count: Int, size: Dp) {
                 tint = Color.White.copy(alpha = 0.95f),
                 modifier = Modifier.size(size * 0.34f)
             )
-            Spacer(Modifier.height(4.dp))
-            Text(
-                "$count",
-                style = MaterialTheme.typography.titleMedium,
-                color = Color.White.copy(alpha = 0.9f)
-            )
+            if (showCount) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "$count",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = Color.White.copy(alpha = 0.9f)
+                )
+            }
         }
     }
 }
@@ -7479,6 +8162,8 @@ private fun SearchScreen(
     var results by remember { mutableStateOf<List<YtTrack>>(emptyList()) }
     var searching by remember { mutableStateOf(false) }
     var suggestions by remember { mutableStateOf<List<String>>(emptyList()) }
+    // Real artist hits (music_artists shelf): multiple artists per query.
+    var artistResults by remember { mutableStateOf<List<YtArtist>>(emptyList()) }
     val context = LocalContext.current
     var error by remember { mutableStateOf<String?>(null) }
     var retryTick by remember { mutableIntStateOf(0) }
@@ -7580,6 +8265,7 @@ private fun SearchScreen(
         val q = query.trim()
         if (q.length < 2) {
             suggestions = emptyList()
+            artistResults = emptyList()
             return@LaunchedEffect
         }
         delay(180)
@@ -7590,16 +8276,31 @@ private fun SearchScreen(
             if (query.trim() == q) suggestions = s
         } catch (e: Exception) {
         }
+        // Artist shelf in parallel (own debounce already paid above).
+        try {
+            val a = withContext(Dispatchers.IO) {
+                YoutubeRepository.searchArtists(q, 8)
+            }
+            if (query.trim() == q) artistResults = a
+        } catch (e: Exception) {
+        }
     }
 
-    // Artists row data (Spotify-style): distinct result artists; the row
-    // itself lives inside the LazyColumn below (remember must stay in
-    // composable context, not LazyList scope).
-    val artistHits = remember(results) {
+    // Artists row data (Spotify-style): real artist shelf first, track-
+    // derived artists as fallback (remember must stay in composable
+    // context, not LazyList scope).
+    val artistHits = remember(results, artistResults) {
         try {
-            results.filter { isArtistLike(it.artist) }
-                .distinctBy { it.artist.lowercase() }.take(8)
-                .map { t -> Pair(t.artist, t.thumbUrl) }
+            val real = artistResults.filter { it.name.isNotBlank() }
+                .distinctBy { it.name.lowercase() }.take(8)
+                .map { Triple(it.name, it.thumbUrl, it.subs) }
+            if (real.isNotEmpty()) {
+                real
+            } else {
+                results.filter { isArtistLike(it.artist) || it.displayArtist() != "Unknown Artist" }
+                    .distinctBy { it.displayArtist().lowercase() }.take(8)
+                    .map { Triple(it.displayArtist(), it.thumbUrl, "") }
+            }
         } catch (e: Exception) {
             emptyList()
         }
@@ -7676,7 +8377,7 @@ private fun SearchScreen(
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     itemsIndexed(artistHits) { _, hit ->
-                        val (aname, aart) = hit
+                        val (aname, aart, asubs) = hit
                         Column(
                             horizontalAlignment = Alignment.CenterHorizontally,
                             modifier = Modifier.width(72.dp)
@@ -7902,7 +8603,7 @@ private fun TrendingVideoRail(
                     Spacer(Modifier.height(6.dp))
                     Text(t.title, style = MaterialTheme.typography.bodyMedium,
                         maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text(t.artist, style = MaterialTheme.typography.bodySmall,
+                    Text(t.displayArtist(), style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
