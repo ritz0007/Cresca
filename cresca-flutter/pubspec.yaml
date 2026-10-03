@@ -1,0 +1,17 @@
+name: cresca_app
+description: Cresca music app — Flutter port core (Phase 1 pure-Dart slice).
+publish_to: none
+version: 1.5.0+20
+
+# Phase-1 note: pure-Dart core ships first so `dart test` stays green with
+# the standalone Dart SDK. The full Flutter shell (flutter SDK, material
+# widgets, cached_network_image, palette_generator, shared_preferences,
+# flutter_secure_storage, web_socket_channel, http) lands in the same
+# directory once the Flutter SDK repair completes — see
+# pubspec.flutter.yaml for the target app manifest.
+environment:
+  sdk: ^3.0.0
+
+dev_dependencies:
+  test: ^1.25.0
+  lints: ^5.0.0

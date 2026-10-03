@@ -1,0 +1,15 @@
+{
+  "name": "cresca-jam-server",
+  "version": "1.0.0",
+  "description": "Cresca JAM listen-together relay (tiny WebSocket hub, no audio relay)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
