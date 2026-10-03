@@ -1,1 +1,5 @@
+analyzer:
+  exclude:
+    - build/**
+    - android/**
 include: package:lints/recommended.yaml
