@@ -166,6 +166,10 @@ class YoutubeRepository {
     }
   }
 
+  /// Endless pager for See All (H11). Caller drains via loadMore().
+  SearchPager searchPager(String query, {int pageSize = 20}) =>
+      SearchPager(_explode, query, pageSize: pageSize);
+
   /// Suggestions via the fast engine only (<180ms target, S2).
   Future<List<String>> suggestions(String input) async {
     try {
@@ -513,31 +517,95 @@ class YoutubeRepository {
 
   /// Extractor Video → track, or null. Same gates as every other source
   /// (duration 30s–10min, lives, junk, distinct handled by caller).
-  YtTrack? _trackFromVideo(Video v) {
+  YtTrack? _trackFromVideo(Video v) => trackFromExplodeVideo(v);
+}
+
+/// Extractor Video → track, or null (shared with [SearchPager]).
+YtTrack? trackFromExplodeVideo(Video v) {
+  try {
+    final id = v.id.value;
+    if (id.length != 11) return null;
     try {
-      final id = v.id.value;
-      if (id.length != 11) return null;
-      try {
-        if (v.isLive) return null;
-      } catch (_) {}
-      final secs = v.duration?.inSeconds ?? 0;
-      if (secs < 30 || secs > 600) return null;
-      final title = v.title;
-      final artist = v.author.trim().isEmpty ? 'YouTube' : v.author.trim();
-      if (isMusicJunk(title, artist)) return null;
-      String thumb = '';
-      try {
-        thumb = sharpThumb(v.thumbnails.highResUrl);
-      } catch (_) {}
-      return YtTrack(
-        id: id,
-        title: title,
-        artist: artist,
-        thumbUrl: thumb,
-        watchUrl: 'https://www.youtube.com/watch?v=$id',
-      );
+      if (v.isLive) return null;
+    } catch (_) {}
+    final secs = v.duration?.inSeconds ?? 0;
+    if (secs < 30 || secs > 600) return null;
+    final title = v.title;
+    final artist = v.author.trim().isEmpty ? 'YouTube' : v.author.trim();
+    if (isMusicJunk(title, artist)) return null;
+    String thumb = '';
+    try {
+      thumb = sharpThumb(v.thumbnails.highResUrl);
+    } catch (_) {}
+    return YtTrack(
+      id: id,
+      title: title,
+      artist: artist,
+      thumbUrl: thumb,
+      watchUrl: 'https://www.youtube.com/watch?v=$id',
+    );
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Endless search pager for See All full pages (H11): keeps the query +
+/// continuation, appends page after page. Seen-set + exhausted flag
+/// mirror the native SearchPager.
+class SearchPager {
+  final YoutubeExplode _yt;
+  final String query;
+  final int pageSize;
+  final Set<String> seen = {};
+  bool exhausted = false;
+  VideoSearchList? _page;
+  bool _started = false;
+
+  SearchPager(this._yt, this.query, {this.pageSize = 20});
+
+  Future<List<YtTrack>> loadMore() async {
+    try {
+      if (exhausted) return [];
+      VideoSearchList? list = _page;
+      if (!_started) {
+        list = await _yt.search
+            .search(query, filter: TypeFilters.video)
+            .timeout(browseTimeout);
+        _started = true;
+      } else {
+        try {
+          final prev = _page;
+          if (prev == null) {
+            exhausted = true;
+            return [];
+          }
+          list = await prev.nextPage().timeout(browseTimeout);
+        } catch (_) {
+          list = null;
+        }
+        if (list == null) {
+          exhausted = true;
+          return [];
+        }
+      }
+      _page = list;
+      final current = list;
+      if (current.isEmpty) {
+        exhausted = true;
+        return [];
+      }
+      final out = <YtTrack>[];
+      for (final v in list) {
+        try {
+          final t = trackFromExplodeVideo(v);
+          if (t == null || !seen.add(t.id)) continue;
+          out.add(t);
+          if (out.length >= pageSize) break;
+        } catch (_) {}
+      }
+      return out;
     } catch (_) {
-      return null;
+      return [];
     }
   }
 }

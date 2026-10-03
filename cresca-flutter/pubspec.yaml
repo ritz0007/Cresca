@@ -20,6 +20,9 @@ dependencies:
   just_audio: ^0.10.5
   audio_service: ^0.18.17
   crypto: ^3.0.6
+  path_provider: ^2.1.5
+  url_launcher: ^6.3.2
+  share_plus: ^11.1.0
 
 dev_dependencies:
   flutter_test:
