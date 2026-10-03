@@ -19,6 +19,7 @@ dependencies:
   youtube_explode_dart: ^2.5.2
   just_audio: ^0.10.5
   audio_service: ^0.18.17
+  crypto: ^3.0.6
 
 dev_dependencies:
   flutter_test:

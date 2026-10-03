@@ -175,6 +175,84 @@ List<YtTrack> rankByVibe(
   }
 }
 
+/// BitChord-style autoplay queue fill (pure half of autoplayFor).
+/// Hard rules: seed + same-NAME echoes never queue, max 2 per artist
+/// (seed artist included), related-graph order preserved, mood-ranked.
+/// [fillerExtra] is the ONE artist-radio filler used when the graph is thin
+/// (already caller-filtered for labelish artists).
+List<YtTrack> buildAutoplay(
+  YtTrack seed,
+  List<YtTrack> related,
+  List<YtTrack> fillerExtra, {
+  int max = 20,
+  Random? random,
+}) {
+  try {
+    final clean = <YtTrack>[];
+    final artistCount = <String, int>{};
+    void consider(YtTrack c) {
+      if (clean.length >= max) return;
+      if (c.id == seed.id || isSameName(c, seed)) return;
+      final key = c.artist.toLowerCase();
+      final n = (artistCount[key] ?? 0) + 1;
+      if (n > 2) return;
+      artistCount[key] = n;
+      clean.add(c);
+    }
+
+    for (final c in related) {
+      consider(c);
+      if (clean.length >= max) break;
+    }
+    // Thin graph: ONE artist-radio filler, same hard rules, no dupes.
+    if (clean.length < max ~/ 2) {
+      for (final h in fillerExtra) {
+        if (clean.length >= max) break;
+        if (clean.any((e) => e.id == h.id)) continue;
+        consider(h);
+      }
+    }
+    final relIds = related.map((e) => e.id).toSet();
+    final ranked = rankByVibe(seed, clean,
+        relatedIds: relIds, random: random);
+    final seen = <String>{};
+    return ranked
+        .where((t) => t.id != seed.id && seen.add(t.id))
+        .take(max)
+        .toList();
+  } catch (_) {
+    return [];
+  }
+}
+
+/// Round-robin interleave: keeps every artist represented in new-release
+/// rails (native newReleases). Dedupes ids, caps at max.
+List<YtTrack> interleaveRoundRobin(List<List<YtTrack>> perArtist,
+    {int max = 12}) {
+  try {
+    final out = <YtTrack>[];
+    final seen = <String>{};
+    var round = 0;
+    var progress = true;
+    while (out.length < max && progress) {
+      progress = false;
+      for (final list in perArtist) {
+        if (out.length >= max) break;
+        if (round >= list.length) continue;
+        final t = list[round];
+        if (seen.add(t.id)) {
+          out.add(t);
+          progress = true;
+        }
+      }
+      round++;
+    }
+    return out;
+  } catch (_) {
+    return [];
+  }
+}
+
 /// Smart-shuffle order: preference-scored (liked/recent/same artist),
 /// randomized within score tiers, current first. Mirrors
 /// MainActivity.applySmartShuffle; caller feeds [QueueEngine.applyOrder].
