@@ -117,7 +117,12 @@ class QueueSheet extends StatelessWidget {
           alignment: Alignment.centerRight,
           padding: const EdgeInsets.only(right: 16),
           child: const Icon(Icons.delete_outline)),
-      onDismissed: (_) => state.controller.engine.removeAt(itemIndex),
+      onDismissed: (_) {
+        try {
+          state.controller.engine.removeAt(itemIndex);
+          state.poke();
+        } catch (_) {}
+      },
       child: TrackRow(
         track: t,
         contextQueue: engine.snapshot(),
@@ -158,6 +163,7 @@ class SliverReorderableListHack extends StatelessWidget {
             final pos = order.indexOf(engine.currentIndex);
             state.controller.engine
                 .moveInOrder(pos + 1 + a, pos + 1 + b);
+            state.poke();
           } catch (_) {}
         },
         itemBuilder: (_, i) {
@@ -170,8 +176,12 @@ class SliverReorderableListHack extends StatelessWidget {
                 alignment: Alignment.centerRight,
                 padding: const EdgeInsets.only(right: 16),
                 child: const Icon(Icons.delete_outline)),
-            onDismissed: (_) =>
-                state.controller.engine.removeAt(itemIndex),
+            onDismissed: (_) {
+              try {
+                state.controller.engine.removeAt(itemIndex);
+                state.poke();
+              } catch (_) {}
+            },
             child: TrackRow(
               track: t,
               contextQueue: engine.snapshot(),

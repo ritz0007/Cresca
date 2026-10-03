@@ -4,7 +4,9 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:audio_service/audio_service.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/semantics.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'app/app.dart';
@@ -20,6 +22,13 @@ Future<Directory> _filesDir() async {
 
 Future<void> _boot() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Debug drives (uiautomator) need the semantics tree; release builds
+  // enable it on demand via accessibility services.
+  if (kDebugMode) {
+    try {
+      SemanticsBinding.instance.ensureSemantics();
+    } catch (_) {}
+  }
   await lockPortrait();
   final dir = await _filesDir();
   final state = AppState(dir);

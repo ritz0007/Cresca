@@ -387,6 +387,7 @@ class _Transport extends StatelessWidget {
             IconButton(
               iconSize: 44,
               icon: const Icon(Icons.skip_previous, color: Colors.white),
+              tooltip: 'Previous',
               onPressed: () => state.controller.previous(),
             ),
             loading
@@ -409,12 +410,14 @@ class _Transport extends StatelessWidget {
                             .onPrimary),
                     icon: Icon(
                         playing ? Icons.pause : Icons.play_arrow),
+                    tooltip: playing ? 'Pause' : 'Play',
                     onPressed: () =>
                         state.controller.togglePlay(),
                   ),
             IconButton(
               iconSize: 44,
               icon: const Icon(Icons.skip_next, color: Colors.white),
+              tooltip: 'Next',
               onPressed: () => state.controller.next(),
             ),
             IconButton(
@@ -425,6 +428,7 @@ class _Transport extends StatelessWidget {
                           ? Icons.repeat
                           : Icons.repeat_one,
                   color: Colors.white),
+              tooltip: 'Repeat',
               onPressed: () {
                 try {
                   engine.cycleRepeat();

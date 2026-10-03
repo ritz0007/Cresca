@@ -33,11 +33,15 @@ class _SearchScreenState extends State<SearchScreen> {
   @override
   void initState() {
     super.initState();
-    AppScope.of(context).onSearchFocusRequest = () {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
       try {
-        FocusScope.of(context).requestFocus(_focus);
+        AppScope.of(context).onSearchFocusRequest = () {
+          try {
+            FocusScope.of(context).requestFocus(_focus);
+          } catch (_) {}
+        };
       } catch (_) {}
-    };
+    });
   }
 
   @override

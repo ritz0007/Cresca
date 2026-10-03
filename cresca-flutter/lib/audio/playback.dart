@@ -192,6 +192,18 @@ class PlayerController {
   Future<void> Function()? onLikeToggle;
   void Function(String message)? onError;
 
+  /// Fired synchronously after every engine mutation (setQueue, playAt,
+  /// next, previous) so the UI paints instantly without awaiting the
+  /// (potentially minutes-long) resolve cascade. The app layer hooks
+  /// this to notifyListeners.
+  void Function()? onQueueChanged;
+
+  void _emit() {
+    try {
+      onQueueChanged?.call();
+    } catch (_) {}
+  }
+
   PlayerController({
     required this.engine,
     required this.resolver,
@@ -246,6 +258,7 @@ class PlayerController {
     try {
       engine.setQueue(tracks, start);
       skipBudget.reset();
+      _emit();
       await _loadCurrent(autoplay: true);
     } catch (_) {}
   }
@@ -254,6 +267,7 @@ class PlayerController {
     try {
       engine.playAt(index);
       skipBudget.reset();
+      _emit();
       await _loadCurrent(autoplay: true);
     } catch (_) {}
   }
@@ -261,8 +275,8 @@ class PlayerController {
   Future<void> next() async {
     try {
       final r = engine.next();
+      _emit();
       if (r.step == NextStep.play) {
-        skipBudget.reset();
         await _loadCurrent(autoplay: true);
       } else if (r.step == NextStep.exhausted) {
         await _onExhausted(r.exhaustedTrack);
@@ -273,6 +287,7 @@ class PlayerController {
   Future<void> previous() async {
     try {
       final idx = engine.previous();
+      _emit();
       if (idx >= 0) {
         skipBudget.reset();
         await _loadCurrent(autoplay: true);

@@ -11,14 +11,25 @@ import '../state.dart';
 import 'player_sheet.dart';
 import 'track_row.dart';
 
-class MiniPlayer extends StatefulWidget {
+class MiniPlayer extends StatelessWidget {
   const MiniPlayer({super.key});
 
   @override
-  State<MiniPlayer> createState() => _MiniPlayerState();
+  Widget build(BuildContext context) {
+    final state = AppScope.of(context);
+    return _MiniBodyHost(state: state);
+  }
 }
 
-class _MiniPlayerState extends State<MiniPlayer>
+class _MiniBodyHost extends StatefulWidget {
+  final AppState state;
+  const _MiniBodyHost({required this.state});
+
+  @override
+  State<_MiniBodyHost> createState() => _MiniPlayerState();
+}
+
+class _MiniPlayerState extends State<_MiniBodyHost>
     with SingleTickerProviderStateMixin {
   double _dx = 0;
   bool _peekLeft = false;
@@ -26,7 +37,16 @@ class _MiniPlayerState extends State<MiniPlayer>
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = widget.state;
+    // AppScope never re-notifies (mutable singleton), so subscribe to
+    // the ChangeNotifier directly like every other live widget.
+    return AnimatedBuilder(
+      animation: state,
+      builder: (_, _) => _miniBody(state),
+    );
+  }
+
+  Widget _miniBody(AppState state) {
     final engine = state.controller.engine;
     final track = engine.current;
     if (track == null) return const SizedBox.shrink();
@@ -116,6 +136,8 @@ class _MiniPlayerState extends State<MiniPlayer>
                               icon: Icon(playing
                                   ? Icons.pause
                                   : Icons.play_arrow),
+                              tooltip:
+                                  playing ? 'Pause' : 'Play',
                               onPressed: () =>
                                   state.controller.togglePlay(),
                             );
@@ -186,11 +208,13 @@ class _Progress extends StatelessWidget {
         final f = total.inMilliseconds <= 0
             ? 0.0
             : (pos.inMilliseconds / total.inMilliseconds).clamp(0.0, 1.0);
-        return LinearProgressIndicator(
-          value: f,
-          minHeight: 2,
-          backgroundColor:
-              Theme.of(context).colorScheme.surfaceContainerHighest,
+        return ExcludeSemantics(
+          child: LinearProgressIndicator(
+            value: f,
+            minHeight: 2,
+            backgroundColor:
+                Theme.of(context).colorScheme.surfaceContainerHighest,
+          ),
         );
       },
     );

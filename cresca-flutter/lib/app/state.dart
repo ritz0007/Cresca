@@ -98,6 +98,11 @@ class AppState extends ChangeNotifier {
       cacheDir: filesDir,
     );
     controller.onSaveSession = _writeSession;
+    controller.onQueueChanged = () {
+      try {
+        notifyListeners();
+      } catch (_) {}
+    };
     controller.onError = (m) {
       try {
         notifyListeners();
@@ -115,6 +120,14 @@ class AppState extends ChangeNotifier {
         await crash.log('app init failed', e);
       } catch (_) {}
     }
+    // Kick the home load from here too (screen initState ordering is
+    // fragile across embedding versions); the screen also triggers
+    // on demand via post-frame callback.
+    try {
+      if (topPicks.isEmpty && rails.isEmpty) {
+        unawaited(loadHome());
+      }
+    } catch (_) {}
   }
 
   @override
@@ -132,6 +145,14 @@ class AppState extends ChangeNotifier {
     try {
       motionOn = on;
       prefs?.setBool(motionPrefKey, on);
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  /// Manual refresh after direct engine mutations from sheets
+  /// (remove/reorder), which bypass the controller hooks.
+  void poke() {
+    try {
       notifyListeners();
     } catch (_) {}
   }
@@ -180,22 +201,29 @@ class AppState extends ChangeNotifier {
 
   Future<List<YtTrack>> _fetchSection(HomeSection s) async {
     try {
+      List<YtTrack> out;
       if (s.query == '__released__') {
-        return await repo.playlistTracks(
+        out = await repo.playlistTracks(
             HomeFeed.releasedPlaylistId, max: 25);
+      } else if (s.query == '__charts__') {
+        out = await repo.chartTopVideos(max: 25);
+      } else {
+        out = await repo.searchMusic(s.query, max: 15);
       }
-      if (s.query == '__charts__') {
-        return await repo.chartTopVideos(max: 25);
-      }
-      return await repo.searchMusic(s.query, max: 15);
-    } catch (_) {
+      return out;
+    } catch (e) {
       return [];
     }
   }
 
   /// Staged paint (H10): cached waves instantly, then 4-way parallel
   /// refresh with incremental +120ms waves. Never demo data (H8).
+  /// Re-entry guarded (screen post-frame + AppState.init both trigger).
+  bool _homeLoading = false;
+
   Future<void> loadHome({bool force = false}) async {
+    if (_homeLoading) return;
+    _homeLoading = true;
     try {
       homeStatus = HomeStatus.loading;
       homeError = '';
@@ -277,10 +305,12 @@ class AppState extends ChangeNotifier {
       }
       notifyListeners();
       unawaited(_precacheChartsTaste());
+      _homeLoading = false;
     } catch (_) {
       homeStatus = HomeStatus.error;
       homeError = 'Something went wrong. Pull to retry.';
       notifyListeners();
+      _homeLoading = false;
     }
   }
 

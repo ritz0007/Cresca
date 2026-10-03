@@ -22,8 +22,12 @@ class _TrendingScreenState extends State<TrendingScreen> {
   @override
   void initState() {
     super.initState();
-    final state = AppScope.of(context);
-    if (state.trendingGlobal.isEmpty) state.loadTrending();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      try {
+        final state = AppScope.of(context);
+        if (state.trendingGlobal.isEmpty) state.loadTrending();
+      } catch (_) {}
+    });
   }
 
   @override

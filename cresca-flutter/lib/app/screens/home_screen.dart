@@ -28,10 +28,16 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
-    final state = AppScope.of(context);
-    if (state.topPicks.isEmpty && state.rails.isEmpty) {
-      state.loadHome();
-    }
+    // Post-frame: initState-time inherited lookup is unreliable, and the
+    // AppState.init belt-and-suspenders call covers cold boot anyway.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      try {
+        final state = AppScope.of(context);
+        if (state.topPicks.isEmpty && state.rails.isEmpty) {
+          state.loadHome();
+        }
+      } catch (_) {}
+    });
     _scroll.addListener(() {
       try {
         final max = _scroll.position.maxScrollExtent;
