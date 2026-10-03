@@ -1,11 +1,15 @@
+import 'dart:convert';
 import 'dart:math';
 
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:test/test.dart';
 
 import 'package:cresca_app/core/discovery.dart';
 import 'package:cresca_app/core/track.dart';
 import 'package:cresca_app/data/cache.dart';
 import 'package:cresca_app/data/innertube.dart';
+import 'package:cresca_app/data/resolve.dart';
 
 Map<String, dynamic> musicItem({
   String videoId = 'dQw4w9WgXcQ',
@@ -382,6 +386,100 @@ void main() {
       expect(out.map((e) => e.id).toList(), ['a1', 'b1', 'c1', 'a2', 'c2']);
     });
   });
+
+  group('resolve race', () {
+    test('player body shape', () {
+      final b = playerBody('dQw4w9WgXcQ', 'V', poToken: 'P');
+      expect(b['videoId'], 'dQw4w9WgXcQ');
+      expect(b['racyCheckOk'], true);
+      expect(b['contentCheckOk'], true);
+      expect(((b['context'] as Map)['client'] as Map)['clientName'],
+          'ANDROID_MUSIC');
+      expect(
+          (b['serviceIntegrityDimensions'] as Map)['poToken'], 'P');
+      expect(playerBody('x', '').containsKey('serviceIntegrityDimensions'),
+          isFalse);
+    });
+
+    test('player parse: status/mime/cipher/sort/dedupe', () {
+      expect(
+          parsePlayerUrls(jsonDecode(_playerJson([], status: 'LOGIN_REQUIRED'))
+              .cast<String, dynamic>()),
+          isEmpty);
+      final root = jsonDecode(_playerJson([
+        _fmt('video/mp4', 'https://v/1', 999999),
+        _fmt('audio/mp4', 'https://a/low', 48000),
+        _fmt('audio/mp4', '', 999), // cipher-shaped: no direct url
+        _fmt('audio/webm', 'https://a/hi', 160000),
+        _fmt('audio/webm', 'https://a/hi', 160000),
+      ])).cast<String, dynamic>();
+      expect(parsePlayerUrls(root),
+          ['https://a/hi', 'https://a/low']);
+    });
+
+    test('fast path remembers best; mem serves second call', () async {
+      var posts = 0;
+      final mock = MockClient((req) async {
+        posts++;
+        return _playerResponse(_playerJson([
+          _fmt('audio/mp4', 'https://a/best', 128000),
+          _fmt('audio/mp4', 'https://a/low', 48000),
+        ]));
+      });
+      final r = StreamResolver(httpClient: mock);
+      const w = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+      expect(await r.audioUrl(w), 'https://a/best');
+      final before = posts;
+      expect(await r.audioUrl(w), 'https://a/best');
+      expect(posts, before); // served from 5h mem
+    });
+
+    test('single-flight joins concurrent callers', () async {
+      var posts = 0;
+      final mock = MockClient((req) async {
+        posts++;
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        return _playerResponse(_playerJson([
+          _fmt('audio/mp4', 'https://a/1', 64000),
+        ]));
+      });
+      final r = StreamResolver(httpClient: mock);
+      const w = 'https://www.youtube.com/watch?v=AAAAAAAAAAA';
+      final results = await Future.wait([r.audioUrl(w), r.audioUrl(w)]);
+      expect(results, ['https://a/1', 'https://a/1']);
+      expect(posts, 2); // one race (music+vr legs), shared by both callers
+    });
+
+    test('403 everywhere falls back to manifest; drop refetches', () async {
+      var posts = 0;
+      final mock = MockClient((req) async {
+        posts++;
+        return _playerResponse('forbidden', 403);
+      });
+      final r = StreamResolver(
+        httpClient: mock,
+        manifestFetcher: (_) async => ['https://m/1'],
+      );
+      const w = 'https://www.youtube.com/watch?v=BBBBBBBBBBB';
+      expect(await r.audioUrl(w), 'https://m/1');
+      r.dropCachedUrl(w);
+      expect(await r.audioUrl(w), 'https://m/1');
+      expect(posts, greaterThan(2)); // refetched after drop
+    });
+
+    test('snapshot round-trips through resolver', () {
+      final r = StreamResolver(
+          httpClient: MockClient((_) async => _playerResponse('{}')));
+      r.urlCache.remember('w', 'https://g/u', 3000000000000);
+      r.urlCache.lastDiskSaveMs = 0;
+      final s = r.encodeUrlSnapshot()!;
+      final r2 = StreamResolver(
+          httpClient: MockClient((_) async => _playerResponse('{}')));
+      expect(r2.restoreUrlSnapshot(s), 1);
+      r.dispose();
+      r2.dispose();
+    });
+  });
 }
 
 class FakeRandom implements Random {
@@ -392,3 +490,17 @@ class FakeRandom implements Random {
   @override
   double nextDouble() => 0.0;
 }
+
+http.Response _playerResponse(String body, [int code = 200]) =>
+    http.Response(body, code,
+        headers: {'content-type': 'application/json'});
+
+String _playerJson(List<Map<String, dynamic>> formats,
+        {String status = 'OK'}) =>
+    jsonEncode({
+      'playabilityStatus': {'status': status},
+      'streamingData': {'adaptiveFormats': formats, 'formats': []},
+    });
+
+Map<String, dynamic> _fmt(String mime, String url, int br) =>
+    {'mimeType': mime, 'url': url, 'bitrate': br};
