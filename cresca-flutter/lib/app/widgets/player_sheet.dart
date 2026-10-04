@@ -579,7 +579,14 @@ class _ArtistPageState extends State<ArtistPage> {
       appBar: AppBar(title: Text(widget.name), actions: [
         IconButton(
           icon: Icon(fav ? Icons.favorite : Icons.favorite_border),
-          onPressed: () {},
+          tooltip: fav ? 'Unfavorite artist' : 'Favorite artist',
+          onPressed: () async {
+            try {
+              await state.library.toggleArtist(widget.name,
+                  thumbUrl: widget.thumb);
+              if (mounted) setState(() {});
+            } catch (_) {}
+          },
         ),
       ]),
       body: loading

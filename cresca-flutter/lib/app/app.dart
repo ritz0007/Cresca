@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 
 import 'screens/home_screen.dart';
 import 'screens/library_screen.dart';
+import 'screens/radio_screen.dart';
 import 'screens/search_screen.dart';
 import 'screens/trending_screen.dart';
 import 'state.dart';
@@ -89,10 +90,7 @@ class _CrescaAppState extends State<CrescaApp> {
                 children: const [
                   HomeScreen(),
                   TrendingScreen(),
-                  _Placeholder(
-                      title: 'Radio',
-                      hint:
-                          'Saved stations + song radio arrive in Phase 3'),
+                  RadioScreen(),
                   LibraryScreen(),
                   SearchScreen(),
                 ],
@@ -155,25 +153,6 @@ class _CrescaAppState extends State<CrescaApp> {
                       key: ValueKey('ready')),
             ),
           ],
-        ),
-      ),
-    );
-  }
-}
-
-class _Placeholder extends StatelessWidget {
-  final String title;
-  final String hint;
-  const _Placeholder({required this.title, required this.hint});
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: Text(title)),
-      body: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(32),
-          child: Text(hint, textAlign: TextAlign.center),
         ),
       ),
     );

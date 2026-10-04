@@ -187,9 +187,12 @@ class StreamResolver {
     try {
       if (manifestFetcher != null) return await manifestFetcher!(videoId);
       _yt ??= YoutubeExplode();
+      // Watch-page scrape is slow on constrained networks (it carries
+      // the n/sig decipher context the URLs need); the outer 45s cap
+      // still bounds the whole resolve.
       final manifest = await _yt!.videos.streams
           .getManifest(videoId)
-          .timeout(const Duration(seconds: 20));
+          .timeout(const Duration(seconds: 30));
       final sorted = manifest.audioOnly.toList()
         ..sort((a, b) =>
             b.bitrate.bitsPerSecond.compareTo(a.bitrate.bitsPerSecond));

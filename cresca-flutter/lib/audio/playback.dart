@@ -192,6 +192,10 @@ class PlayerController {
   Future<void> Function()? onLikeToggle;
   void Function(String message)? onError;
 
+  /// Fired after every successful track load and transport advance so
+  /// the app layer can top up autoplay tails (radio endless).
+  Future<void> Function()? onAdvanced;
+
   /// Fired synchronously after every engine mutation (setQueue, playAt,
   /// next, previous) so the UI paints instantly without awaiting the
   /// (potentially minutes-long) resolve cascade. The app layer hooks
@@ -443,6 +447,9 @@ class PlayerController {
       unawaited(saveSessionNow());
       unawaited(handler.broadcastState());
       unawaited(_precacheNext());
+      try {
+        await onAdvanced?.call();
+      } catch (_) {}
     } catch (_) {
       if (gen == _loadGen) await _onUnresolvable(track);
     } finally {

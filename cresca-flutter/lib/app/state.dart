@@ -26,6 +26,7 @@ import '../data/repository.dart';
 import '../data/resolve.dart';
 import 'crash.dart';
 import 'library.dart';
+import 'radio_store.dart' show SavedRadio;
 
 /// Home paint state (H8): skeleton → content | honest offline error.
 enum HomeStatus { loading, ready, error }
@@ -109,6 +110,11 @@ class AppState extends ChangeNotifier {
       cacheDir: filesDir,
     );
     controller.onSaveSession = _writeSession;
+    controller.onAdvanced = () async {
+      try {
+        await ensureRadioTail();
+      } catch (_) {}
+    };
     controller.onQueueChanged = () {
       try {
         notifyListeners();
@@ -538,6 +544,76 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  // ---------- radio (R2–R3) ----------
+
+  /// Station tap: music-only search → play from top (native onStation).
+  Future<void> startStation(String query) async {
+    try {
+      radioLoading = true;
+      notifyListeners();
+      final res = await repo.searchMusic(query, max: 20);
+      if (res.isNotEmpty) {
+        radioSeed = null;
+        radioTracks = [];
+        await controller.playQueue(res, 0);
+      }
+      radioLoading = false;
+      notifyListeners();
+    } catch (_) {
+      radioLoading = false;
+      notifyListeners();
+    }
+  }
+
+  /// Resume a saved radio card (plays its stored tracks).
+  Future<void> openRadio(SavedRadio radio) async {
+    try {
+      if (radio.tracks.isEmpty) {
+        await startRadio(radio.seed);
+        return;
+      }
+      radioSeed = radio.seed;
+      radioTracks = List.of(radio.tracks);
+      await controller.playQueue(radioTracks, 0);
+      await library.upsertRadio(radio);
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  Future<void> toggleRadioLike(String seedId) async {
+    try {
+      await library.toggleRadioLike(seedId);
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  Future<void> deleteRadio(String seedId) async {
+    try {
+      await library.deleteRadio(seedId);
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  /// Saves the current song-radio session as a card (R3 Save as playlist
+  /// counterpart: radios persist separately from playlists).
+  Future<void> saveRadioCard() async {
+    try {
+      final seed = radioSeed;
+      if (seed == null || radioTracks.isEmpty) return;
+      await library.upsertRadio(SavedRadio(
+        id: 'radio_${seed.id}',
+        seed: seed,
+        title: '${seed.displayArtist()} Radio',
+        subtitle: '${radioTracks.length} songs',
+        thumbUrl: seed.thumbUrl,
+        tracks: List.of(radioTracks),
+        createdAt: DateTime.now().millisecondsSinceEpoch,
+        updatedAt: DateTime.now().millisecondsSinceEpoch,
+      ));
+      notifyListeners();
+    } catch (_) {}
+  }
+
   // ---------- radio lite (R3 path for Phase-2 audio) ----------
 
   Future<void> startRadio(YtTrack seed) async {
@@ -549,6 +625,7 @@ class AppState extends ChangeNotifier {
       radioTracks = distinctById([seed, ...fill]).take(200).toList();
       await controller.playQueue(radioTracks, 0);
       radioLoading = false;
+      unawaited(saveRadioCard());
       notifyListeners();
     } catch (_) {
       radioLoading = false;
@@ -557,8 +634,7 @@ class AppState extends ChangeNotifier {
   }
 
   /// Chained autoplay: ≤5 remain → extend from the tail (200 cap).
-  Future<void> ensureRadioTail() async {
-    try {
+  Future<void> ensureRadioTail() async {    try {
       if (radioTracks.isEmpty) {
         // Plain queue: top up from related once (endless fixed-20).
         final cur = controller.engine.current;
