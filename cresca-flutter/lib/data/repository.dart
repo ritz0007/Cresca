@@ -170,6 +170,39 @@ class YoutubeRepository {
   SearchPager searchPager(String query, {int pageSize = 20}) =>
       SearchPager(_explode, query, pageSize: pageSize);
 
+  /// Logged-in library pull (liked songs + history) for taste seeds.
+  /// Authed browse; empty when logged out or on any failure. Caller
+  /// persists + feeds recommendation seeds — never merges into local
+  /// liked/recent.
+  Future<(List<YtTrack>, List<YtTrack>)> ytLibrary({int max = 50}) async {
+    try {
+      if (session.cookies.isEmpty) return (<YtTrack>[], <YtTrack>[]);
+      Future<List<YtTrack>> pull(String browseId) async {
+        try {
+          final json = await _post(
+            'browse',
+            browseBody(browseId, session.visitorData),
+          );
+          if (json == null) return [];
+          return parseShelves(json, 4, 25)
+              .values
+              .expand((e) => e)
+              .toList();
+        } catch (_) {
+          return [];
+        }
+      }
+
+      final liked =
+          distinctById(await pull('FEmusic_liked')).take(max).toList();
+      final history =
+          distinctById(await pull('FEmusic_history')).take(max).toList();
+      return (liked, history);
+    } catch (_) {
+      return (<YtTrack>[], <YtTrack>[]);
+    }
+  }
+
   /// Suggestions via the fast engine only (<180ms target, S2).
   Future<List<String>> suggestions(String input) async {
     try {

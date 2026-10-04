@@ -15,6 +15,7 @@ import 'package:share_plus/share_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../audio/playback.dart';
+import '../auth/session.dart';
 import '../core/home_feed.dart';
 import '../core/motion.dart';
 import '../core/queue.dart';
@@ -42,6 +43,7 @@ class AppState extends ChangeNotifier {
   late final PlayerController controller;
   late final LibraryStore library;
   late final CrashLog crash;
+  final YtSession ytSession = YtSession();
   SharedPreferences? prefs;
 
   bool motionOn = true;
@@ -85,13 +87,22 @@ class AppState extends ChangeNotifier {
       refreshCount = prefs?.getInt('home_refresh_count') ?? 0;
     } catch (_) {}
     final urlCache = UrlCache();
-    final session = RepoSession();
+    await ytSession.load();
+    final session = RepoSession()
+      ..cookies = ytSession.cookies
+      ..visitorData = ytSession.visitorData
+      ..poToken = ytSession.poToken;
     repo = YoutubeRepository(
       httpClient: http.Client(),
       session: session,
       cacheDir: filesDir,
     );
-    resolver = StreamResolver(urlCache: urlCache);
+    resolver = StreamResolver(
+      urlCache: urlCache,
+      cookies: () => ytSession.cookies,
+      visitorData: () => ytSession.visitorData,
+      poToken: () => ytSession.poToken,
+    );
     controller = PlayerController(
       engine: QueueEngine(),
       resolver: resolver,
@@ -139,6 +150,49 @@ class AppState extends ChangeNotifier {
       resolver.dispose();
     } catch (_) {}
     super.dispose();
+  }
+
+  /// Pushes the encrypted session into the repository (login/logout).
+  void syncSessionToRepo() {
+    try {
+      repo.session.cookies = ytSession.cookies;
+      repo.session.visitorData = ytSession.visitorData;
+      repo.session.poToken = ytSession.poToken;
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  /// YouTube logout: wipes the encrypted session (the sheet clears the
+  /// WebView cookies) and drops session-bound caches.
+  Future<void> logoutYouTube() async {
+    try {
+      await ytSession.logout();
+      syncSessionToRepo();
+    } catch (_) {}
+  }
+
+  /// Taste seeds pull after login (liked + history, persisted for
+  /// recommendations only — never merged into local liked/recent).
+  Future<void> pullTasteSeeds() async {
+    try {
+      if (!ytSession.isLoggedIn) return;
+      final (liked, history) = await repo.ytLibrary(max: 50);
+      final seeds = [...liked, ...history].take(100).toList();
+      if (seeds.isEmpty) return;
+      final f = File('${filesDir.path}/yt_seeds.json');
+      await atomicWrite(
+          f,
+          jsonEncode([
+            for (final t in seeds)
+              {
+                'id': t.id,
+                'title': t.title,
+                'artist': t.artist,
+                'thumb': t.thumbUrl,
+                'watch': t.watchUrl,
+              },
+          ]));
+    } catch (_) {}
   }
 
   void setMotion(bool on) {

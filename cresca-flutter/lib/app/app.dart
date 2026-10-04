@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'screens/home_screen.dart';
+import 'screens/library_screen.dart';
 import 'screens/search_screen.dart';
 import 'screens/trending_screen.dart';
 import 'state.dart';
@@ -92,10 +93,7 @@ class _CrescaAppState extends State<CrescaApp> {
                       title: 'Radio',
                       hint:
                           'Saved stations + song radio arrive in Phase 3'),
-                  _Placeholder(
-                      title: 'Library',
-                      hint:
-                          'Folders, playlists + downloads arrive in Phase 3'),
+                  LibraryScreen(),
                   SearchScreen(),
                 ],
               ),
