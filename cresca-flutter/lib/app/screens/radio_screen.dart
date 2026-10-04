@@ -138,7 +138,9 @@ class _RadioCard extends StatelessWidget {
                       radio.liked
                           ? Icons.favorite
                           : Icons.favorite_border,
-                      color: radio.liked ? Colors.red : Colors.white,
+                      color: radio.liked
+                          ? const Color(0xFF1DB954)
+                          : Colors.white,
                     ),
                     onPressed: () =>
                         state.toggleRadioLike(radio.seed.id),

@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import '../../core/home_feed.dart';
 import '../../core/track.dart';
 import '../app.dart';
+import '../design.dart';
 import '../state.dart';
 import '../widgets/mini_player.dart';
 import '../widgets/track_row.dart';
@@ -140,6 +141,9 @@ class _HomeScreenState extends State<HomeScreen> {
                     onRetry: () => state.loadHome(force: true),
                   ),
                 ),
+              if (state.pendingUpdate != null)
+                SliverToBoxAdapter(
+                    child: _UpdateBanner(state: state)),
               if (state.topPicks.isNotEmpty) ...[
                 SliverToBoxAdapter(
                     child: _TopPicks(tracks: state.topPicks)),
@@ -167,6 +171,91 @@ class SliverListSkeleton extends StatelessWidget {
     return SliverList.builder(
       itemCount: 8,
       itemBuilder: (_, _) => const TrackSkeleton(),
+    );
+  }
+}
+
+/// Update banner (H9/Y4): green-tinted, tag + Download/Install +
+/// release notes + dismiss. Session-scoped dismiss only.
+class _UpdateBanner extends StatelessWidget {
+  final AppState state;
+  const _UpdateBanner({required this.state});
+
+  @override
+  Widget build(BuildContext context) {
+    final u = state.pendingUpdate;
+    if (u == null) return const SizedBox.shrink();
+    final prog = state.updateProgress;
+    final downloaded = state.updateDownloaded;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(14, 10, 8, 10),
+        decoration: BoxDecoration(
+          color: spotifyGreen.withValues(alpha: 0.14),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+              color: spotifyGreen.withValues(alpha: 0.4)),
+        ),
+        child: Row(
+          children: [
+            const Icon(Icons.system_update_outlined,
+                color: spotifyGreen),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Cresca ${u.tag} available',
+                      style: const TextStyle(
+                          fontWeight: FontWeight.w700)),
+                  Text(
+                      prog >= 0
+                          ? 'Downloading… ${prog.round()}%'
+                          : downloaded
+                              ? 'Downloaded — ready to install.'
+                              : 'Tap Update to download.',
+                      style: Theme.of(context)
+                          .textTheme
+                          .bodySmall),
+                ],
+              ),
+            ),
+            TextButton(
+              onPressed: () => state.openReleasePage(),
+              child: const Text("What's new"),
+            ),
+            FilledButton(
+              style: spotifyPlayStyle(),
+              onPressed: prog >= 0
+                  ? null
+                  : () async {
+                      try {
+                        if (downloaded) {
+                          await state.installUpdate();
+                        } else {
+                          final msg =
+                              await state.downloadUpdate();
+                          if (context.mounted &&
+                              msg.isNotEmpty) {
+                            ScaffoldMessenger.of(context)
+                                .showSnackBar(SnackBar(
+                                    content: Text(msg)));
+                          }
+                        }
+                      } catch (_) {}
+                    },
+              child: Text(
+                  downloaded ? 'Install' : 'Update'),
+            ),
+            IconButton(
+              icon: const Icon(Icons.close, size: 18),
+              tooltip: 'Dismiss',
+              onPressed: () => state.dismissUpdate(),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -228,6 +317,7 @@ class _TopPicks extends StatelessWidget {
           Row(
             children: [
               FilledButton.icon(
+                style: spotifyPlayStyle(),
                 icon: const Icon(Icons.play_arrow),
                 label: const Text('Play all'),
                 onPressed: () => state.actPlay(tracks, 0),
@@ -343,6 +433,7 @@ class _HeroCard extends StatelessWidget {
                 Row(
                   children: [
                     FilledButton(
+                        style: spotifyPlayStyle(),
                         onPressed: () => state.actPlay(tracks, 0),
                         child: const Text('Play')),
                     const SizedBox(width: 8),

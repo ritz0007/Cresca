@@ -27,6 +27,10 @@ dependencies:
   google_fonts: ^6.2.1
   background_downloader: ^9.1.0
   app_links: ^6.3.2
+  package_info_plus: ^8.3.0
+  open_file: ^3.5.10
+  flutter_local_notifications: ^19.4.0
+  permission_handler: ^12.0.1
 
 dev_dependencies:
   flutter_test:

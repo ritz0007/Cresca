@@ -191,6 +191,11 @@ class PlayerController {
   Future<void> Function()? onLikeToggle;
   void Function(String message)? onError;
 
+  /// Local-file override (offline downloads): when set and non-null
+  /// for the current track id, the file plays instead of resolving.
+  /// Replay prefers file (L5).
+  File? Function(String trackId)? localFileFor;
+
   /// Fired after every successful track load and transport advance so
   /// the app layer can top up autoplay tails (radio endless).
   Future<void> Function()? onAdvanced;
@@ -216,6 +221,9 @@ class PlayerController {
   })  : handler = handler ?? CrescaAudioHandler(),
         player = player ??
             AudioPlayer(
+              // Native fetch parity: ExoPlayer sends the app UA directly
+              // (no localhost proxy — sources carry no custom headers).
+              userAgent: 'Cresca/1.0 (Android)',
               audioLoadConfiguration: const AudioLoadConfiguration(
                 androidLoadControl: AndroidLoadControl(
                   minBufferDuration: Duration(milliseconds: 1500),
@@ -417,6 +425,31 @@ class PlayerController {
     errorLine = null;
     try {
       engine.resetRetries();
+      // Offline-first: a downloaded file wins over the network (L5).
+      File? local;
+      try {
+        local = localFileFor?.call(track.id);
+      } catch (_) {
+        local = null;
+      }
+      if (local != null) {
+        if (gen != _loadGen) return;
+        await _setFileWindow(track, local.path, seekMs: seekMs);
+        if (gen != _loadGen) return;
+        if (autoplay && !deferPlay) {
+          try {
+            await player.play();
+          } catch (_) {}
+        } else {
+          try {
+            await player.pause();
+          } catch (_) {}
+        }
+        skipBudget.reset();
+        unawaited(saveSessionNow());
+        unawaited(handler.broadcastState());
+        return;
+      }
       var url = await resolver.audioUrl(track.watchUrl);
       var tries = 0;
       while ((url == null || url.isEmpty) && tries < 3) {
@@ -454,6 +487,17 @@ class PlayerController {
     } finally {
       if (gen == _loadGen) resolving = false;
     }
+  }
+
+  /// Single local file window (offline replay).
+  Future<void> _setFileWindow(YtTrack track, String path,
+      {int seekMs = 0}) async {
+    final src = AudioSource.uri(Uri.file(path), tag: _mediaTag(track));
+    await player.setAudioSource(
+      src,
+      initialPosition:
+          seekMs > 0 ? Duration(milliseconds: seekMs) : Duration.zero,
+    );
   }
 
   /// 3-item window [current, +1, +2]: gapless auto-advance inside the

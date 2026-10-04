@@ -26,8 +26,15 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'dart:math' as math;
 
-/// Cresca red — brand primary in both themes (A3 default song-null).
+/// Cresca red — brand moments only (splash/logo). Product actions speak
+/// Spotify green (user direction: everything Spotify except the player,
+/// which keeps its Apple-Music treatment).
 const crescaRed = Color(0xFFFA243C);
+
+/// Spotify resting palette.
+const spotifyGreen = Color(0xFF1DB954);
+const spotifyGreenBright = Color(0xFF1ED760);
+const spotifySubtext = Color(0xFFB3B3B3);
 
 /// Builds the app TextTheme: catalog scale × Montserrat (Spotify voice).
 /// Weights: ExtraBold→w800, Bold→w700, SemiBold→w600, Normal→w400.
@@ -56,17 +63,55 @@ TextTheme crescaTextTheme(TextTheme base) {
 }
 
 ThemeData crescaTheme(Brightness brightness) {
-  final seed = ColorScheme.fromSeed(
-      seedColor: crescaRed, brightness: brightness);
-  final scheme = brightness == Brightness.light
-      ? seed.copyWith(
-          surface: const Color(0xFFFFFFFF),
-          surfaceContainerHighest: const Color(0xFFF2F2F6),
-        )
-      : seed.copyWith(
-          surface: const Color(0xFF000000),
-          surfaceContainerHighest: const Color(0xFF1C1C1E),
-        );
+  final dark = brightness == Brightness.dark;
+  // Spotify look: near-black surfaces, white type, green resting
+  // accent. Nav selection stays white (Spotify marks tabs with tint,
+  // green is reserved for actions).
+  final scheme = ColorScheme(
+    brightness: brightness,
+    primary: spotifyGreen,
+    onPrimary: Colors.black,
+    primaryContainer:
+        dark ? const Color(0xFF282828) : const Color(0xFFE8F5E9),
+    onPrimaryContainer: dark ? Colors.white : Colors.black,
+    secondary: spotifyGreenBright,
+    onSecondary: Colors.black,
+    secondaryContainer:
+        dark ? const Color(0xFF282828) : const Color(0xFFF2F2F6),
+    onSecondaryContainer: dark ? Colors.white : Colors.black,
+    tertiary: spotifyGreenBright,
+    onTertiary: Colors.black,
+    error: dark ? const Color(0xFFF15E6C) : const Color(0xFFBA1A1A),
+    onError: dark ? Colors.black : Colors.white,
+    surface: dark ? const Color(0xFF121212) : const Color(0xFFFFFFFF),
+    onSurface: dark ? Colors.white : Colors.black,
+    surfaceDim:
+        dark ? const Color(0xFF0A0A0A) : const Color(0xFFF2F2F6),
+    surfaceBright:
+        dark ? const Color(0xFF282828) : const Color(0xFFFFFFFF),
+    surfaceContainerLowest:
+        dark ? const Color(0xFF000000) : const Color(0xFFFFFFFF),
+    surfaceContainerLow:
+        dark ? const Color(0xFF121212) : const Color(0xFFF7F7F9),
+    surfaceContainer:
+        dark ? const Color(0xFF181818) : const Color(0xFFF2F2F6),
+    surfaceContainerHigh:
+        dark ? const Color(0xFF1E1E1E) : const Color(0xFFEDEDF0),
+    surfaceContainerHighest:
+        dark ? const Color(0xFF282828) : const Color(0xFFE8E8EA),
+    onSurfaceVariant:
+        dark ? spotifySubtext : const Color(0xFF6E6E73),
+    outline: dark ? const Color(0xFF2A2A2A) : const Color(0xFFE5E5EA),
+    outlineVariant:
+        dark ? const Color(0xFF2A2A2A) : const Color(0xFFE5E5EA),
+    shadow: Colors.black,
+    scrim: Colors.black,
+    inverseSurface: dark ? Colors.white : Colors.black,
+    onInverseSurface: dark ? Colors.black : Colors.white,
+    inversePrimary:
+        dark ? const Color(0xFF0D7A37) : spotifyGreen,
+    surfaceTint: Colors.transparent,
+  );
   return ThemeData(
     useMaterial3: true,
     colorScheme: scheme,
@@ -221,6 +266,13 @@ class FrostedTabBar extends StatelessWidget {
   }
 }
 
+/// Spotify primary action: green pill, black label/glyph.
+ButtonStyle spotifyPlayStyle() => FilledButton.styleFrom(
+      backgroundColor: spotifyGreen,
+      foregroundColor: Colors.black,
+      textStyle: const TextStyle(fontWeight: FontWeight.w700),
+    );
+
 /// iOS spinner (Cupertino activity indicator in M3 clothing).
 class IosSpinner extends StatelessWidget {
   final double size;
@@ -368,12 +420,23 @@ class FloatingTabBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final dark =
+        Theme.of(context).brightness == Brightness.dark;
+    // Spotify marks the active tab white (dark) / black (light);
+    // green is reserved for actions.
+    final selected = dark ? Colors.white : Colors.black;
     return SafeArea(
       top: false,
       child: Padding(
         padding:
             const EdgeInsets.fromLTRB(10, 0, 10, 10),
-        child: Center(
+        // heightFactor: intrinsic height only. A bare Center expands
+        // to the full bottomNav area and Scaffold centers the pill
+        // mid-screen (tabs at y~1103 on 2400px). Align keeps the bar
+        // pinned to the bottom.
+        child: Align(
+          alignment: Alignment.center,
+          heightFactor: 1.0,
           child: ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 440),
             child: Glass(
@@ -397,7 +460,7 @@ class FloatingTabBar extends StatelessWidget {
                                   : _items[i].$1,
                               size: 25,
                               color: i == current
-                                  ? scheme.primary
+                                  ? selected
                                   : scheme.onSurfaceVariant.withValues(
                                       alpha: 0.65),
                             ),
@@ -409,7 +472,7 @@ class FloatingTabBar extends StatelessWidget {
                                     fontSize: 11,
                                     fontWeight: FontWeight.w600,
                                     color: i == current
-                                        ? scheme.primary
+                                        ? selected
                                         : scheme.onSurfaceVariant
                                             .withValues(
                                                 alpha: 0.65))),

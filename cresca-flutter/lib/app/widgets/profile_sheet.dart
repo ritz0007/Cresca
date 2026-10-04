@@ -6,6 +6,7 @@
 import 'package:flutter/material.dart';
 
 import '../app.dart';
+import '../design.dart';
 import '../state.dart';
 import 'session_sheet.dart';
 
@@ -226,13 +227,126 @@ class _ProfileSheetState extends State<ProfileSheet> {
                       },
                     ),
                     _H('Updates'),
-                    const ListTile(
-                      leading:
-                          Icon(Icons.system_update_outlined),
-                      title: Text('Check for updates'),
-                      subtitle: Text(
-                          'Automatic update flow lands with release tooling.'),
-                    ),
+                    Builder(builder: (ctx) {
+                      final u = state.pendingUpdate;
+                      final checking = state.updateChecking;
+                      final prog = state.updateProgress;
+                      final downloaded = state.updateDownloaded;
+                      final subtitle = checking
+                          ? 'Checking for updates…'
+                          : u == null
+                              ? 'You are on the latest release.'
+                              : prog >= 0
+                                  ? 'Downloading ${u.tag}… ${prog.round()}%'
+                                  : downloaded
+                                      ? '${u.tag} downloaded — ready to install.'
+                                      : 'Cresca ${u.tag} available.';
+                      return Column(
+                        children: [
+                          ListTile(
+                            leading: const Icon(
+                                Icons.system_update_outlined),
+                            title: Text(u == null
+                                ? 'Check for updates'
+                                : 'Cresca ${u.tag} available'),
+                            subtitle: prog >= 0
+                                ? Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(subtitle),
+                                      const SizedBox(height: 6),
+                                      LinearProgressIndicator(
+                                          value: prog / 100),
+                                    ],
+                                  )
+                                : Text(subtitle),
+                            trailing: checking
+                                ? const SizedBox(
+                                    width: 20,
+                                    height: 20,
+                                    child:
+                                        CircularProgressIndicator(
+                                            strokeWidth: 2))
+                                : IconButton(
+                                    icon: const Icon(
+                                        Icons.refresh_outlined),
+                                    tooltip:
+                                        'Check for updates',
+                                    onPressed: () async {
+                                      try {
+                                        final msg = await state
+                                            .checkForUpdates(
+                                                manual: true);
+                                        if (ctx.mounted) {
+                                          ScaffoldMessenger.of(
+                                                  ctx)
+                                              .showSnackBar(
+                                                  SnackBar(
+                                                      content: Text(
+                                                          msg)));
+                                        }
+                                      } catch (_) {}
+                                    },
+                                  ),
+                          ),
+                          if (u != null)
+                            Padding(
+                              padding:
+                                  const EdgeInsets.fromLTRB(
+                                      16, 0, 16, 4),
+                              child: Row(
+                                children: [
+                                  Expanded(
+                                    child: FilledButton.icon(
+                                      style:
+                                          spotifyPlayStyle(),
+                                      icon: Icon(downloaded
+                                          ? Icons
+                                              .install_mobile_outlined
+                                          : Icons
+                                              .download_outlined),
+                                      label: Text(downloaded
+                                          ? 'Install'
+                                          : prog >= 0
+                                              ? 'Downloading…'
+                                              : 'Download'),
+                                      onPressed: prog >= 0
+                                          ? null
+                                          : () async {
+                                              try {
+                                                final msg = downloaded
+                                                    ? await state
+                                                        .installUpdate()
+                                                    : await state
+                                                        .downloadUpdate();
+                                                if (ctx.mounted) {
+                                                  ScaffoldMessenger.of(
+                                                          ctx)
+                                                      .showSnackBar(
+                                                          SnackBar(
+                                                              content: Text(
+                                                                  msg)));
+                                                }
+                                              } catch (_) {}
+                                            },
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: OutlinedButton(
+                                      child: const Text(
+                                          'Release notes'),
+                                      onPressed: () => state
+                                          .openReleasePage(),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                        ],
+                      );
+                    }),
                     _H('About'),
                     const ListTile(
                       title: Text('Cresca 1.5.0 (Flutter)'),

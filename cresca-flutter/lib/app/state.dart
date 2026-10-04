@@ -29,6 +29,7 @@ import '../data/resolve.dart';
 import 'crash.dart';
 import 'downloads.dart';
 import 'library.dart';
+import 'updates.dart';
 import 'radio_store.dart' show SavedRadio;
 
 /// Home paint state (H8): skeleton → content | honest offline error.
@@ -50,7 +51,13 @@ class AppState extends ChangeNotifier {
   late final DownloadStore downloads;
   final YtSession ytSession = YtSession();
   final SpotifySession spotify = SpotifySession();
+  final UpdateChecker updates = UpdateChecker();
   SharedPreferences? prefs;
+
+  /// Pending update (banner source, H9/Y4).
+  AppUpdate? pendingUpdate;
+  bool updateChecking = false;
+  double updateProgress = -1;
 
   /// Appearance: system / light / dark (L4).
   String appearance = 'system';
@@ -177,6 +184,7 @@ class AppState extends ChangeNotifier {
         unawaited(loadHome());
       }
     } catch (_) {}
+    scheduleAutoUpdateCheck();
   }
 
   @override
@@ -360,6 +368,142 @@ class AppState extends ChangeNotifier {
     } catch (_) {
       return '';
     }
+  }
+
+  /// Update check (Y4): daily throttle unless manual; sets pendingUpdate
+  /// when the release tag is newer than the installed version.
+  /// Returns a human status string for toasts.
+  Future<String> checkForUpdates({bool manual = false}) async {
+    if (updateChecking) return 'Checking…';
+    try {
+      updateChecking = true;
+      updateProgress = -1;
+      notifyListeners();
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final last = prefs?.getInt('update_last_check') ?? 0;
+      if (!manual && now - last < updateIntervalMs) return 'Up to date';
+      final rel = await updates.latest();
+      try {
+        await prefs?.setInt('update_last_check', now);
+      } catch (_) {}
+      if (rel == null) return 'Check failed — try again later';
+      final current = await updates.currentVersion();
+      if (!isNewerTag(rel.tag, current)) {
+        pendingUpdate = null;
+        notifyListeners();
+        return 'Up to date ($current)';
+      }
+      pendingUpdate = rel;
+      try {
+        final raw = prefs?.getStringList('update_notified_tags') ?? [];
+        await updates.notifyOnce(
+          rel,
+          raw.toSet(),
+          (tag) async {
+            try {
+              final next = {...raw, tag}.toList();
+              await prefs?.setStringList(
+                  'update_notified_tags', next);
+            } catch (_) {}
+          },
+        );
+      } catch (_) {}
+      notifyListeners();
+      return 'Cresca ${rel.tag} available';
+    } catch (_) {
+      return 'Check failed — try again later';
+    } finally {
+      updateChecking = false;
+      try {
+        notifyListeners();
+      } catch (_) {}
+    }
+  }
+
+  /// Quiet auto-check shortly after startup (Y4 daily throttle inside).
+  void scheduleAutoUpdateCheck() {
+    try {
+      unawaited(Future<void>.delayed(
+          const Duration(seconds: 10), () async {
+        try {
+          await checkForUpdates();
+        } catch (_) {}
+      }));
+    } catch (_) {}
+  }
+
+  /// Local path of the downloaded update APK (when present).
+  String? get updateApkPath {
+    try {
+      final u = pendingUpdate;
+      if (u == null || u.apkName.isEmpty) return null;
+      final f = File('${filesDir.path}/Cresca/${u.apkName}');
+      return f.existsSync() ? f.path : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  bool get updateDownloaded => updateApkPath != null;
+
+  Future<String> downloadUpdate() async {
+    try {
+      final u = pendingUpdate;
+      if (u == null) return 'No update pending';
+      if (u.apkUrl.isEmpty) {
+        if (u.pageUrl.isNotEmpty) {
+          try {
+            await launchUrl(Uri.parse(u.pageUrl),
+                mode: LaunchMode.externalApplication);
+          } catch (_) {}
+          return 'Opened release page';
+        }
+        return 'No APK asset for this release';
+      }
+      updateProgress = 0;
+      notifyListeners();
+      final ok = await updates.downloadApk(
+        u,
+        onProgress: (p) {
+          try {
+            updateProgress = p;
+            notifyListeners();
+          } catch (_) {}
+        },
+      );
+      updateProgress = -1;
+      notifyListeners();
+      return ok ? 'Downloading update…' : 'Download failed to start';
+    } catch (_) {
+      return 'Download failed to start';
+    }
+  }
+
+  Future<String> installUpdate() async {
+    try {
+      final path = updateApkPath;
+      if (path == null) return 'APK not downloaded yet';
+      final ok = await updates.installApk(path);
+      return ok ? 'Opening installer…' : 'Allow installs, then retry';
+    } catch (_) {
+      return 'Install failed';
+    }
+  }
+
+  Future<void> openReleasePage() async {
+    try {
+      final url = pendingUpdate?.pageUrl ?? '';
+      if (url.isEmpty) return;
+      await launchUrl(Uri.parse(url),
+          mode: LaunchMode.externalApplication);
+    } catch (_) {}
+  }
+
+  void dismissUpdate() {
+    try {
+      pendingUpdate = null;
+      notifyListeners();
+    } catch (_) {}
   }
 
   /// Manual refresh after direct engine mutations from sheets

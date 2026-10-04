@@ -139,14 +139,13 @@ class _MiniPlayerState extends State<_MiniBodyHost>
                                     ),
                                   );
                                 }
-                                return IconButton.filled(
-                                  style: IconButton.styleFrom(
-                                    backgroundColor: scheme.primary,
-                                    foregroundColor: scheme.onPrimary,
-                                  ),
+                                // Spotify mini style: white glyph, no fill.
+                                return IconButton(
+                                  iconSize: 32,
                                   icon: Icon(
                                     playing ? Icons.pause : Icons.play_arrow,
                                   ),
+                                  color: Colors.white,
                                   tooltip: playing ? 'Pause' : 'Play',
                                   onPressed: () =>
                                       state.controller.togglePlay(),

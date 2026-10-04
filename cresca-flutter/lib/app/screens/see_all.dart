@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 
 import '../../core/track.dart';
 import '../app.dart';
+import '../design.dart';
 import '../widgets/mini_player.dart';
 import '../widgets/track_row.dart';
 
@@ -137,6 +138,7 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
               children: [
                 Expanded(
                   child: FilledButton.icon(
+                    style: spotifyPlayStyle(),
                     icon: const Icon(Icons.play_arrow),
                     label: const Text('Play all'),
                     onPressed: _tracks.isEmpty
