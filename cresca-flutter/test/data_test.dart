@@ -404,6 +404,32 @@ void main() {
           isFalse);
     });
 
+    test('player body carries sts only when provided', () {
+      final plain =
+          playerBody(TubeClient.androidPhone, 'dQw4w9WgXcQ', '');
+      expect(plain.containsKey('playbackContext'), isFalse);
+      final withSts = playerBody(
+          TubeClient.androidPhone, 'dQw4w9WgXcQ', '',
+          signatureTimestamp: 20725);
+      expect(
+          (withSts['playbackContext']
+                  as Map)['contentPlaybackContext'],
+          {'signatureTimestamp': 20725});
+    });
+
+    test('sts parses from watch pages', () {
+      expect(parseSts('<html>"STS":20725,</html>'), 20725);
+      expect(parseSts('<html>nope</html>'), 0);
+      expect(parseSts(''), 0);
+    });
+
+    test('phone client spec matches maintained values', () {
+      expect(TubeClient.androidPhone.name, 'ANDROID');
+      expect(TubeClient.androidPhone.version, '20.10.38');
+      expect(TubeClient.androidPhone.androidSdkVersion, 30);
+      expect(TubeClient.androidPhone.osName, 'Android');
+    });
+
     test('player body context follows the calling client', () {
       for (final c in [
         TubeClient.webRemix,
@@ -465,7 +491,10 @@ void main() {
       const w = 'https://www.youtube.com/watch?v=AAAAAAAAAAA';
       final results = await Future.wait([r.audioUrl(w), r.audioUrl(w)]);
       expect(results, ['https://a/1', 'https://a/1']);
-      expect(posts, 2); // one race (music+vr legs), shared by both callers
+      // One race shared by both callers: music + vr POSTs + sts GET
+      // (mock returns JSON, so no sts → phone POST skipped; music
+      // wins, stragglers ignored).
+      expect(posts, 3);
     });
 
     test('403 everywhere falls back to manifest; drop refetches', () async {

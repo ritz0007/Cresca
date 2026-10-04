@@ -30,7 +30,6 @@ const Duration sessionTick = Duration(seconds: 5);
 const int audioDiskBudgetBytes = 4 * 1024 * 1024 * 1024;
 const int audioTrackCapBytes = 10 * 1024 * 1024;
 const String audioCacheDirName = 'exoplayer';
-const String streamUserAgent = 'Cresca/1.0 (Android)';
 
 /// Custom action names (prev/like/next always visible, Y1).
 const String actionLike = 'cresca_like';
@@ -486,11 +485,12 @@ class PlayerController {
       final file = File('${cacheDir.path}/$audioCacheDirName/$safe.m4a');
       // Experimental in just_audio 0.10, but it is the documented
       // videoId-keyed disk cache (mirrors native customCacheKey).
+      // NOTE: no custom headers — headers force just_audio's localhost
+      // proxy path; direct ExoPlayer fetch matches the native stack.
       // ignore: experimental_member_use
       return LockCachingAudioSource(
         Uri.parse(url),
         cacheFile: file,
-        headers: const {'User-Agent': streamUserAgent},
         tag: _mediaTag(t),
       );
     } catch (_) {

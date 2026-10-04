@@ -23,12 +23,16 @@ class TubeClient {
   final String apiKey;
   final String userAgent;
   final String? referer;
+  final int androidSdkVersion;
+  final String osName;
   const TubeClient({
     required this.name,
     required this.version,
     required this.apiKey,
     required this.userAgent,
     this.referer,
+    this.androidSdkVersion = 34,
+    this.osName = '',
   });
 
   static const uaWeb =
@@ -68,6 +72,19 @@ class TubeClient {
     apiKey: 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30',
     userAgent: uaWeb,
   );
+
+  /// Phone client for the NewPipe-equivalent resolve leg: needs a fresh
+  /// signatureTimestamp (see fetchSignatureTimestamp) or the player
+  /// answers UNPLAYABLE/LOGIN_REQUIRED like the music clients.
+  static const androidPhone = TubeClient(
+    name: 'ANDROID',
+    version: '20.10.38',
+    apiKey: 'AIzaSyAOghZGza2MQSZkY_zfZ370N-PUdXEo8AI',
+    userAgent:
+        'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip',
+    androidSdkVersion: 30,
+    osName: 'Android',
+  );
 }
 
 String tubeUrl(TubeClient client, String endpoint,
@@ -82,7 +99,10 @@ Map<String, dynamic> contextMap(TubeClient client, String visitorData) {
     'gl': 'US',
   };
   if (visitorData.isNotEmpty) c['visitorData'] = visitorData;
-  if (client.name.startsWith('ANDROID')) c['androidSdkVersion'] = 34;
+  if (client.name.startsWith('ANDROID')) {
+    c['androidSdkVersion'] = client.androidSdkVersion;
+  }
+  if (client.osName.isNotEmpty) c['osName'] = client.osName;
   return {
     'client': c,
     'user': {'lockedSafetyMode': false},
@@ -542,6 +562,20 @@ List<YtTrack> parseRadioPanels(
     }
   } catch (_) {}
   return out;
+}
+
+/// Signature timestamp for the phone resolve leg, scraped from a watch
+/// page (`"STS":20725`). Player-build scoped: cache per session, refresh
+/// when the phone leg stops returning OK.
+int parseSts(String html) {
+  try {
+    final m =
+        RegExp(r'"STS":(\d+)').firstMatch(html);
+    if (m == null) return 0;
+    return int.tryParse(m.group(1) ?? '') ?? 0;
+  } catch (_) {
+    return 0;
+  }
 }
 
 String? _shelfTitle(Map<String, dynamic> s) {

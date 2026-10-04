@@ -27,6 +27,7 @@ Map<String, dynamic> playerBody(
   String videoId,
   String visitorData, {
   String poToken = '',
+  int signatureTimestamp = 0,
 }) {
   final body = <String, dynamic>{
     'context': contextMap(client, visitorData),
@@ -36,6 +37,15 @@ Map<String, dynamic> playerBody(
   };
   if (poToken.isNotEmpty) {
     body['serviceIntegrityDimensions'] = {'poToken': poToken};
+  }
+  // Phone-leg BotGuard equivalent (NewPipe parity): without a fresh sts
+  // the player answers UNPLAYABLE/LOGIN_REQUIRED.
+  if (signatureTimestamp > 0) {
+    body['playbackContext'] = {
+      'contentPlaybackContext': {
+        'signatureTimestamp': signatureTimestamp,
+      },
+    };
   }
   return body;
 }
@@ -88,6 +98,22 @@ class _BrUrl {
   const _BrUrl(this.bitrate, this.url);
 }
 
+/// Extractor HTTP with device-consistent browser headers. The bundled
+/// default UA (Chrome 96-era) trips bot gating on scrape paths; a
+/// current desktop-Chrome profile + consent cookie keeps watch-page +
+/// decipher fetches at native parity.
+class _ModernTubeClient extends YoutubeHttpClient {
+  @override
+  Map<String, String> get headers => const {
+        'user-agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'cookie': 'CONSENT=YES+cb',
+        'accept':
+            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'accept-language': 'en-US,en;q=0.9',
+      };
+}
+
 Map<String, dynamic>? _asMap(dynamic v) =>
     v is Map ? v.cast<String, dynamic>() : null;
 
@@ -108,6 +134,14 @@ class StreamResolver {
 
   YoutubeExplode? _yt;
   final Map<String, Future<String?>> _flight = {};
+
+  YoutubeExplode _explode() {
+    final yt = _yt;
+    if (yt != null) return yt;
+    final created = YoutubeExplode(_ModernTubeClient());
+    _yt = created;
+    return created;
+  }
 
   StreamResolver({
     http.Client? httpClient,
@@ -134,7 +168,34 @@ class StreamResolver {
     } catch (_) {}
   }
 
-  Future<List<String>> _playerLeg(String videoId, TubeClient client) async {
+  /// Session-cached signature timestamp for the phone leg (player-build
+  /// scoped; refresh when the phone leg stops returning playable URLs).
+  int _sts = 0;
+
+  Future<int> _stsFor(String videoId) async {
+    try {
+      if (_sts > 0) return _sts;
+      final res = await httpClient
+          .get(
+            Uri.parse(
+                'https://www.youtube.com/watch?v=$videoId&app=desktop'),
+            headers: const {
+              'User-Agent':
+                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+            },
+          )
+          .timeout(const Duration(seconds: 12));
+      if (res.statusCode < 200 || res.statusCode >= 300) return 0;
+      final sts = parseSts(res.body);
+      if (sts > 0) _sts = sts;
+      return sts;
+    } catch (_) {
+      return _sts;
+    }
+  }
+
+  Future<List<String>> _playerLeg(String videoId, TubeClient client,
+      {int signatureTimestamp = 0}) async {
     try {
       final res = await httpClient
           .post(
@@ -147,7 +208,8 @@ class StreamResolver {
               poToken: poToken(),
             ),
             body: jsonEncode(playerBody(client, videoId, visitorData(),
-                poToken: poToken())),
+                poToken: poToken(),
+                signatureTimestamp: signatureTimestamp)),
           )
           .timeout(playerLegTimeout);
       if (res.statusCode < 200 || res.statusCode >= 300) return [];
@@ -159,16 +221,36 @@ class StreamResolver {
     }
   }
 
-  /// Ranked audio URLs, best-first. Race: MUSIC vs VR concurrently
-  /// (first non-empty wins, 8s cap each), then WEB_REMIX.
+  Future<List<String>> _phoneLeg(String videoId) async {
+    try {
+      final sts = await _stsFor(videoId);
+      if (sts <= 0) return [];
+      return await _playerLeg(videoId, TubeClient.androidPhone,
+          signatureTimestamp: sts);
+    } catch (_) {
+      return [];
+    }
+  }
+
+  /// Ranked audio URLs, best-first. Phone leg first (NewPipe-equivalent:
+  /// current phone client + fresh sts yields directly-fetchable URLs
+  /// logged-out), then the MUSIC vs VR race, then WEB_REMIX.
   Future<List<String>> tubeAudioUrls(String videoId) async {
     try {
+      // Phone first: proven fetchable without a session (206 partial
+      // content on plain Range GETs); music/VR urls 403 at fetch when
+      // their n-throttling is ciphered.
+      try {
+        final phone =
+            await _phoneLeg(videoId).timeout(const Duration(seconds: 15));
+        if (phone.isNotEmpty) return phone;
+      } catch (_) {}
       final vrFuture = _playerLeg(videoId, TubeClient.androidVr);
       List<String> music = [];
       try {
         music = await _playerLeg(videoId, TubeClient.androidMusic);
       } catch (_) {}
-      if (music.isNotEmpty) return music; // VR future ignored (cancelled).
+      if (music.isNotEmpty) return music; // stragglers ignored.
       try {
         final vr = await vrFuture;
         if (vr.isNotEmpty) return vr;
@@ -186,13 +268,14 @@ class StreamResolver {
   Future<List<String>> _manifestUrls(String videoId) async {
     try {
       if (manifestFetcher != null) return await manifestFetcher!(videoId);
-      _yt ??= YoutubeExplode();
       // Watch-page scrape is slow on constrained networks (it carries
-      // the n/sig decipher context the URLs need); the outer 45s cap
-      // still bounds the whole resolve.
-      final manifest = await _yt!.videos.streams
+      // the n/sig decipher context the URLs need); sized to fit inside
+      // the outer resolve cap after the 8s race legs.
+      final manifest = await _explode()
+          .videos
+          .streams
           .getManifest(videoId)
-          .timeout(const Duration(seconds: 30));
+          .timeout(const Duration(seconds: 35));
       final sorted = manifest.audioOnly.toList()
         ..sort((a, b) =>
             b.bitrate.bitsPerSecond.compareTo(a.bitrate.bitsPerSecond));
