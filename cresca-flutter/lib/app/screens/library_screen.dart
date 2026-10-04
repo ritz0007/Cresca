@@ -10,6 +10,7 @@ import '../app.dart';
 import '../state.dart';
 import '../widgets/downloads_sheet.dart';
 import '../widgets/mini_player.dart';
+import '../widgets/profile_sheet.dart';
 import '../widgets/session_sheet.dart';
 import 'playlist_screen.dart';
 import 'see_all.dart';
@@ -75,8 +76,7 @@ class _QuickTiles extends StatelessWidget {
             child: _Tile(
               icon: Icons.person_outline,
               label: 'Profile',
-              onTap: () => _toast(context,
-                  'Full profile arrives with settings in Phase 3'),
+              onTap: () => openProfileSheet(context),
             ),
           ),
           const SizedBox(width: 8),
@@ -409,9 +409,4 @@ Future<String?> _askName(BuildContext context) async {
   }
 }
 
-void _toast(BuildContext context, String message) {
-  try {
-    ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text(message)));
-  } catch (_) {}
-}
+

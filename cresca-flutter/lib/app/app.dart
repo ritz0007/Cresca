@@ -47,10 +47,41 @@ class _CrescaAppState extends State<CrescaApp> {
   @override
   void initState() {
     super.initState();
+    // Rebuild chrome (theme mode) when app state changes appearance.
+    try {
+      widget.state.addListener(_onState);
+    } catch (_) {}
     // A1: hold 1.2s after data ready, fade handled by AnimatedSwitcher.
     Future<void>.delayed(const Duration(milliseconds: 1200), () {
       if (mounted) setState(() => _splash = false);
     });
+  }
+
+  @override
+  void didUpdateWidget(covariant CrescaApp old) {
+    super.didUpdateWidget(old);
+    if (old.state != widget.state) {
+      try {
+        old.state.removeListener(_onState);
+      } catch (_) {}
+      try {
+        widget.state.addListener(_onState);
+      } catch (_) {}
+    }
+  }
+
+  void _onState() {
+    try {
+      if (mounted) setState(() {});
+    } catch (_) {}
+  }
+
+  @override
+  void dispose() {
+    try {
+      widget.state.removeListener(_onState);
+    } catch (_) {}
+    super.dispose();
   }
 
   void _onTab(int i) {
@@ -72,7 +103,11 @@ class _CrescaAppState extends State<CrescaApp> {
       child: MaterialApp(
         title: 'Cresca',
         debugShowCheckedModeBanner: false,
-        themeMode: ThemeMode.system,
+        themeMode: switch (widget.state.appearance) {
+          'light' => ThemeMode.light,
+          'dark' => ThemeMode.dark,
+          _ => ThemeMode.system,
+        },
         // iOS spirit + Spotify voice (see design.dart D1–D4).
         theme: crescaTheme(Brightness.light),
         darkTheme: crescaTheme(Brightness.dark),

@@ -16,6 +16,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../audio/playback.dart';
 import '../auth/session.dart';
+import '../auth/spotify.dart';
 import '../core/home_feed.dart';
 import '../core/motion.dart';
 import '../core/queue.dart';
@@ -48,7 +49,11 @@ class AppState extends ChangeNotifier {
   late final CrashLog crash;
   late final DownloadStore downloads;
   final YtSession ytSession = YtSession();
+  final SpotifySession spotify = SpotifySession();
   SharedPreferences? prefs;
+
+  /// Appearance: system / light / dark (L4).
+  String appearance = 'system';
 
   bool motionOn = true;
   int refreshCount = 0;
@@ -95,10 +100,16 @@ class AppState extends ChangeNotifier {
     } catch (_) {}
     final urlCache = UrlCache();
     await ytSession.load();
+    await spotify.load();
     final session = RepoSession()
       ..cookies = ytSession.cookies
       ..visitorData = ytSession.visitorData
       ..poToken = ytSession.poToken;
+    session.useInnerTube =
+        prefs?.getBool('engine_fast') ?? true;
+    try {
+      appearance = prefs?.getString('appearance') ?? 'system';
+    } catch (_) {}
     repo = YoutubeRepository(
       httpClient: http.Client(),
       session: session,
@@ -274,6 +285,81 @@ class AppState extends ChangeNotifier {
       prefs?.setBool(motionPrefKey, on);
       notifyListeners();
     } catch (_) {}
+  }
+
+  /// Engine: Fast (InnerTube, default) vs Stable (extractor only).
+  bool get engineFast => repo.session.useInnerTube;
+
+  Future<void> setEngineFast(bool fast) async {
+    try {
+      repo.session.useInnerTube = fast;
+      await prefs?.setBool('engine_fast', fast);
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  Future<void> setAppearance(String value) async {
+    try {
+      appearance =
+          value == 'light' || value == 'dark' ? value : 'system';
+      await prefs?.setString('appearance', appearance);
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  /// Clears network caches (home/search/trending snapshots + stream
+  /// URLs + audio bytes) without touching library/downloads/session.
+  Future<String> clearCache() async {
+    try {
+      var bytes = 0;
+      final dir = filesDir;
+      final entries = await dir.list().toList();
+      for (final e in entries) {
+        try {
+          final name = e.path.split(RegExp(r'[/\\]')).last;
+          if (e is File &&
+              (name.startsWith('yt_') ||
+                  name == urlDiskFile)) {
+            try {
+              bytes += await e.length();
+            } catch (_) {}
+            await e.delete();
+          }
+        } catch (_) {}
+      }
+      try {
+        final audio = Directory(
+            '${dir.path}/$audioCacheDirName');
+        if (await audio.exists()) {
+          await for (final e in audio.list(recursive: true)) {
+            try {
+              if (e is File) bytes += await e.length();
+            } catch (_) {}
+          }
+          await audio.delete(recursive: true);
+        }
+      } catch (_) {}
+      urlCacheClear();
+      return 'Cleared ${_mb(bytes)}';
+    } catch (_) {
+      return 'Clear failed';
+    }
+  }
+
+  void urlCacheClear() {
+    try {
+      resolver.urlCache.rows.clear();
+      resolver.urlCache.lastDiskSaveMs = 0;
+    } catch (_) {}
+  }
+
+  static String _mb(int bytes) {
+    try {
+      if (bytes < 1024 * 1024) return '${bytes ~/ 1024} KB';
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    } catch (_) {
+      return '';
+    }
   }
 
   /// Manual refresh after direct engine mutations from sheets
