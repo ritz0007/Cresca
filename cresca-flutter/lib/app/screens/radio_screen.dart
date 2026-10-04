@@ -6,7 +6,6 @@ import 'package:flutter/material.dart';
 
 import '../app.dart';
 import '../radio_store.dart';
-import '../widgets/mini_player.dart';
 import '../widgets/track_row.dart';
 
 class RadioScreen extends StatelessWidget {
@@ -25,7 +24,7 @@ class RadioScreen extends StatelessWidget {
             children: [
               Expanded(
                 child: ListView(
-                  padding: const EdgeInsets.only(bottom: 16),
+                  padding: const EdgeInsets.only(bottom: 210),
                   children: [
                     const Padding(
                       padding:
@@ -86,7 +85,6 @@ class RadioScreen extends StatelessWidget {
                   ],
                 ),
               ),
-              const MiniPlayer(),
             ],
           ),
         );
@@ -192,3 +190,4 @@ class _StationCard extends StatelessWidget {
     );
   }
 }
+

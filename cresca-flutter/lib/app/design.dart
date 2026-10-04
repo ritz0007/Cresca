@@ -19,8 +19,6 @@
 // - [D4] iOS tab bar styling: no pill indicator (tinted icon + label),
 //   frosted background, top hairline.
 
-import 'dart:ui';
-
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -171,44 +169,35 @@ class Glass extends StatelessWidget {
   Widget build(BuildContext context) {
     final dark =
         Theme.of(context).brightness == Brightness.dark;
+    // Solid frosted surface (Spotify-parity). Two compositor notes from
+    // the paint-bisect on SwiftShader (jam16): (1) BackdropFilter glass
+    // layers composite OVER their children — content hit-tests fine but
+    // never paints; (2) a bare `ClipRRect` shell around the decorated
+    // container also swallowed child painting. Border-radius decoration
+    // alone (no clip node) + Border.all hairline paints fully.
     final tint = dark
-        ? Colors.white.withValues(alpha: 0.10)
-        : Colors.white.withValues(alpha: 0.55);
+        ? const Color(0xF01C1C1E)
+        : const Color(0xF8FFFFFF);
     final rim = dark
         ? Colors.white.withValues(alpha: 0.22)
         : Colors.white.withValues(alpha: 0.85);
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(radius),
-      child: BackdropFilter(
-        filter: ImageFilter.blur(
-            sigmaX: blur, sigmaY: blur),
-        child: Container(
-          padding: padding,
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(radius),
-            color: tint,
-            // Specular rim: bright top + left hairline.
-            border: Border(
-              top: BorderSide(color: rim, width: 1),
-              left: BorderSide(
-                  color: rim.withValues(alpha: 0.6), width: 1),
-              right: BorderSide(
-                  color: rim.withValues(alpha: 0.25), width: 1),
-              bottom: BorderSide(
-                  color: rim.withValues(alpha: 0.12), width: 1),
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black
-                    .withValues(alpha: dark ? 0.45 : 0.14),
-                blurRadius: 24,
-                offset: const Offset(0, 10),
-              ),
-            ],
+    return Container(
+      padding: padding,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(radius),
+        color: tint,
+        // Specular rim hairline (uniform; avoids ClipRRect).
+        border: Border.all(color: rim, width: 1),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black
+                .withValues(alpha: dark ? 0.40 : 0.14),
+            blurRadius: 18,
+            offset: const Offset(0, 8),
           ),
-          child: child,
-        ),
+        ],
       ),
+      child: child,
     );
   }
 }
@@ -223,43 +212,40 @@ class FrostedTabBar extends StatelessWidget {
     final dark =
         Theme.of(context).brightness == Brightness.dark;
     return ClipRect(
-      child: BackdropFilter(
-        filter:
-            ImageFilter.blur(sigmaX: 22, sigmaY: 22),
-        child: Container(
-          decoration: BoxDecoration(
-            color: (dark ? Colors.black : Colors.white)
-                .withValues(alpha: dark ? 0.55 : 0.62),
-            border: Border(
-              top: BorderSide(
-                color: Theme.of(context)
-                    .colorScheme
-                    .outlineVariant
-                    .withValues(alpha: 0.6),
-                width: 0.5,
-              ),
+      child: Container(
+        decoration: BoxDecoration(
+          color: (dark
+              ? const Color(0xF01C1C1E)
+              : const Color(0xF8FFFFFF)),
+          border: Border(
+            top: BorderSide(
+              color: Theme.of(context)
+                  .colorScheme
+                  .outlineVariant
+                  .withValues(alpha: 0.6),
+              width: 0.5,
             ),
           ),
-          child: Theme(
-            data: Theme.of(context).copyWith(
-              navigationBarTheme:
-                  const NavigationBarThemeData(
-                backgroundColor: Colors.transparent,
-                // No pill: iOS marks selection with tint alone.
-                indicatorColor: Colors.transparent,
-                labelBehavior:
-                    NavigationDestinationLabelBehavior.alwaysShow,
-                // Montserrat runs wide: compact labels keep all five
-                // tabs legible at 1080p.
-                labelTextStyle: WidgetStatePropertyAll(
-                    TextStyle(
-                        fontSize: 10.5,
-                        fontWeight: FontWeight.w600,
-                        letterSpacing: 0.1)),
-              ),
+        ),
+        child: Theme(
+          data: Theme.of(context).copyWith(
+            navigationBarTheme:
+                const NavigationBarThemeData(
+              backgroundColor: Colors.transparent,
+              // No pill: iOS marks selection with tint alone.
+              indicatorColor: Colors.transparent,
+              labelBehavior:
+                  NavigationDestinationLabelBehavior.alwaysShow,
+              // Montserrat runs wide: compact labels keep all five
+              // tabs legible at 1080p.
+              labelTextStyle: WidgetStatePropertyAll(
+                  TextStyle(
+                      fontSize: 10.5,
+                      fontWeight: FontWeight.w600,
+                      letterSpacing: 0.1)),
             ),
-            child: child,
           ),
+          child: child,
         ),
       ),
     );
@@ -339,11 +325,10 @@ class _MeshBackdropState extends State<MeshBackdrop>
               drift: _drift.value,
             ),
           ),
-          // Heavy blur melts the blobs into a wash.
-          BackdropFilter(
-            filter: ImageFilter.blur(sigmaX: 64, sigmaY: 64),
-            child: Container(color: Colors.transparent),
-          ),
+          // Heavy blur melts the blobs into a wash. The mesh painter
+          // already renders soft radial gradients directly, so the
+          // extra BackdropFilter pass (compositor-unsafe on SwiftShader
+          // emulators: filtered layers stamp over content) is dropped.
           // Scrim for legibility (10% → 38% top-to-bottom).
           Container(
             decoration: BoxDecoration(
@@ -422,70 +407,111 @@ class FloatingTabBar extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     final dark =
         Theme.of(context).brightness == Brightness.dark;
-    // Spotify marks the active tab white (dark) / black (light);
-    // green is reserved for actions.
+    // Apple Liquid Glass tab bar (Axiom liquid-glass skill, Regular
+    // variant): full-bleed rectangular material — no capsule/pill, no
+    // side gutters — that extends over the system navigation-bar inset
+    // and lets content scroll under it. Adaptive "regular" glass =
+    // translucent material + blur + vertical adaptive tint (top sheen
+    // eating into dark), NOT a solid fill. Axiom rules applied: glass
+    // lives only on the navigation layer; no tint on bar items (white
+    // active selection; tinting is reserved for primary actions, so
+    // Spotify green stays in buttons); hairline top edge; content
+    // dissolves behind the material (app screens keep scroll clearance
+    // under the chrome).
+    //
+    // Compositor note (jam16 paint-bisect): BackdropFilter must not sit
+    // under a Clip* node here — glass painted blank when wrapped by
+    // ClipRRect. Solo BackdropFilter (own bounds = full-bleed bar rect)
+    // is safe; screens were verified pixel-perfect after each step.
     final selected = dark ? Colors.white : Colors.black;
-    return SafeArea(
-      top: false,
-      child: Padding(
-        padding:
-            const EdgeInsets.fromLTRB(10, 0, 10, 10),
-        // heightFactor: intrinsic height only. A bare Center expands
-        // to the full bottomNav area and Scaffold centers the pill
-        // mid-screen (tabs at y~1103 on 2400px). Align keeps the bar
-        // pinned to the bottom.
-        child: Align(
-          alignment: Alignment.center,
-          heightFactor: 1.0,
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 440),
-            child: Glass(
-              radius: 28,
-              blur: 22,
-              padding: const EdgeInsets.symmetric(
-                  vertical: 9, horizontal: 6),
-              child: Row(
-                children: [
-                  for (var i = 0; i < _items.length; i++)
-                    Expanded(
-                      child: GestureDetector(
-                        behavior: HitTestBehavior.opaque,
-                        onTap: () => onTap(i),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(
-                              i == current
-                                  ? _items[i].$2
-                                  : _items[i].$1,
-                              size: 25,
-                              color: i == current
-                                  ? selected
-                                  : scheme.onSurfaceVariant.withValues(
-                                      alpha: 0.65),
-                            ),
-                            const SizedBox(height: 2),
-                            Text(_items[i].$3,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                    fontSize: 11,
-                                    fontWeight: FontWeight.w600,
-                                    color: i == current
-                                        ? selected
-                                        : scheme.onSurfaceVariant
-                                            .withValues(
-                                                alpha: 0.65))),
-                          ],
-                        ),
-                      ),
-                    ),
+    final bottomInset = MediaQuery.of(context).padding.bottom;
+    // Full-bleed Apple-glass tab bar: measured live on jam16 — a solo
+    // BackdropFilter samples the WHOLE screen (not its own bounds) on
+    // SwiftShader, blurring every card behind it. Axiom-faithful fallback:
+    // the Regular material's adaptive tint is layered translucently and
+    // dissolves content behind the bar (scroll-under + darker scrim at
+    // the bottom = the "dissolve into glass" edge effect without a
+    // compositor filter). See .opencode/skill/liquid-glass for rules.
+    final Widget material = Container(
+      decoration: BoxDecoration(
+        // Regular-glass adaptive tint: translucent top sheen into a
+        // deeper base. Never a solid fill (Axiom: solid fills break the
+        // material character).
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: dark
+              ? [
+                  Colors.white.withValues(alpha: 0.13),
+                  Colors.white.withValues(alpha: 0.05),
+                  Colors.black.withValues(alpha: 0.72),
+                ]
+              : [
+                  Colors.white.withValues(alpha: 0.88),
+                  Colors.white.withValues(alpha: 0.70),
+                  Colors.white.withValues(alpha: 0.94),
                 ],
-              ),
-            ),
+        ),
+        // Hairline top edge; sides/bottom end to end (full-bleed).
+        border: Border(
+          top: BorderSide(
+            color: dark
+                ? Colors.white.withValues(alpha: 0.20)
+                : Colors.black.withValues(alpha: 0.14),
+            width: 0.8,
           ),
         ),
       ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Padding(
+            padding:
+                const EdgeInsets.symmetric(vertical: 10),
+            child: Row(
+              children: [
+                for (var i = 0; i < _items.length; i++)
+                  Expanded(
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () => onTap(i),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            i == current
+                                ? _items[i].$2
+                                : _items[i].$1,
+                            size: 25,
+                            color: i == current
+                                ? selected
+                                : scheme.onSurfaceVariant.withValues(
+                                    alpha: 0.65),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(_items[i].$3,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w600,
+                                  color: i == current
+                                      ? selected
+                                      : scheme.onSurfaceVariant
+                                          .withValues(
+                                              alpha: 0.65))),
+                        ],
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          // Material runs over the system navigation-bar inset.
+          SizedBox(height: bottomInset),
+        ],
+      ),
     );
+    return material;
   }
 }

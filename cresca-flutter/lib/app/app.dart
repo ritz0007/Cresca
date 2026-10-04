@@ -12,6 +12,7 @@ import 'screens/search_screen.dart';
 import 'screens/trending_screen.dart';
 import 'state.dart';
 import 'design.dart';
+import 'widgets/mini_player.dart';
 
 /// Inherited access to the app state (rows, sheets, screens).
 class AppScope extends InheritedWidget {
@@ -114,7 +115,7 @@ class _CrescaAppState extends State<CrescaApp> {
         home: Stack(
           children: [
             Scaffold(
-              // Content flows under the floating pill (liquid glass).
+              // Content flows under the glass chrome (liquid glass).
               extendBody: true,
               body: IndexedStack(
                 index: _tab,
@@ -126,11 +127,30 @@ class _CrescaAppState extends State<CrescaApp> {
                   SearchScreen(),
                 ],
               ),
-              // Floating glass pill (BitChord shape): 10dp gutters,
-              // blur + specular rim, tint-marked selection.
-              bottomNavigationBar: FloatingTabBar(
-                current: _tab,
-                onTap: _onTab,
+              // NOTE: bottom chrome (mini player above the floating
+              // glass pill) is stacked here ONCE. Screens no longer
+              // carry their own MiniPlayer in a Scaffold
+              // bottomNavigationBar slot — that rendered a second
+              // full-screen scaffold bottom chrome straight on top of
+              // the pill (overlapping bars → misaligned/empty look).
+            ),
+            // Shared bottom chrome: mini player pinned above the
+            // floating glass pill.
+            Align(
+              alignment: Alignment.bottomCenter,
+              child: SafeArea(
+                top: false,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    const MiniPlayer(),
+                    FloatingTabBar(
+                      current: _tab,
+                      onTap: _onTab,
+                    ),
+                  ],
+                ),
               ),
             ),
             // A1: splash + intro overlay.

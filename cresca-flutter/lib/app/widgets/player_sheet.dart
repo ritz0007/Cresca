@@ -15,6 +15,7 @@ import 'package:just_audio/just_audio.dart';
 import '../../core/discovery.dart';
 import '../../core/queue.dart';
 import '../../core/track.dart';
+import '../../data/details.dart';
 import '../app.dart';
 import '../design.dart';
 import '../state.dart';
@@ -140,6 +141,11 @@ class _PlayerSheetState extends State<PlayerSheet> {
                       const SizedBox(height: 8),
                       LyricsSection(
                           key: ValueKey(track.id), track: track),
+                      const SizedBox(height: 12),
+                      DetailsSection(
+                          key: ValueKey('det-${track.id}'),
+                          track: track),
+                      const SizedBox(height: 12),
                       const _Phase3Stubs(),
                       const SizedBox(height: 24),
                     ],
@@ -628,7 +634,7 @@ class _ActionsRow extends StatelessWidget {
   }
 }
 
-/// Honest stubs for remaining Phase-3 surfaces (credits/video):
+/// Honest note for the one remaining Phase-3 surface (video):
 /// never fake content (H8).
 class _Phase3Stubs extends StatelessWidget {
   const _Phase3Stubs();
@@ -639,10 +645,121 @@ class _Phase3Stubs extends StatelessWidget {
       padding: EdgeInsets.symmetric(horizontal: 24),
       child: Column(
         children: [
-          Text('Credits and video arrive in Phase 3.',
+          Text('Video mode arrives in Phase 4.',
               textAlign: TextAlign.center,
               style: TextStyle(color: Colors.white54, fontSize: 12)),
         ],
+      ),
+    );
+  }
+}
+
+/// About-this-song card (P8): Plays/Likes/Released/Duration + trimmed
+/// description. Extractor-backed (P8 native DetailsCard parity).
+class DetailsSection extends StatefulWidget {
+  final YtTrack track;
+  const DetailsSection({super.key, required this.track});
+
+  @override
+  State<DetailsSection> createState() => _DetailsSectionState();
+}
+
+class _DetailsSectionState extends State<DetailsSection> {
+  VideoDetails? _details;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void didUpdateWidget(covariant DetailsSection old) {
+    super.didUpdateWidget(old);
+    if (old.track.id != widget.track.id) _load();
+  }
+
+  Future<void> _load() async {
+    final store = AppScope.of(context).details;
+    try {
+      final d = await store.load(widget.track.watchUrl);
+      if (!mounted) return;
+      setState(() => _details = d);
+    } catch (_) {}
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final d = _details;
+    final rows = <(String, String)>[
+      ('Artist', widget.track.displayArtist()),
+      if (d != null && d.views >= 0)
+        ('Plays', fmtCompact(d.views)),
+      if (d != null && d.likes > 0) ('Likes', fmtCompact(d.likes)),
+      if (d != null && d.uploadDate.isNotEmpty)
+        ('Released', d.uploadDate),
+      if (d != null && d.durationSec > 0) ...[
+        (
+          'Duration',
+          '${(d.durationSec ~/ 60)}:${(d.durationSec % 60).toString().padLeft(2, '0')}'
+        ),
+      ],
+      ('Source', 'YouTube'),
+    ];
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 24),
+      child: Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: Colors.white.withValues(alpha: 0.08),
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('About this song',
+                style: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.6),
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600)),
+            const SizedBox(height: 6),
+            for (final (k, v) in rows)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 3),
+                child: Row(
+                  children: [
+                    SizedBox(
+                        width: 84,
+                        child: Text(k,
+                            style: TextStyle(
+                                color: Colors.white
+                                    .withValues(alpha: 0.55),
+                                fontSize: 12))),
+                    Expanded(
+                      child: Text(v,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          textAlign: TextAlign.right,
+                          style: const TextStyle(
+                              color: Colors.white, fontSize: 12)),
+                    ),
+                  ],
+                ),
+              ),
+            if (d != null && d.description.isNotEmpty) ...[
+              const SizedBox(height: 6),
+              Text(
+                d.description.trimLeft(),
+                maxLines: 4,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.6),
+                    fontSize: 12,
+                    height: 1.4),
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }

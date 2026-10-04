@@ -81,7 +81,9 @@ class _MiniPlayerState extends State<_MiniBodyHost>
       },
       // Liquid-glass floating card (D3): frosted, specular rim.
       child: Padding(
-        padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+        // Bottom gutter is 0 here: it sits directly above the floating
+        // tab bar (own 10dp gutter), so the two read as one chrome unit.
+        padding: const EdgeInsets.fromLTRB(12, 4, 12, 0),
         child: AnimatedContainer(
           duration: Duration(milliseconds: state.motionMs(180)),
           transform: Matrix4.translationValues(_dx, 0, 0),

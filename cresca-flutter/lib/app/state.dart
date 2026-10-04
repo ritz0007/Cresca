@@ -24,6 +24,7 @@ import '../core/session.dart';
 import '../core/track.dart';
 import '../data/cache.dart';
 import '../data/lyrics.dart';
+import '../data/details.dart';
 import '../data/repository.dart';
 import '../data/resolve.dart';
 import 'crash.dart';
@@ -49,6 +50,7 @@ class AppState extends ChangeNotifier {
   late final LibraryStore library;
   late final CrashLog crash;
   late final DownloadStore downloads;
+  late final DetailsStore details = DetailsStore();
   final YtSession ytSession = YtSession();
   final SpotifySession spotify = SpotifySession();
   final UpdateChecker updates = UpdateChecker();
@@ -192,6 +194,7 @@ class AppState extends ChangeNotifier {
     try {
       _debounce?.cancel();
       downloads.dispose();
+      details.dispose();
       controller.dispose();
       repo.dispose();
       resolver.dispose();

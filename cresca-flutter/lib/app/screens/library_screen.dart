@@ -9,7 +9,6 @@ import '../../core/track.dart';
 import '../app.dart';
 import '../state.dart';
 import '../widgets/downloads_sheet.dart';
-import '../widgets/mini_player.dart';
 import '../widgets/profile_sheet.dart';
 import '../widgets/session_sheet.dart';
 import 'playlist_screen.dart';
@@ -31,7 +30,10 @@ class LibraryScreen extends StatelessWidget {
             children: [
               Expanded(
                 child: ListView(
-                  padding: const EdgeInsets.only(bottom: 16),
+                  padding: const EdgeInsets.only(
+                      // Bottom chrome (mini player + pill) is app-shell;
+                      // lists scroll under the glass.
+                      bottom: 210),
                   children: [
                     Padding(
                       padding: const EdgeInsets.all(16),
@@ -52,7 +54,6 @@ class LibraryScreen extends StatelessWidget {
                   ],
                 ),
               ),
-              const MiniPlayer(),
             ],
           ),
         );
@@ -408,5 +409,6 @@ Future<String?> _askName(BuildContext context) async {
     return null;
   }
 }
+
 
 

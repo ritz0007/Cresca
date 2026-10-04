@@ -10,7 +10,6 @@ import 'package:flutter/material.dart';
 import '../../core/track.dart';
 import '../app.dart';
 import '../state.dart';
-import '../widgets/mini_player.dart';
 import '../widgets/track_row.dart';
 
 class SearchScreen extends StatefulWidget {
@@ -201,6 +200,8 @@ class _SearchScreenState extends State<SearchScreen> {
                         ? 'Search for songs and artists'
                         : 'No results — try another query'))
                 : ListView.builder(
+                    // Bottom chrome is app-shell; scroll under the glass.
+                    padding: const EdgeInsets.only(bottom: 210),
                     itemCount: shown.length,
                     itemBuilder: (_, i) => TrackRow(
                         track: shown[i],
@@ -208,9 +209,9 @@ class _SearchScreenState extends State<SearchScreen> {
                         index: i),
                   ),
           ),
-          const MiniPlayer(),
         ],
       ),
     );
   }
 }
+

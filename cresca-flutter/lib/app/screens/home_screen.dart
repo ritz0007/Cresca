@@ -10,7 +10,6 @@ import '../../core/track.dart';
 import '../app.dart';
 import '../design.dart';
 import '../state.dart';
-import '../widgets/mini_player.dart';
 import '../widgets/track_row.dart';
 import 'see_all.dart';
 
@@ -154,10 +153,12 @@ class _HomeScreenState extends State<HomeScreen> {
               for (final rail in state.rails)
                 SliverToBoxAdapter(
                     child: _Rail(rail: rail, state: state)),
+              // Bottom chrome (mini player + pill) is app-shell; the
+              // list scrolls under the glass (Spotify parity).
+              const SliverPadding(padding: EdgeInsets.only(bottom: 210)),
             ],
           ),
         ),
-        bottomNavigationBar: const MiniPlayer(),
       ),
     );
   }
@@ -543,3 +544,4 @@ class _Rail extends StatelessWidget {
     );
   }
 }
+

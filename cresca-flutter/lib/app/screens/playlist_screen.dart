@@ -8,7 +8,6 @@ import '../../core/track.dart';
 import '../app.dart';
 import '../library.dart';
 import '../state.dart';
-import '../widgets/mini_player.dart';
 import '../widgets/track_row.dart';
 import 'library_screen.dart' show MosaicArt;
 
@@ -277,7 +276,6 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
                   ],
                 ),
               ),
-              const MiniPlayer(),
             ],
           ),
         );

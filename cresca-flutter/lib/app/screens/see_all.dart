@@ -7,7 +7,6 @@ import 'package:flutter/material.dart';
 import '../../core/track.dart';
 import '../app.dart';
 import '../design.dart';
-import '../widgets/mini_player.dart';
 import '../widgets/track_row.dart';
 
 Future<void> openSeeAllQuery(BuildContext context, String title,
@@ -192,14 +191,13 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
                         child: Text('${_tracks.length} loaded')),
                   );
                 }
-                return TrackRow(
+                 return TrackRow(
                     track: _tracks[i],
                     contextQueue: _tracks,
                     index: i);
               },
             ),
           ),
-          const MiniPlayer(),
         ],
       ),
     );

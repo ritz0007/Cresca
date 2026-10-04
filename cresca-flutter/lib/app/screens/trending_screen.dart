@@ -7,7 +7,6 @@ import 'package:flutter/material.dart';
 import '../../core/track.dart';
 import '../app.dart';
 import '../state.dart';
-import '../widgets/mini_player.dart';
 import '../widgets/track_row.dart';
 import 'see_all.dart';
 
@@ -56,6 +55,8 @@ class _TrendingScreenState extends State<TrendingScreen> {
               child: RefreshIndicator(
                 onRefresh: () => state.loadTrending(force: true),
                 child: ListView(
+                  // Bottom chrome is app-shell; scroll under the glass.
+                  padding: const EdgeInsets.only(bottom: 210),
                   children: [
                     _GlobalTop(
                         tracks: state.trendingGlobal, state: state),
@@ -67,7 +68,6 @@ class _TrendingScreenState extends State<TrendingScreen> {
                 ),
               ),
             ),
-            const MiniPlayer(),
           ],
         ),
       ),
@@ -184,3 +184,4 @@ class _RegionRail extends StatelessWidget {
     );
   }
 }
+

@@ -98,20 +98,22 @@ class _BrUrl {
   const _BrUrl(this.bitrate, this.url);
 }
 
+Map<String, String> modernTubeHeaders() => const {
+      'user-agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+      'cookie': 'CONSENT=YES+cb',
+      'accept':
+          'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'accept-language': 'en-US,en;q=0.9',
+    };
+
 /// Extractor HTTP with device-consistent browser headers. The bundled
 /// default UA (Chrome 96-era) trips bot gating on scrape paths; a
 /// current desktop-Chrome profile + consent cookie keeps watch-page +
 /// decipher fetches at native parity.
 class _ModernTubeClient extends YoutubeHttpClient {
   @override
-  Map<String, String> get headers => const {
-        'user-agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        'cookie': 'CONSENT=YES+cb',
-        'accept':
-            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'accept-language': 'en-US,en;q=0.9',
-      };
+  Map<String, String> get headers => modernTubeHeaders();
 }
 
 Map<String, dynamic>? _asMap(dynamic v) =>
