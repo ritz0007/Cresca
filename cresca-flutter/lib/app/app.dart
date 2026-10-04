@@ -79,6 +79,8 @@ class _CrescaAppState extends State<CrescaApp> {
         home: Stack(
           children: [
             Scaffold(
+              // Content flows under the floating pill (liquid glass).
+              extendBody: true,
               body: IndexedStack(
                 index: _tab,
                 children: const [
@@ -89,35 +91,11 @@ class _CrescaAppState extends State<CrescaApp> {
                   SearchScreen(),
                 ],
               ),
-              // A5/D4: liquid-glass bottom bar — frosted, hairline,
-              // no pill (iOS marks selection with tint alone).
-              bottomNavigationBar: FrostedTabBar(
-                child: NavigationBar(
-                selectedIndex: _tab,
-                onDestinationSelected: _onTab,
-                destinations: const [
-                  NavigationDestination(
-                      icon: Icon(Icons.home_outlined),
-                      selectedIcon: Icon(Icons.home),
-                      label: 'Listen Now'),
-                  NavigationDestination(
-                      icon: Icon(Icons.trending_up_outlined),
-                      selectedIcon: Icon(Icons.trending_up),
-                      label: 'Trending'),
-                  NavigationDestination(
-                      icon: Icon(Icons.radio_outlined),
-                      selectedIcon: Icon(Icons.radio),
-                      label: 'Radio'),
-                  NavigationDestination(
-                      icon: Icon(Icons.library_music_outlined),
-                      selectedIcon: Icon(Icons.library_music),
-                      label: 'Library'),
-                  NavigationDestination(
-                      icon: Icon(Icons.search_outlined),
-                      selectedIcon: Icon(Icons.search),
-                      label: 'Search'),
-                ],
-                ),
+              // Floating glass pill (BitChord shape): 10dp gutters,
+              // blur + specular rim, tint-marked selection.
+              bottomNavigationBar: FloatingTabBar(
+                current: _tab,
+                onTap: _onTab,
               ),
             ),
             // A1: splash + intro overlay.

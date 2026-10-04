@@ -8,7 +8,6 @@
 
 import 'dart:async';
 import 'dart:math' as math;
-import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
@@ -17,6 +16,7 @@ import '../../core/discovery.dart';
 import '../../core/queue.dart';
 import '../../core/track.dart';
 import '../app.dart';
+import '../design.dart';
 import '../state.dart';
 import 'queue_sheet.dart';
 import 'track_menu.dart';
@@ -47,25 +47,8 @@ class PlayerSheet extends StatefulWidget {
   State<PlayerSheet> createState() => _PlayerSheetState();
 }
 
-class _PlayerSheetState extends State<PlayerSheet>
-    with SingleTickerProviderStateMixin {
+class _PlayerSheetState extends State<PlayerSheet> {
   double? _dragPos;
-  late final AnimationController _breathe;
-
-  @override
-  void initState() {
-    super.initState();
-    // Idle-sine breathe 1.2% (P1 adaptation: no FFT API in Flutter).
-    _breathe = AnimationController(
-        vsync: this, duration: const Duration(seconds: 4))
-      ..repeat();
-  }
-
-  @override
-  void dispose() {
-    _breathe.dispose();
-    super.dispose();
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -79,16 +62,9 @@ class _PlayerSheetState extends State<PlayerSheet>
         }
         return Stack(
           children: [
-            // Blurred-zoom backdrop (P1).
-            Positioned.fill(
-              child: TrackArt(track: track, size: 400),
-            ),
-            Positioned.fill(
-              child: BackdropFilter(
-                filter: ImageFilter.blur(sigmaX: 28, sigmaY: 28),
-                child: Container(
-                    color: Colors.black.withValues(alpha: 0.55)),
-              ),
+            // Artwork mesh wash (Apple-Music/BitChord backdrop).
+            const Positioned.fill(
+              child: MeshBackdrop(),
             ),
             CustomScrollView(
               controller: widget.scroll,
@@ -104,21 +80,8 @@ class _PlayerSheetState extends State<PlayerSheet>
                               color: Colors.white54,
                               borderRadius: BorderRadius.circular(2))),
                       const SizedBox(height: 16),
-                      // Full-bleed artwork + beat breathe (P1).
-                      AnimatedBuilder(
-                        animation: _breathe,
-                        builder: (_, child) {
-                          final s = 1.0 +
-                              0.012 *
-                                  (0.5 +
-                                      0.5 *
-                                          math.sin(
-                                              _breathe.value * 2 * math.pi));
-                          return Transform.scale(
-                              scale: s, child: child);
-                        },
-                        child: _ArtCard(track: track),
-                      ),
+                      // Full-bleed artwork: idle breathe × pause shrink.
+                      _ArtCard(track: track),
                       const SizedBox(height: 8),
                       // Rolling ticker on art (P2; lyrics ride it in P3).
                       _Ticker(text: '${track.title} • ${track.displayArtist()}'),
@@ -161,6 +124,7 @@ class _PlayerSheetState extends State<PlayerSheet>
                         },
                       ),
                       _Transport(state: state),
+                      _VolumeRow(state: state),
                       if (state.controller.errorLine != null)
                         Padding(
                           padding: const EdgeInsets.symmetric(
@@ -187,34 +151,88 @@ class _PlayerSheetState extends State<PlayerSheet>
   }
 }
 
-class _ArtCard extends StatelessWidget {
+class _ArtCard extends StatefulWidget {
   final YtTrack track;
   const _ArtCard({required this.track});
 
   @override
+  State<_ArtCard> createState() => _ArtCardState();
+}
+
+class _ArtCardState extends State<_ArtCard>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _breathe;
+
+  @override
+  void initState() {
+    super.initState();
+    // Idle-sine breathe 1.2% (P1 adaptation: no FFT API in Flutter).
+    _breathe = AnimationController(
+        vsync: this, duration: const Duration(seconds: 4))
+      ..repeat();
+  }
+
+  @override
+  void dispose() {
+    _breathe.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final track = widget.track;
     final art = track.thumbUrl.replaceAll('hqdefault', 'maxresdefault');
-    return Container(
-      width: 320,
-      height: 320,
-      margin: const EdgeInsets.symmetric(horizontal: 24),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: const [
-          BoxShadow(blurRadius: 24, color: Colors.black45)
-        ],
-      ),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(16),
-        child: TrackArt(
-            track: YtTrack(
-                id: track.id,
-                title: track.title,
-                artist: track.artist,
-                thumbUrl: art,
-                watchUrl: track.watchUrl),
-            size: 320),
-      ),
+    return StreamBuilder<bool>(
+      stream:
+          AppScope.of(context).controller.player.playingStream,
+      initialData:
+          AppScope.of(context).controller.player.playing,
+      builder: (_, snap) {
+        final playing = snap.data ?? true;
+        return AnimatedScale(
+          // Apple-Music pause shrink (1.0 → 0.92).
+          scale: playing ? 1.0 : 0.92,
+          duration: const Duration(milliseconds: 350),
+          curve: Curves.easeOutBack,
+          child: AnimatedBuilder(
+            animation: _breathe,
+            builder: (_, child) {
+              final s = 1.0 +
+                  0.012 *
+                      (0.5 +
+                          0.5 *
+                              math.sin(_breathe.value *
+                                  2 *
+                                  math.pi));
+              return Transform.scale(scale: s, child: child);
+            },
+            child: Container(
+              width: 320,
+              height: 320,
+              margin:
+                  const EdgeInsets.symmetric(horizontal: 24),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(10),
+                boxShadow: const [
+                  BoxShadow(
+                      blurRadius: 24, color: Colors.black45)
+                ],
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(10),
+                child: TrackArt(
+                    track: YtTrack(
+                        id: track.id,
+                        title: track.title,
+                        artist: track.artist,
+                        thumbUrl: art,
+                        watchUrl: track.watchUrl),
+                    size: 320),
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 }
@@ -302,10 +320,21 @@ class _SeekBar extends StatelessWidget {
             children: [
               SliderTheme(
                 data: SliderTheme.of(context).copyWith(
+                  // Hairline capsule (7dp, 12dp while dragging),
+                  // played white / unplayed faint (BitChord shape).
+                  trackHeight: 7,
+                  trackShape:
+                      const RoundedRectSliderTrackShape(),
                   thumbShape: RoundSliderThumbShape(
-                      enabledThumbRadius: dragPos != null ? 10 : 6),
+                      enabledThumbRadius:
+                          dragPos != null ? 12 : 7),
                   overlayShape: const RoundSliderOverlayShape(
-                      overlayRadius: 16),
+                      overlayRadius: 18),
+                  activeTrackColor:
+                      Colors.white.withValues(alpha: 0.92),
+                  inactiveTrackColor:
+                      Colors.white.withValues(alpha: 0.26),
+                  thumbColor: Colors.white,
                 ),
                 child: Slider(
                   value: total <= 0 ? 0.0 : value.clamp(0.0, total),
@@ -314,14 +343,22 @@ class _SeekBar extends StatelessWidget {
                   onChangeEnd: onSeek,
                 ),
               ),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Text(fmtMs(value.toInt()),
-                      style: const TextStyle(color: Colors.white70)),
-                  Text(fmtMs(total.toInt()),
-                      style: const TextStyle(color: Colors.white70)),
-                ],
+              Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Row(
+                  mainAxisAlignment:
+                      MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(fmtMs(value.toInt()),
+                        style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 12)),
+                    Text(fmtMs(total.toInt()),
+                        style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 12)),
+                  ],
+                ),
               ),
             ],
           ),
@@ -385,29 +422,32 @@ class _Transport extends StatelessWidget {
               },
             ),
             IconButton(
-              iconSize: 44,
+              iconSize: 53,
               icon: const Icon(Icons.skip_previous, color: Colors.white),
               tooltip: 'Previous',
               onPressed: () => state.controller.previous(),
             ),
             loading
                 ? const SizedBox(
-                    width: 64,
-                    height: 64,
+                    width: 92,
+                    height: 92,
                     child: Padding(
-                      padding: EdgeInsets.all(12),
+                      padding: EdgeInsets.all(24),
                       child: CircularProgressIndicator(
-                          color: Colors.white),
+                          color: Colors.white,
+                          strokeWidth: 3),
                     ),
                   )
                 : IconButton.filled(
-                    iconSize: 40,
+                    iconSize: 74,
                     style: IconButton.styleFrom(
                         backgroundColor:
                             Theme.of(context).colorScheme.primary,
                         foregroundColor: Theme.of(context)
                             .colorScheme
-                            .onPrimary),
+                            .onPrimary,
+                        padding:
+                            const EdgeInsets.all(9)),
                     icon: Icon(
                         playing ? Icons.pause : Icons.play_arrow),
                     tooltip: playing ? 'Pause' : 'Play',
@@ -415,7 +455,7 @@ class _Transport extends StatelessWidget {
                         state.controller.togglePlay(),
                   ),
             IconButton(
-              iconSize: 44,
+              iconSize: 53,
               icon: const Icon(Icons.skip_next, color: Colors.white),
               tooltip: 'Next',
               onPressed: () => state.controller.next(),
@@ -443,6 +483,63 @@ class _Transport extends StatelessWidget {
   }
 }
 
+/// Volume row (Apple-Music shape): 20dp speakers + slider.
+/// Drives the player volume directly.
+class _VolumeRow extends StatelessWidget {
+  final AppState state;
+  const _VolumeRow({required this.state});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<double>(
+      stream: state.controller.player.volumeStream,
+      initialData: state.controller.player.volume,
+      builder: (_, snap) {
+        final v = (snap.data ?? 1.0).clamp(0.0, 1.0);
+        return Padding(
+          padding:
+              const EdgeInsets.fromLTRB(32, 0, 32, 4),
+          child: Row(
+            children: [
+              const Icon(Icons.volume_down_outlined,
+                  size: 20, color: Colors.white54),
+              const SizedBox(width: 10),
+              Expanded(
+                child: SliderTheme(
+                  data: SliderTheme.of(context).copyWith(
+                    trackHeight: 6,
+                    thumbShape:
+                        const RoundSliderThumbShape(
+                            enabledThumbRadius: 7),
+                    overlayShape:
+                        const RoundSliderOverlayShape(
+                            overlayRadius: 14),
+                    activeTrackColor: Colors.white70,
+                    inactiveTrackColor: Colors.white24,
+                    thumbColor: Colors.white,
+                  ),
+                  child: Slider(
+                    value: v,
+                    onChanged: (nv) {
+                      try {
+                        state.controller.player
+                            .setVolume(nv);
+                      } catch (_) {}
+                    },
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              const Icon(Icons.volume_up_outlined,
+                  size: 20, color: Colors.white54),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
 /// Actions row (P6): Video/Audio toggle, Like, Download, Queue, JAM
 /// (dot when active — placeholder toast until Phase 4), 3-dot More.
 class _ActionsRow extends StatelessWidget {
@@ -453,43 +550,69 @@ class _ActionsRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final liked = state.library.isLiked(track.id);
+    Widget disc({
+      required String tip,
+      required IconData icon,
+      required VoidCallback onTap,
+      bool filled = false,
+    }) {
+      return Tooltip(
+        message: tip,
+        child: GestureDetector(
+          onTap: onTap,
+          child: Container(
+            width: 44,
+            height: 44,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: filled
+                  ? Colors.white.withValues(alpha: 0.34)
+                  : Colors.white.withValues(alpha: 0.18),
+              border: Border.all(
+                  color: Colors.white.withValues(alpha: 0.35),
+                  width: 0.5),
+            ),
+            child: Icon(icon, size: 19, color: Colors.white),
+          ),
+        ),
+      );
+    }
+
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceEvenly,
       children: [
-        IconButton(
-          tooltip: 'Video',
-          icon: const Icon(Icons.ondemand_video_outlined,
-              color: Colors.white),
-          onPressed: () => _toast(context,
+        disc(
+          tip: 'Video',
+          icon: Icons.ondemand_video_outlined,
+          onTap: () => _toast(context,
               'Video mode arrives in Phase 3 — audio for now'),
         ),
-        IconButton(
-          tooltip: liked ? 'Unlike' : 'Like',
-          icon: Icon(liked ? Icons.favorite : Icons.favorite_border,
-              color: Colors.white),
-          onPressed: () => state.actToggleLike(track),
+        disc(
+          tip: liked ? 'Unlike' : 'Like',
+          icon: liked ? Icons.favorite : Icons.favorite_border,
+          filled: liked,
+          onTap: () => state.actToggleLike(track),
         ),
-        IconButton(
-          tooltip: 'Download',
-          icon: const Icon(Icons.download_outlined, color: Colors.white),
-          onPressed: () => _toast(context, state.downloadStub),
+        disc(
+          tip: 'Download',
+          icon: Icons.download_outlined,
+          onTap: () => _toast(context, state.downloadStub),
         ),
-        IconButton(
-          tooltip: 'Queue',
-          icon: const Icon(Icons.queue_music_outlined,
-              color: Colors.white),
-          onPressed: () => openQueueSheet(context),
+        disc(
+          tip: 'Queue',
+          icon: Icons.queue_music_outlined,
+          onTap: () => openQueueSheet(context),
         ),
-        IconButton(
-          tooltip: 'JAM',
-          icon: const Icon(Icons.group_outlined, color: Colors.white),
-          onPressed: () => _toast(
+        disc(
+          tip: 'JAM',
+          icon: Icons.group_outlined,
+          onTap: () => _toast(
               context, 'JAM listen-together arrives in Phase 4'),
         ),
-        IconButton(
-          tooltip: 'More',
-          icon: const Icon(Icons.more_vert, color: Colors.white),
-          onPressed: () => showTrackMenu(
+        disc(
+          tip: 'More',
+          icon: Icons.more_vert,
+          onTap: () => showTrackMenu(
               context, state, track, state.controller.engine.snapshot()),
         ),
       ],

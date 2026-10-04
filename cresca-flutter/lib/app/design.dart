@@ -24,6 +24,7 @@ import 'dart:ui';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'dart:math' as math;
 
 /// Cresca red — brand primary in both themes (A3 default song-null).
 const crescaRed = Color(0xFFFA243C);
@@ -231,6 +232,197 @@ class IosSpinner extends StatelessWidget {
       width: size,
       height: size,
       child: const CupertinoActivityIndicator(radius: 10),
+    );
+  }
+}
+
+/// Artwork mesh backdrop (Apple-Music/BitChord shape): 4 color blobs at
+/// fixed anchors drifting slowly, heavy blur, dark scrim for legibility.
+/// Colors ride the theme seed (artwork-palette tinting lands with the
+/// palette_generator hookup); blobs rest after each track change.
+class MeshBackdrop extends StatefulWidget {
+  const MeshBackdrop({super.key});
+
+  @override
+  State<MeshBackdrop> createState() => _MeshBackdropState();
+}
+
+class _MeshBackdropState extends State<MeshBackdrop>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _drift;
+
+  @override
+  void initState() {
+    super.initState();
+    _drift = AnimationController(
+        vsync: this, duration: const Duration(seconds: 8))
+      ..repeat();
+  }
+
+  @override
+  void dispose() {
+    _drift.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final dark =
+        Theme.of(context).brightness == Brightness.dark;
+    return AnimatedBuilder(
+      animation: _drift,
+      builder: (_, _) => Stack(
+        fit: StackFit.expand,
+        children: [
+          Container(color: scheme.surface),
+          CustomPaint(
+            painter: _MeshPainter(
+              colors: [
+                scheme.primary,
+                scheme.secondary,
+                scheme.tertiary,
+                scheme.primaryContainer,
+              ],
+              drift: _drift.value,
+            ),
+          ),
+          // Heavy blur melts the blobs into a wash.
+          BackdropFilter(
+            filter: ImageFilter.blur(sigmaX: 64, sigmaY: 64),
+            child: Container(color: Colors.transparent),
+          ),
+          // Scrim for legibility (10% → 38% top-to-bottom).
+          Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [
+                  Colors.black.withValues(
+                      alpha: dark ? 0.10 : 0.04),
+                  Colors.black.withValues(alpha: 0.38),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _MeshPainter extends CustomPainter {
+  final List<Color> colors;
+  final double drift;
+  const _MeshPainter({required this.colors, required this.drift});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final maxSide =
+        size.width > size.height ? size.width : size.height;
+    final r = 0.62 * maxSide;
+    // BitChord anchors: (0.20,0.25) (0.80,0.20) (0.75,0.80) (0.25,0.75).
+    final anchors = [
+      Offset(size.width * 0.20, size.height * 0.25),
+      Offset(size.width * 0.80, size.height * 0.20),
+      Offset(size.width * 0.75, size.height * 0.80),
+      Offset(size.width * 0.25, size.height * 0.75),
+    ];
+    // Slow drift (0.45π per 8s cycle), then rest is inherent to repeat.
+    final wobble = 0.45 * 3.14159 * drift;
+    for (var i = 0; i < 4; i++) {
+      final a = anchors[i] +
+          Offset(18 * math.sin(wobble + i * 1.7),
+              18 * math.cos(wobble * 0.8 + i));
+      final paint = Paint()
+        ..color = colors[i % colors.length].withValues(alpha: 0.85)
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 8);
+      canvas.drawCircle(a, r / 3.2, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _MeshPainter old) =>
+      old.drift != drift || old.colors != colors;
+}
+
+/// Floating pill tab bar (BitChord/Apple-Music shape): glass pill with
+/// side gutters (max 440 centered), 5 tint-marked destinations, no
+/// indicator pill. Used with Scaffold.extendBody so content flows under
+/// the blur.
+class FloatingTabBar extends StatelessWidget {
+  final int current;
+  final ValueChanged<int> onTap;
+  const FloatingTabBar(
+      {super.key, required this.current, required this.onTap});
+
+  static const _items = [
+    (Icons.home_outlined, Icons.home, 'Listen Now'),
+    (Icons.trending_up_outlined, Icons.trending_up, 'Trending'),
+    (Icons.radio_outlined, Icons.radio, 'Radio'),
+    (Icons.library_music_outlined, Icons.library_music, 'Library'),
+    (Icons.search_outlined, Icons.search, 'Search'),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding:
+            const EdgeInsets.fromLTRB(10, 0, 10, 10),
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 440),
+            child: Glass(
+              radius: 28,
+              blur: 22,
+              padding: const EdgeInsets.symmetric(
+                  vertical: 9, horizontal: 6),
+              child: Row(
+                children: [
+                  for (var i = 0; i < _items.length; i++)
+                    Expanded(
+                      child: GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: () => onTap(i),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              i == current
+                                  ? _items[i].$2
+                                  : _items[i].$1,
+                              size: 25,
+                              color: i == current
+                                  ? scheme.primary
+                                  : scheme.onSurfaceVariant.withValues(
+                                      alpha: 0.65),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(_items[i].$3,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                    color: i == current
+                                        ? scheme.primary
+                                        : scheme.onSurfaceVariant
+                                            .withValues(
+                                                alpha: 0.65))),
+                          ],
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
