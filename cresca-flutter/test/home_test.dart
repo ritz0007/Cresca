@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:test/test.dart';
 
 import 'package:cresca_app/app/library.dart';
+import 'package:cresca_app/app/radio_store.dart';
 import 'package:cresca_app/core/home_feed.dart';
 import 'package:cresca_app/core/track.dart';
 
@@ -108,6 +109,64 @@ void main() {
       await lib2.load();
       expect(lib2.playlists.first.name, 'Road');
       expect(lib2.playlists.first.tracks.first.id, 'a');
+    });
+
+    test('playlist rename/delete/remove-row', () async {
+      final lib = LibraryStore(dir);
+      await lib.load();
+      final p = await lib.createPlaylist('Road');
+      await lib.addToPlaylist(p.id, t('a'));
+      expect(await lib.renamePlaylist(p.id, 'Trip'), isTrue);
+      expect(await lib.renamePlaylist(p.id, '  '), isFalse);
+      await lib.removeFromPlaylist(p.id, 'a');
+      expect(
+          lib.playlists
+              .firstWhere((e) => e.id == p.id)
+              .tracks,
+          isEmpty);
+      await lib.deletePlaylist(p.id);
+      expect(lib.playlists.where((e) => e.id == p.id), isEmpty);
+    });
+
+    test('radios upsert/like-sort/delete with caps', () async {
+      final lib = LibraryStore(dir);
+      await lib.load();
+      YtTrack seed(String id) => t(id);
+      final now = 1000;
+      await lib.upsertRadio(SavedRadio(
+          id: 'r1',
+          seed: seed('s1'),
+          title: 'R1',
+          tracks: [seed('s1')],
+          createdAt: now,
+          updatedAt: now));
+      await lib.upsertRadio(SavedRadio(
+          id: 'r2',
+          seed: seed('s2'),
+          title: 'R2',
+          tracks: [seed('s2')],
+          createdAt: now,
+          updatedAt: now));
+      expect(await lib.toggleRadioLike('s1'), isTrue);
+      expect(lib.radios.first.seed.id, 's1'); // liked floats first
+      await lib.deleteRadio('s1');
+      expect(lib.radios.any((e) => e.seed.id == 's1'), isFalse);
+      final lib2 = LibraryStore(dir);
+      await lib2.load();
+      expect(lib2.radios.length, 1);
+    });
+
+    test('artists name-keyed toggle + persist', () async {
+      final lib = LibraryStore(dir);
+      await lib.load();
+      await lib.toggleArtist('Arijit Singh', thumbUrl: 'th');
+      expect(lib.isArtistFav('arijit singh'), isTrue);
+      await lib.toggleArtist('Arijit Singh');
+      expect(lib.isArtistFav('Arijit Singh'), isFalse);
+      await lib.toggleArtist('Shreya');
+      final lib2 = LibraryStore(dir);
+      await lib2.load();
+      expect(lib2.isArtistFav('SHREYA'), isTrue);
     });
   });
 }

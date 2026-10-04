@@ -389,7 +389,8 @@ void main() {
 
   group('resolve race', () {
     test('player body shape', () {
-      final b = playerBody('dQw4w9WgXcQ', 'V', poToken: 'P');
+      final b = playerBody(
+          TubeClient.androidMusic, 'dQw4w9WgXcQ', 'V', poToken: 'P');
       expect(b['videoId'], 'dQw4w9WgXcQ');
       expect(b['racyCheckOk'], true);
       expect(b['contentCheckOk'], true);
@@ -397,8 +398,25 @@ void main() {
           'ANDROID_MUSIC');
       expect(
           (b['serviceIntegrityDimensions'] as Map)['poToken'], 'P');
-      expect(playerBody('x', '').containsKey('serviceIntegrityDimensions'),
+      expect(
+          playerBody(TubeClient.androidMusic, 'x', '')
+              .containsKey('serviceIntegrityDimensions'),
           isFalse);
+    });
+
+    test('player body context follows the calling client', () {
+      for (final c in [
+        TubeClient.webRemix,
+        TubeClient.androidMusic,
+        TubeClient.androidVr,
+        TubeClient.web,
+      ]) {
+        final b = playerBody(c, 'dQw4w9WgXcQ', '');
+        expect(((b['context'] as Map)['client'] as Map)['clientName'],
+            c.name);
+        expect(((b['context'] as Map)['client'] as Map)['clientVersion'],
+            c.version);
+      }
     });
 
     test('player parse: status/mime/cipher/sort/dedupe', () {

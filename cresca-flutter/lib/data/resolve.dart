@@ -19,14 +19,17 @@ import '../core/track.dart';
 import 'cache.dart';
 import 'innertube.dart';
 
-/// Player request body (InnerTubeApi.playerUrls 1:1).
+/// Player request body (InnerTubeApi.playerUrls 1:1). The context MUST
+/// match the calling client (name/version/key/headers travel together);
+/// a mismatched context silently kills that race leg.
 Map<String, dynamic> playerBody(
+  TubeClient client,
   String videoId,
   String visitorData, {
   String poToken = '',
 }) {
   final body = <String, dynamic>{
-    'context': contextMap(TubeClient.androidMusic, visitorData),
+    'context': contextMap(client, visitorData),
     'videoId': videoId,
     'racyCheckOk': true,
     'contentCheckOk': true,
@@ -143,7 +146,7 @@ class StreamResolver {
               visitorData: visitorData(),
               poToken: poToken(),
             ),
-            body: jsonEncode(playerBody(videoId, visitorData(),
+            body: jsonEncode(playerBody(client, videoId, visitorData(),
                 poToken: poToken())),
           )
           .timeout(playerLegTimeout);
@@ -186,7 +189,7 @@ class StreamResolver {
       _yt ??= YoutubeExplode();
       final manifest = await _yt!.videos.streams
           .getManifest(videoId)
-          .timeout(playerLegTimeout);
+          .timeout(const Duration(seconds: 20));
       final sorted = manifest.audioOnly.toList()
         ..sort((a, b) =>
             b.bitrate.bitsPerSecond.compareTo(a.bitrate.bitsPerSecond));
