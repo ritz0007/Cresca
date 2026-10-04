@@ -22,6 +22,7 @@ import '../core/queue.dart';
 import '../core/session.dart';
 import '../core/track.dart';
 import '../data/cache.dart';
+import '../data/lyrics.dart';
 import '../data/repository.dart';
 import '../data/resolve.dart';
 import 'crash.dart';
@@ -67,6 +68,9 @@ class AppState extends ChangeNotifier {
   bool radioLoading = false;
 
   Timer? _debounce;
+
+  /// Session lyrics memo by track id (track re-entry never re-hits).
+  final Map<String, LyricsState> lyricsMemo = {};
 
   /// Registered by the Search tab; double-tap on Search calls it (T1).
   void Function()? onSearchFocusRequest;

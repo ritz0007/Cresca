@@ -18,6 +18,7 @@ import '../../core/track.dart';
 import '../app.dart';
 import '../design.dart';
 import '../state.dart';
+import 'lyrics_panel.dart';
 import 'queue_sheet.dart';
 import 'track_menu.dart';
 import 'track_row.dart';
@@ -137,7 +138,9 @@ class _PlayerSheetState extends State<PlayerSheet> {
                         ),
                       _ActionsRow(state: state, track: track),
                       const SizedBox(height: 8),
-                      _Phase3Stubs(track: track),
+                      LyricsSection(
+                          key: ValueKey(track.id), track: track),
+                      const _Phase3Stubs(),
                       const SizedBox(height: 24),
                     ],
                   ),
@@ -566,7 +569,7 @@ class _ActionsRow extends StatelessWidget {
             decoration: BoxDecoration(
               shape: BoxShape.circle,
               color: filled
-                  ? Colors.white.withValues(alpha: 0.34)
+                  ? const Color(0xFF1DB954)
                   : Colors.white.withValues(alpha: 0.18),
               border: Border.all(
                   color: Colors.white.withValues(alpha: 0.35),
@@ -620,10 +623,10 @@ class _ActionsRow extends StatelessWidget {
   }
 }
 
-/// Honest stubs for Phase-3 surfaces: never fake content (H8).
+/// Honest stubs for remaining Phase-3 surfaces (credits/video):
+/// never fake content (H8).
 class _Phase3Stubs extends StatelessWidget {
-  final YtTrack track;
-  const _Phase3Stubs({required this.track});
+  const _Phase3Stubs();
 
   @override
   Widget build(BuildContext context) {
@@ -631,7 +634,7 @@ class _Phase3Stubs extends StatelessWidget {
       padding: EdgeInsets.symmetric(horizontal: 24),
       child: Column(
         children: [
-          Text('Lyrics, credits and video arrive in Phase 3.',
+          Text('Credits and video arrive in Phase 3.',
               textAlign: TextAlign.center,
               style: TextStyle(color: Colors.white54, fontSize: 12)),
         ],
@@ -723,6 +726,7 @@ class _ArtistPageState extends State<ArtistPage> {
                       children: [
                         Expanded(
                           child: FilledButton.icon(
+                            style: spotifyPlayStyle(),
                             icon: const Icon(Icons.play_arrow),
                             label: const Text('Play'),
                             onPressed: () =>
