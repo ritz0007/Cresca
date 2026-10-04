@@ -164,7 +164,7 @@ class _RegionRail extends StatelessWidget {
             ),
           ),
           SizedBox(
-            height: 132,
+            height: 148,
             child: ListView.builder(
               scrollDirection: Axis.horizontal,
               padding:

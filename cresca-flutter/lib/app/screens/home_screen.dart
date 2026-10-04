@@ -247,7 +247,7 @@ class _TopPicks extends StatelessWidget {
             ],
           ),
           SizedBox(
-            height: 148,
+            height: 178,
             child: ListView.builder(
               scrollDirection: Axis.horizontal,
               itemCount: tracks.length,
@@ -274,18 +274,28 @@ class _PickCard extends StatelessWidget {
     return GestureDetector(
       onTap: () => state.actPlay(queue, index),
       child: Container(
-        width: 120,
-        margin: const EdgeInsets.only(right: 8, top: 8),
+        width: 124,
+        margin: const EdgeInsets.only(right: 10, top: 8),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
           children: [
             TrackArt(track: track, size: 112),
+            const SizedBox(height: 6),
             Text(track.title,
-                maxLines: 1, overflow: TextOverflow.ellipsis),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w600)),
             Text(track.displayArtist(),
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: Theme.of(context).textTheme.bodySmall),
+                style: TextStyle(
+                    fontSize: 11.5,
+                    color: Theme.of(context)
+                        .colorScheme
+                        .onSurfaceVariant)),
           ],
         ),
       ),
@@ -427,7 +437,7 @@ class _Rail extends StatelessWidget {
             ),
           ),
           SizedBox(
-            height: 148,
+            height: 178,
             child: ListView.builder(
               scrollDirection: Axis.horizontal,
               padding:

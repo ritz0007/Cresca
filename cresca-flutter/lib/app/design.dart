@@ -197,12 +197,19 @@ class FrostedTabBar extends StatelessWidget {
           child: Theme(
             data: Theme.of(context).copyWith(
               navigationBarTheme:
-                  NavigationBarThemeData(
+                  const NavigationBarThemeData(
                 backgroundColor: Colors.transparent,
                 // No pill: iOS marks selection with tint alone.
                 indicatorColor: Colors.transparent,
                 labelBehavior:
                     NavigationDestinationLabelBehavior.alwaysShow,
+                // Montserrat runs wide: compact labels keep all five
+                // tabs legible at 1080p.
+                labelTextStyle: WidgetStatePropertyAll(
+                    TextStyle(
+                        fontSize: 10.5,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: 0.1)),
               ),
             ),
             child: child,
