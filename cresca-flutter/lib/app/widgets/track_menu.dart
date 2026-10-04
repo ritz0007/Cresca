@@ -53,11 +53,16 @@ Future<void> showTrackMenu(BuildContext context, AppState state,
             child: const Text('Add to playlist'),
           ),
           CupertinoActionSheetAction(
-            onPressed: () {
+            onPressed: () async {
               Navigator.pop(sheet);
-              _toast(context, state.downloadStub);
+              try {
+                final msg = await state.actDownload(track);
+                if (context.mounted) _toast(context, msg);
+              } catch (_) {}
             },
-            child: const Text('Download'),
+            child: Text(state.downloads.isDownloaded(track.id)
+                ? 'Downloaded ✓'
+                : 'Download'),
           ),
           CupertinoActionSheetAction(
             onPressed: () {

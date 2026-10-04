@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import '../../core/track.dart';
 import '../app.dart';
 import '../state.dart';
+import '../widgets/downloads_sheet.dart';
 import '../widgets/mini_player.dart';
 import '../widgets/session_sheet.dart';
 import 'playlist_screen.dart';
@@ -90,9 +91,9 @@ class _QuickTiles extends StatelessWidget {
           Expanded(
             child: _Tile(
               icon: Icons.download_outlined,
-              label: 'Downloads',
-              onTap: () => _toast(context,
-                  'Offline downloads arrive in Phase 3'),
+              label:
+                  'Downloads (${state.downloads.listAll().length})',
+              onTap: () => openDownloadsSheet(context),
             ),
           ),
         ],
@@ -255,8 +256,8 @@ class _FolderCard extends StatelessWidget {
                 borderRadius: BorderRadius.circular(16),
                 gradient: folder.heart
                     ? const LinearGradient(colors: [
-                        Color(0xFFFA243C),
-                        Color(0xFF7D0018)
+                        Color(0xFF1DB954),
+                        Color(0xFF0D5C2B)
                       ])
                     : null,
                 color: folder.heart

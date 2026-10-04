@@ -599,7 +599,12 @@ class _ActionsRow extends StatelessWidget {
         disc(
           tip: 'Download',
           icon: Icons.download_outlined,
-          onTap: () => _toast(context, state.downloadStub),
+          onTap: () async {
+            try {
+              final msg = await state.actDownload(track);
+              if (context.mounted) _toast(context, msg);
+            } catch (_) {}
+          },
         ),
         disc(
           tip: 'Queue',

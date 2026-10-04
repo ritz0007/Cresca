@@ -26,6 +26,7 @@ import '../data/lyrics.dart';
 import '../data/repository.dart';
 import '../data/resolve.dart';
 import 'crash.dart';
+import 'downloads.dart';
 import 'library.dart';
 import 'radio_store.dart' show SavedRadio;
 
@@ -45,6 +46,7 @@ class AppState extends ChangeNotifier {
   late final PlayerController controller;
   late final LibraryStore library;
   late final CrashLog crash;
+  late final DownloadStore downloads;
   final YtSession ytSession = YtSession();
   SharedPreferences? prefs;
 
@@ -131,8 +133,23 @@ class AppState extends ChangeNotifier {
     };
     library = LibraryStore(filesDir);
     crash = CrashLog(filesDir);
+    downloads = DownloadStore(
+      filesDir,
+      publicDir: _deviceMusicDir(),
+    );
+    try {
+      downloads.location =
+          prefs?.getString('dl_location') ?? 'app';
+    } catch (_) {}
+    controller.localFileFor = downloads.fileFor;
+    downloads.onChanged = () {
+      try {
+        notifyListeners();
+      } catch (_) {}
+    };
     try {
       await library.load();
+      await downloads.load();
       await controller.init();
       await _restoreSession();
       await _restoreUrlCache();
@@ -155,6 +172,7 @@ class AppState extends ChangeNotifier {
   void dispose() {
     try {
       _debounce?.cancel();
+      downloads.dispose();
       controller.dispose();
       repo.dispose();
       resolver.dispose();
@@ -203,6 +221,51 @@ class AppState extends ChangeNotifier {
               },
           ]));
     } catch (_) {}
+  }
+
+  /// Best-effort public Music dir (device-Music downloads switch).
+  Directory? _deviceMusicDir() {
+    try {
+      const candidates = [
+        '/storage/emulated/0/Music',
+        '/sdcard/Music',
+      ];
+      for (final p in candidates) {
+        final d = Directory(p);
+        try {
+          if (d.existsSync()) return d;
+        } catch (_) {}
+      }
+      return Directory('/storage/emulated/0/Music');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> setDownloadLocation(String value) async {
+    try {
+      downloads.location = value == 'device' ? 'device' : 'app';
+      await prefs?.setString('dl_location', downloads.location);
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  /// Row-menu Download: resolves the stream URL once, then enqueues a
+  /// background download. Returns a human status string for the toast.
+  Future<String> actDownload(YtTrack t) async {
+    try {
+      if (downloads.isDownloaded(t.id)) return 'Already downloaded';
+      final url = await resolver.audioUrl(t.watchUrl).timeout(
+            const Duration(seconds: 45),
+          );
+      if (url == null || url.isEmpty) {
+        return 'Could not resolve audio stream';
+      }
+      final ok = await downloads.enqueue(t, url);
+      return ok ? 'Download started' : 'Download failed to start';
+    } catch (_) {
+      return 'Download failed to start';
+    }
   }
 
   void setMotion(bool on) {
@@ -782,10 +845,6 @@ class AppState extends ChangeNotifier {
       await launchUrl(uri, mode: LaunchMode.externalApplication);
     } catch (_) {}
   }
-
-  /// Downloads land in Phase 3 (background_downloader): honest stub.
-  String get downloadStub =>
-      'Downloads arrive with offline mode in Phase 3';
 
   String _json(Map<String, dynamic> root) {
     try {
