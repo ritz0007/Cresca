@@ -4,6 +4,7 @@
 
 import 'dart:async';
 
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
 import '../../core/track.dart';
@@ -115,33 +116,18 @@ class _SearchScreenState extends State<SearchScreen> {
     final shown = _rows.isEmpty ? _cachedFirst : _rows;
     return Scaffold(
       appBar: AppBar(
-        title: TextField(
+        // iOS search field (CupertinoSearchTextField carries its own
+        // clear button + activity indicator styling).
+        title: CupertinoSearchTextField(
           controller: _text,
           focusNode: _focus,
-          decoration: InputDecoration(
-            hintText: 'Search songs, artists',
-            border: InputBorder.none,
-            suffixIcon: _loading
-                ? const Padding(
-                    padding: EdgeInsets.all(12),
-                    child: SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(
-                            strokeWidth: 2)),
-                  )
-                : (_text.text.isEmpty
-                    ? null
-                    : IconButton(
-                        icon: const Icon(Icons.clear),
-                        onPressed: () {
-                          _text.clear();
-                          _run('', state);
-                        },
-                      )),
-          ),
+          placeholder: 'Search songs, artists',
           onChanged: (v) => _onChanged(v, state),
           onSubmitted: (v) => _run(v, state),
+          onSuffixTap: () {
+            _text.clear();
+            _run('', state);
+          },
         ),
       ),
       body: Column(

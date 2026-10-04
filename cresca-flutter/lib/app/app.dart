@@ -11,6 +11,7 @@ import 'screens/radio_screen.dart';
 import 'screens/search_screen.dart';
 import 'screens/trending_screen.dart';
 import 'state.dart';
+import 'design.dart';
 
 /// Inherited access to the app state (rows, sheets, screens).
 class AppScope extends InheritedWidget {
@@ -72,16 +73,9 @@ class _CrescaAppState extends State<CrescaApp> {
         title: 'Cresca',
         debugShowCheckedModeBanner: false,
         themeMode: ThemeMode.system,
-        theme: ThemeData(
-          useMaterial3: true,
-          colorSchemeSeed: const Color(0xFFFA243C),
-          brightness: Brightness.light,
-        ),
-        darkTheme: ThemeData(
-          useMaterial3: true,
-          colorSchemeSeed: const Color(0xFFFA243C),
-          brightness: Brightness.dark,
-        ),
+        // iOS spirit + Spotify voice (see design.dart D1–D4).
+        theme: crescaTheme(Brightness.light),
+        darkTheme: crescaTheme(Brightness.dark),
         home: Stack(
           children: [
             Scaffold(
@@ -95,8 +89,10 @@ class _CrescaAppState extends State<CrescaApp> {
                   SearchScreen(),
                 ],
               ),
-              // A5: liquid-glass bottom bar (translucent + hairline).
-              bottomNavigationBar: NavigationBar(
+              // A5/D4: liquid-glass bottom bar — frosted, hairline,
+              // no pill (iOS marks selection with tint alone).
+              bottomNavigationBar: FrostedTabBar(
+                child: NavigationBar(
                 selectedIndex: _tab,
                 onDestinationSelected: _onTab,
                 destinations: const [
@@ -121,6 +117,7 @@ class _CrescaAppState extends State<CrescaApp> {
                       selectedIcon: Icon(Icons.search),
                       label: 'Search'),
                 ],
+                ),
               ),
             ),
             // A1: splash + intro overlay.

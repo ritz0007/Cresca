@@ -1,7 +1,9 @@
 // Per-row overflow menu, identical on every screen (M1): Play, Play
 // next, Add to queue, Add to playlist (picker + inline create),
 // Download, Like, Share sheet, Start radio, Open in YouTube.
+// iOS presentation: CupertinoActionSheet with a Cancel button.
 
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
 import '../../core/track.dart';
@@ -10,94 +12,85 @@ import '../state.dart';
 Future<void> showTrackMenu(BuildContext context, AppState state,
     YtTrack track, List<YtTrack> contextQueue) async {
   try {
-    await showModalBottomSheet<void>(
+    final liked = state.library.isLiked(track.id);
+    await showCupertinoModalPopup<void>(
       context: context,
-      builder: (sheet) => SafeArea(
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              ListTile(
-                leading: const Icon(Icons.play_arrow),
-                title: const Text('Play'),
-                onTap: () {
-                  Navigator.pop(sheet);
-                  state.actPlay(contextQueue, contextQueue
-                      .indexWhere((e) => e.id == track.id));
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.queue_play_next),
-                title: const Text('Play next'),
-                onTap: () {
-                  Navigator.pop(sheet);
-                  state.actPlayNext(track);
-                  _toast(sheet, 'Will play next');
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.queue_music),
-                title: const Text('Add to queue'),
-                onTap: () {
-                  Navigator.pop(sheet);
-                  state.actAddToQueue(track);
-                  _toast(sheet, 'Added to queue');
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.playlist_add),
-                title: const Text('Add to playlist'),
-                onTap: () {
-                  Navigator.pop(sheet);
-                  showPlaylistPicker(context, state, track);
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.download_outlined),
-                title: const Text('Download'),
-                onTap: () {
-                  Navigator.pop(sheet);
-                  _toast(sheet, state.downloadStub);
-                },
-              ),
-              ListTile(
-                leading: Icon(state.library.isLiked(track.id)
-                    ? Icons.favorite
-                    : Icons.favorite_border),
-                title: Text(state.library.isLiked(track.id)
-                    ? 'Unlike'
-                    : 'Like'),
-                onTap: () {
-                  Navigator.pop(sheet);
-                  state.actToggleLike(track);
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.share_outlined),
-                title: const Text('Share'),
-                onTap: () {
-                  Navigator.pop(sheet);
-                  state.actShare(track);
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.radio_outlined),
-                title: const Text('Start radio'),
-                onTap: () {
-                  Navigator.pop(sheet);
-                  state.startRadio(track);
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.open_in_new),
-                title: const Text('Open in YouTube'),
-                onTap: () {
-                  Navigator.pop(sheet);
-                  state.actOpenYouTube(track);
-                },
-              ),
-            ],
+      builder: (sheet) => CupertinoActionSheet(
+        title: Text(track.title,
+            maxLines: 1, overflow: TextOverflow.ellipsis),
+        message: Text(track.displayArtist(),
+            maxLines: 1, overflow: TextOverflow.ellipsis),
+        actions: [
+          CupertinoActionSheetAction(
+            onPressed: () {
+              Navigator.pop(sheet);
+              state.actPlay(contextQueue, contextQueue
+                  .indexWhere((e) => e.id == track.id));
+            },
+            child: const Text('Play'),
           ),
+          CupertinoActionSheetAction(
+            onPressed: () {
+              Navigator.pop(sheet);
+              state.actPlayNext(track);
+              _toast(context, 'Will play next');
+            },
+            child: const Text('Play next'),
+          ),
+          CupertinoActionSheetAction(
+            onPressed: () {
+              Navigator.pop(sheet);
+              state.actAddToQueue(track);
+              _toast(context, 'Added to queue');
+            },
+            child: const Text('Add to queue'),
+          ),
+          CupertinoActionSheetAction(
+            onPressed: () {
+              Navigator.pop(sheet);
+              showPlaylistPicker(context, state, track);
+            },
+            child: const Text('Add to playlist'),
+          ),
+          CupertinoActionSheetAction(
+            onPressed: () {
+              Navigator.pop(sheet);
+              _toast(context, state.downloadStub);
+            },
+            child: const Text('Download'),
+          ),
+          CupertinoActionSheetAction(
+            onPressed: () {
+              Navigator.pop(sheet);
+              state.actToggleLike(track);
+            },
+            child: Text(liked ? 'Unlike' : 'Like'),
+          ),
+          CupertinoActionSheetAction(
+            onPressed: () {
+              Navigator.pop(sheet);
+              state.actShare(track);
+            },
+            child: const Text('Share'),
+          ),
+          CupertinoActionSheetAction(
+            onPressed: () {
+              Navigator.pop(sheet);
+              state.startRadio(track);
+            },
+            child: const Text('Start radio'),
+          ),
+          CupertinoActionSheetAction(
+            onPressed: () {
+              Navigator.pop(sheet);
+              state.actOpenYouTube(track);
+            },
+            child: const Text('Open in YouTube'),
+          ),
+        ],
+        cancelButton: CupertinoActionSheetAction(
+          onPressed: () => Navigator.pop(sheet),
+          child: const Text('Cancel'),
         ),
       ),
     );
@@ -108,42 +101,40 @@ Future<void> showTrackMenu(BuildContext context, AppState state,
 Future<void> showPlaylistPicker(
     BuildContext context, AppState state, YtTrack track) async {
   try {
-    await showModalBottomSheet<void>(
+    await showCupertinoModalPopup<void>(
       context: context,
-      builder: (sheet) => SafeArea(
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              ListTile(
-                leading: const Icon(Icons.add),
-                title: const Text('New playlist'),
-                onTap: () async {
-                  Navigator.pop(sheet);
-                  final name = await _askName(context);
-                  if (name == null) return;
-                  try {
-                    final p = await state.library.createPlaylist(name);
-                    await state.library.addToPlaylist(p.id, track);
-                    if (context.mounted) _toast(context, 'Saved');
-                  } catch (_) {}
-                },
-              ),
-              for (final p in state.library.playlists)
-                ListTile(
-                  leading: const Icon(Icons.queue_music_outlined),
-                  title: Text(p.name),
-                  subtitle: Text('${p.tracks.length} songs'),
-                  onTap: () async {
-                    Navigator.pop(sheet);
-                    try {
-                      await state.library.addToPlaylist(p.id, track);
-                      if (context.mounted) _toast(context, 'Saved');
-                    } catch (_) {}
-                  },
-                ),
-            ],
+      builder: (sheet) => CupertinoActionSheet(
+        title: const Text('Add to playlist'),
+        actions: [
+          CupertinoActionSheetAction(
+            onPressed: () async {
+              Navigator.pop(sheet);
+              final name = await _askName(context);
+              if (name == null) return;
+              try {
+                final p =
+                    await state.library.createPlaylist(name);
+                await state.library.addToPlaylist(p.id, track);
+                if (context.mounted) _toast(context, 'Saved');
+              } catch (_) {}
+            },
+            child: const Text('New playlist'),
           ),
+          for (final p in state.library.playlists)
+            CupertinoActionSheetAction(
+              onPressed: () async {
+                Navigator.pop(sheet);
+                try {
+                  await state.library.addToPlaylist(p.id, track);
+                  if (context.mounted) _toast(context, 'Saved');
+                } catch (_) {}
+              },
+              child: Text('${p.name} (${p.tracks.length})'),
+            ),
+        ],
+        cancelButton: CupertinoActionSheetAction(
+          onPressed: () => Navigator.pop(sheet),
+          child: const Text('Cancel'),
         ),
       ),
     );
@@ -153,21 +144,21 @@ Future<void> showPlaylistPicker(
 Future<String?> _askName(BuildContext context) async {
   try {
     final c = TextEditingController();
-    final name = await showDialog<String>(
+    final name = await showCupertinoDialog<String>(
       context: context,
-      builder: (d) => AlertDialog(
+      builder: (d) => CupertinoAlertDialog(
         title: const Text('New playlist'),
-        content: TextField(
+        content: CupertinoTextField(
           controller: c,
           autofocus: true,
-          decoration:
-              const InputDecoration(hintText: 'Playlist name'),
+          placeholder: 'Playlist name',
         ),
         actions: [
-          TextButton(
+          CupertinoDialogAction(
               onPressed: () => Navigator.pop(d),
               child: const Text('Cancel')),
-          TextButton(
+          CupertinoDialogAction(
+              isDefaultAction: true,
               onPressed: () => Navigator.pop(d, c.text),
               child: const Text('Create')),
         ],

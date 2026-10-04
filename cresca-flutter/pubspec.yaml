@@ -24,6 +24,7 @@ dependencies:
   url_launcher: ^6.3.2
   share_plus: ^11.1.0
   webview_flutter: ^4.13.0
+  google_fonts: ^6.2.1
 
 dev_dependencies:
   flutter_test:

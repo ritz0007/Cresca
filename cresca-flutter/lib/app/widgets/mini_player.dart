@@ -7,6 +7,7 @@ import 'package:just_audio/just_audio.dart';
 
 import '../../core/track.dart';
 import '../app.dart';
+import '../design.dart';
 import '../state.dart';
 import 'player_sheet.dart';
 import 'track_row.dart';
@@ -78,94 +79,105 @@ class _MiniPlayerState extends State<_MiniBodyHost>
           });
         } catch (_) {}
       },
-      child: AnimatedContainer(
-        duration: Duration(milliseconds: state.motionMs(180)),
-        transform: Matrix4.translationValues(_dx, 0, 0),
-        decoration: BoxDecoration(
-          color: scheme.surfaceContainerHighest,
-          border: Border(top: BorderSide(color: scheme.outlineVariant)),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Row(
+      // Liquid-glass floating card (D3): frosted, specular rim.
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+        child: AnimatedContainer(
+          duration: Duration(milliseconds: state.motionMs(180)),
+          transform: Matrix4.translationValues(_dx, 0, 0),
+          child: Glass(
+            radius: 18,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
               children: [
-                if (_peekRight)
-                  const Padding(
-                    padding: EdgeInsets.only(left: 4),
-                    child: Icon(Icons.chevron_left, size: 20),
-                  ),
-                Expanded(
-                  child: ListTile(
-                    dense: true,
-                    leading: _MiniArt(track: track),
-                    title: Text(track.title,
-                        maxLines: 1, overflow: TextOverflow.ellipsis),
-                    subtitle: Text(track.displayArtist(),
-                        maxLines: 1, overflow: TextOverflow.ellipsis),
-                    trailing: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        _EqBars(running: true),
-                        StreamBuilder<PlayerState>(
-                          stream:
-                              state.controller.player.playerStateStream,
-                          builder: (_, snap) {
-                            final playing = snap.data?.playing ??
-                                state.controller.player.playing;
-                            final loading = snap.data?.processingState ==
-                                    ProcessingState.loading ||
-                                snap.data?.processingState ==
-                                    ProcessingState.buffering ||
-                                state.controller.resolving;
-                            if (loading) {
-                              return const SizedBox(
-                                width: 40,
-                                height: 40,
-                                child: Padding(
-                                  padding: EdgeInsets.all(8),
-                                  child: CircularProgressIndicator(
-                                      strokeWidth: 2),
-                                ),
-                              );
-                            }
-                            return IconButton.filled(
-                              style: IconButton.styleFrom(
-                                  backgroundColor: scheme.primary,
-                                  foregroundColor: scheme.onPrimary),
-                              icon: Icon(playing
-                                  ? Icons.pause
-                                  : Icons.play_arrow),
-                              tooltip:
-                                  playing ? 'Pause' : 'Play',
-                              onPressed: () =>
-                                  state.controller.togglePlay(),
-                            );
-                          },
+                Row(
+                  children: [
+                    if (_peekRight)
+                      const Padding(
+                        padding: EdgeInsets.only(left: 4),
+                        child: Icon(Icons.chevron_left, size: 20),
+                      ),
+                    Expanded(
+                      child: ListTile(
+                        dense: true,
+                        leading: _MiniArt(track: track),
+                        title: Text(
+                          track.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                         ),
-                      ],
+                        subtitle: Text(
+                          track.displayArtist(),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            _EqBars(running: true),
+                            StreamBuilder<PlayerState>(
+                              stream: state.controller.player.playerStateStream,
+                              builder: (_, snap) {
+                                final playing =
+                                    snap.data?.playing ??
+                                    state.controller.player.playing;
+                                final loading =
+                                    snap.data?.processingState ==
+                                        ProcessingState.loading ||
+                                    snap.data?.processingState ==
+                                        ProcessingState.buffering ||
+                                    state.controller.resolving;
+                                if (loading) {
+                                  return const SizedBox(
+                                    width: 40,
+                                    height: 40,
+                                    child: Padding(
+                                      padding: EdgeInsets.all(8),
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                      ),
+                                    ),
+                                  );
+                                }
+                                return IconButton.filled(
+                                  style: IconButton.styleFrom(
+                                    backgroundColor: scheme.primary,
+                                    foregroundColor: scheme.onPrimary,
+                                  ),
+                                  icon: Icon(
+                                    playing ? Icons.pause : Icons.play_arrow,
+                                  ),
+                                  tooltip: playing ? 'Pause' : 'Play',
+                                  onPressed: () =>
+                                      state.controller.togglePlay(),
+                                );
+                              },
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    if (_peekLeft)
+                      const Padding(
+                        padding: EdgeInsets.only(right: 4),
+                        child: Icon(Icons.chevron_right, size: 20),
+                      ),
+                  ],
+                ),
+                if (state.controller.errorLine != null)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: Text(
+                      state.controller.errorLine!,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(color: scheme.error, fontSize: 12),
                     ),
                   ),
-                ),
-                if (_peekLeft)
-                  const Padding(
-                    padding: EdgeInsets.only(right: 4),
-                    child: Icon(Icons.chevron_right, size: 20),
-                  ),
+                _Progress(state: state),
               ],
             ),
-            if (state.controller.errorLine != null)
-              Padding(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 16),
-                child: Text(state.controller.errorLine!,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                        color: scheme.error, fontSize: 12)),
-              ),
-            _Progress(state: state),
-          ],
+          ),
         ),
       ),
     );
@@ -203,8 +215,7 @@ class _Progress extends StatelessWidget {
       stream: state.controller.player.positionStream,
       builder: (_, snap) {
         final pos = snap.data ?? Duration.zero;
-        final total =
-            state.controller.player.duration ?? Duration.zero;
+        final total = state.controller.player.duration ?? Duration.zero;
         final f = total.inMilliseconds <= 0
             ? 0.0
             : (pos.inMilliseconds / total.inMilliseconds).clamp(0.0, 1.0);
@@ -212,8 +223,9 @@ class _Progress extends StatelessWidget {
           child: LinearProgressIndicator(
             value: f,
             minHeight: 2,
-            backgroundColor:
-                Theme.of(context).colorScheme.surfaceContainerHighest,
+            backgroundColor: Theme.of(context)
+                .colorScheme
+                .surfaceContainerHighest,
           ),
         );
       },
@@ -230,16 +242,16 @@ class _EqBars extends StatefulWidget {
   State<_EqBars> createState() => _EqBarsState();
 }
 
-class _EqBarsState extends State<_EqBars>
-    with SingleTickerProviderStateMixin {
+class _EqBarsState extends State<_EqBars> with SingleTickerProviderStateMixin {
   late final AnimationController _c;
 
   @override
   void initState() {
     super.initState();
     _c = AnimationController(
-        vsync: this, duration: const Duration(milliseconds: 700))
-      ..repeat(reverse: true);
+      vsync: this,
+      duration: const Duration(milliseconds: 700),
+    )..repeat(reverse: true);
   }
 
   @override
@@ -273,5 +285,9 @@ class _EqBarsState extends State<_EqBars>
   }
 
   Widget _bar(Color color, double h) => Container(
-      width: 3, height: h, color: color, margin: const EdgeInsets.only(bottom: 2));
+    width: 3,
+    height: h,
+    color: color,
+    margin: const EdgeInsets.only(bottom: 2),
+  );
 }
