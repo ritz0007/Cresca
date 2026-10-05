@@ -200,24 +200,74 @@ class _LyricsSectionState extends State<LyricsSection> {
     }
     if (s is LyricsSynced) {
       if (s.lines.isEmpty) return const _EmptyLyrics();
-      return _KaraokeView(
-        key: ValueKey(widget.track.id),
-        lines: s.lines,
-        track: widget.track,
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _Attribution(source: s.source, onRetry: _load),
+          _KaraokeView(
+            key: ValueKey(widget.track.id),
+            lines: s.lines,
+            track: widget.track,
+          ),
+        ],
       );
     }
     if (s is LyricsPlain) {
-      return Container(
-        height: 300,
-        margin: const EdgeInsets.symmetric(horizontal: 24),
-        child: SingleChildScrollView(
-          child: Text(s.text,
-              style: const TextStyle(
-                  color: Colors.white70, height: 1.6)),
-        ),
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _Attribution(source: s.source, onRetry: _load),
+          Container(
+            height: 300,
+            margin: const EdgeInsets.symmetric(horizontal: 24),
+            child: SingleChildScrollView(
+              child: Text(s.text,
+                  style: const TextStyle(
+                      color: Colors.white70, height: 1.6)),
+            ),
+          ),
+        ],
       );
     }
     return const _EmptyLyrics();
+  }
+}
+
+/// Provider attribution row (BitChord/YTM parity): "Lyrics by X" +
+/// retry (re-runs the pipeline — next provider may hit).
+class _Attribution extends StatelessWidget {
+  final LyricSource source;
+  final VoidCallback onRetry;
+  const _Attribution({required this.source, required this.onRetry});
+
+  @override
+  Widget build(BuildContext context) {
+    final name = lyricSourceName(source);
+    if (name.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding:
+          const EdgeInsets.symmetric(horizontal: 24, vertical: 4),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text('Lyrics by $name',
+                style: TextStyle(
+                    color:
+                        Colors.white.withValues(alpha: 0.55),
+                    fontSize: 12)),
+          ),
+          GestureDetector(
+            onTap: onRetry,
+            child: const Text('Change',
+                style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                    decoration: TextDecoration.underline)),
+          ),
+        ],
+      ),
+    );
   }
 }
 

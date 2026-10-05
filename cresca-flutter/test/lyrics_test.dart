@@ -1,3 +1,7 @@
+import 'dart:convert';
+
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:test/test.dart';
 
 import 'package:cresca_app/data/lyrics.dart';
@@ -165,6 +169,63 @@ void main() {
       expect(lrclibSearchUrl('a b'), contains('q=a+b'));
       expect(lrclibExactUrl('a', 't'), contains('artist_name=a'));
       expect(ovhUrl('a', 't'), startsWith('https://api.lyrics.ovh/v1/'));
+    });
+
+    test('source attribution names', () {
+      expect(lyricSourceName(LyricSource.kugou), 'KuGou');
+      expect(lyricSourceName(LyricSource.lrclib), 'LRCLIB');
+      expect(
+          lyricSourceName(LyricSource.youtubeCaptions), 'YouTube');
+      expect(lyricSourceName(LyricSource.none), '');
+    });
+
+    test('kugou: hash → candidates → base64 lrc', () async {
+      final lrc = '[00:10.00]hello\n[00:15.00]world\n[00:20.00]again\n';
+      final mock = MockClient((req) async {
+        final u = req.url.toString();
+        if (u.contains('mobileservice.kugou.com')) {
+          return http.Response(
+              jsonEncode({
+                'data': {
+                  'info': [
+                    {'hash': 'ABC123'}
+                  ]
+                }
+              }),
+              200);
+        }
+        if (u.contains('lyrics.kugou.com/search')) {
+          expect(u, contains('hash=ABC123'));
+          return http.Response(
+              jsonEncode({
+                'candidates': [
+                  {'id': '1', 'accesskey': 'K1'}
+                ]
+              }),
+              200);
+        }
+        if (u.contains('lyrics.kugou.com/download')) {
+          return http.Response(
+              jsonEncode({'content': base64.encode(utf8.encode(lrc))}),
+              200);
+        }
+        return http.Response('nope', 404);
+      });
+      final res = await fetchKugou(mock,
+          artist: 'A B', title: 'T', durationMs: 0);
+      expect(res, isA<LyricsSynced>());
+      final synced = res as LyricsSynced;
+      expect(synced.source, LyricSource.kugou);
+      expect(synced.lines.map((e) => e.text),
+          ['hello', 'world', 'again']);
+    });
+
+    test('kugou: empty candidates → null (falls through)', () async {
+      final mock = MockClient((_) async =>
+          http.Response(jsonEncode({'candidates': []}), 200));
+      expect(
+          await fetchKugou(mock, artist: 'A', title: 'T'),
+          isNull);
     });
   });
 }

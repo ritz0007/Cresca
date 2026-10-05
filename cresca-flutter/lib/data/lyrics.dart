@@ -1,4 +1,6 @@
-// Lyrics: fetch (captions → lrclib → ovh) + scoring + parsers.
+// Lyrics: fetch (captions → lrclib → kugou → ovh) + scoring + parsers.
+// Provider order mirrors BitChord's repository (word-synced Apple-Music
+// sources need native TTML; line-synced LRCLIB/KuGou carry the weight).
 // Native refs: LyricsRepository.kt (pipeline, scoring, LRC/VTT/SRT/
 // timedtext parsers, 128-entry memo), InnerTubeApi captionTracks/
 // fetchCaptionText (track parse, rank, fmt=vtt).
@@ -17,7 +19,16 @@ class LyricLine {
   const LyricLine(this.startMs, this.text);
 }
 
-enum LyricSource { youtubeCaptions, lrclib, none }
+enum LyricSource { youtubeCaptions, lrclib, kugou, ovh, none }
+
+/// Human attribution per source (player "Lyrics by X" row, BitChord parity).
+String lyricSourceName(LyricSource s) => switch (s) {
+      LyricSource.youtubeCaptions => 'YouTube',
+      LyricSource.lrclib => 'LRCLIB',
+      LyricSource.kugou => 'KuGou',
+      LyricSource.ovh => 'lyrics.ovh',
+      LyricSource.none => '',
+    };
 
 /// Unified result across providers.
 class LyricsResult {
@@ -43,7 +54,7 @@ abstract class LyricsState {
       return LyricsResult(
           isSynced: false,
           lines: [LyricLine(0, s.text)],
-          source: LyricSource.lrclib);
+          source: s.source);
     }
     return const LyricsResult(
         isSynced: false, lines: [], source: LyricSource.none);
@@ -63,7 +74,8 @@ class LyricsSynced extends LyricsState {
 
 class LyricsPlain extends LyricsState {
   final String text;
-  const LyricsPlain(this.text);
+  final LyricSource source;
+  const LyricsPlain(this.text, [this.source = LyricSource.lrclib]);
 }
 
 class LyricsNotFound extends LyricsState {
@@ -634,18 +646,102 @@ Future<LyricsState> fetchLrclib(
         if (hit != null) return hit;
       } catch (_) {}
     }
+    // KuGou leg (BitChord parity): keyword search → hash → lyric
+    // candidates → LRC download. Carries much the others lack.
+    try {
+      final kg = await fetchKugou(http,
+          artist: a, title: t, durationMs: durationMs);
+      if (kg != null) return kg;
+    } catch (_) {}
     try {
       final who = a.isNotEmpty ? a : t;
       final body = await _get(http, ovhUrl(who, t));
       if (body != null) {
         final txt =
             ((jsonDecode(body) as Map)['lyrics'] ?? '').toString().trim();
-        if (txt.isNotEmpty) return LyricsPlain(txt);
+        if (txt.isNotEmpty) {
+          return LyricsPlain(txt, LyricSource.ovh);
+        }
       }
     } catch (_) {}
     return const LyricsNotFound();
   } catch (_) {
     return const LyricsNotFound();
+  }
+}
+
+/// KuGou leg (BitChord KuGou.kt parity): song-hash lookup, lyric
+/// candidate search, LRC download (base64). Synced LRC only — plain
+/// falls through to lyrics.ovh. Null on any miss.
+Future<LyricsState?> fetchKugou(
+  http.Client http, {
+  required String artist,
+  required String title,
+  int durationMs = 0,
+}) async {
+  try {
+    final q = [title, artist]
+        .where((e) => e.trim().isNotEmpty)
+        .join(' ')
+        .trim();
+    if (q.length < 2) return null;
+    String? hash;
+    try {
+      final body = await _get(http,
+          'https://mobileservice.kugou.com/api/v3/search/song?version=9108&plat=0&pagesize=8&showtype=0&keyword=${Uri.encodeQueryComponent(q)}');
+      if (body != null) {
+        final data = ((jsonDecode(body) as Map)['data'] as Map?);
+        final info = (data?['info'] as List?);
+        if (info != null && info.isNotEmpty) {
+          hash = ((info.first as Map)['hash'] ?? '').toString();
+          if (hash.isEmpty) hash = null;
+        }
+      }
+    } catch (_) {}
+    final params = <String, String>{
+      'ver': '1',
+      'man': 'yes',
+      'client': 'pc',
+      'keyword': q,
+      if (durationMs > 0)
+        'duration': durationMs.toString(),
+    };
+    if (hash != null && hash.isNotEmpty) {
+      params['hash'] = hash;
+    }
+    final searchBody = await _get(http,
+        'https://lyrics.kugou.com/search?${Uri(queryParameters: params).query}');
+    if (searchBody == null) return null;
+    final decoded = jsonDecode(searchBody);
+    final cands = ((decoded as Map)['candidates'] as List?);
+    if (cands == null || cands.isEmpty) return null;
+    for (final c in cands.take(3)) {
+      try {
+        if (c is! Map) continue;
+        final id = (c['id'] ?? '').toString();
+        final key = (c['accesskey'] ?? '').toString();
+        if (id.isEmpty || key.isEmpty) continue;
+        final dl = await _get(http,
+            'https://lyrics.kugou.com/download?ver=1&client=pc&fmt=lrc&charset=utf8&id=${Uri.encodeQueryComponent(id)}&accesskey=${Uri.encodeQueryComponent(key)}');
+        if (dl == null) continue;
+        final content =
+            ((jsonDecode(dl) as Map)['content'] ?? '').toString();
+        if (content.isEmpty) continue;
+        String lrc = '';
+        try {
+          lrc = utf8.decode(base64.decode(content.trim()));
+        } catch (_) {
+          lrc = content;
+        }
+        final lines = parseLrc(lrc);
+        if (lines.length >= 3) {
+          return LyricsSynced(lines, LyricSource.kugou);
+        }
+      } catch (_) {}
+    }
+    return null;
+  } catch (_) {
+    return null;
   }
 }
 
