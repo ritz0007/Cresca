@@ -239,6 +239,33 @@ class YoutubeRepository {
     }
   }
 
+  /// Playlist cards from YTM kiosks (home + charts): (shelf, card,
+  /// browseId) for playable playlist shelves ("Trending 20 India",
+  /// "New releases" style). Caller resolves via playlistTracks.
+  Future<List<(String, String, String)>> browsePlaylistCards(
+      {int maxCards = 4}) async {
+    final out = <(String, String, String)>[];
+    try {
+      if (!session.useInnerTube) return out;
+      for (final kiosk in ['FEmusic_home', 'FEmusic_charts']) {
+        try {
+          final json = await _post(
+            'browse',
+            browseBody(kiosk, session.visitorData),
+          );
+          if (json == null) continue;
+          for (final c in parsePlaylistCards(json,
+              maxCards: maxCards - out.length)) {
+            if (out.any((e) => e.$3 == c.$3)) continue;
+            out.add(c);
+            if (out.length >= maxCards) return out;
+          }
+        } catch (_) {}
+      }
+    } catch (_) {}
+    return out;
+  }
+
   Future<Map<String, List<YtTrack>>> _chartShelves(
       {int maxShelves = 8, int perShelf = 25}) async {
     try {
@@ -364,7 +391,12 @@ class YoutubeRepository {
       final json = await _post('browse', browseBody(id, session.visitorData));
       if (json == null) return [];
       final shelves = parseShelves(json, 4, max);
-      return distinctById(shelves.values.expand((e) => e).toList())
+      final out =
+          distinctById(shelves.values.expand((e) => e).toList());
+      if (out.isNotEmpty) return out.take(max).toList();
+      // Community/playlist shelves nest bare responsive items without
+      // a shelf wrapper (VLPL responses) — collect them directly.
+      return distinctById(parsePlaylistItems(json, max))
           .take(max)
           .toList();
     } catch (_) {

@@ -174,6 +174,63 @@ void main() {
   });
 
   group('parsers', () {
+    test('playlist cards: VL playlists kept, artists skipped', () {
+      Map<String, dynamic> twoRow(String title, String bid) => {
+            'musicTwoRowItemRenderer': {
+              'title': {
+                'runs': [
+                  {'text': title}
+                ]
+              },
+              'navigationEndpoint': {
+                'browseEndpoint': {'browseId': bid}
+              },
+            },
+          };
+      final root = {
+        'contents': {
+          'singleColumnBrowseResultsRenderer': {
+            'tabs': [
+              {
+                'tabRenderer': {
+                  'content': {
+                    'sectionListRenderer': {
+                      'contents': [
+                        {
+                          'musicCarouselShelfRenderer': {
+                            'header': {
+                              'musicCarouselShelfBasicHeaderRenderer': {
+                                'title': {
+                                  'runs': [
+                                    {'text': 'New releases'}
+                                  ]
+                                }
+                              }
+                            },
+                            'contents': [
+                              twoRow('Trending 20 India', 'VLOLAKxyz'),
+                              twoRow('Arijit Singh', 'UCabc123'),
+                              twoRow('Charts', 'FEmusic_charts'),
+                            ],
+                          },
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+            ],
+          },
+        },
+      };
+      final cards = parsePlaylistCards(
+          (root as Map).cast<String, dynamic>());
+      expect(cards.length, 1);
+      expect(cards.first.$1, 'New releases');
+      expect(cards.first.$2, 'Trending 20 India');
+      expect(cards.first.$3, 'VLOLAKxyz');
+    });
+
     test('music item happy path + gates', () {
       final t = parseMusicItem(musicItem())!;
       expect(t.id, 'dQw4w9WgXcQ');

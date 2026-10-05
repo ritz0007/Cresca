@@ -553,6 +553,27 @@ List<String> parseSuggestions(Map<String, dynamic> root) {
   return out;
 }
 
+/// Bare responsive items anywhere in a browse response (community
+/// playlist shelves nest items without a shelf wrapper) → tracks.
+List<YtTrack> parsePlaylistItems(
+    Map<String, dynamic> root, int max) {
+  final out = <YtTrack>[];
+  try {
+    final items = <Map<String, dynamic>>[];
+    collectMaps(root, 'musicResponsiveListItemRenderer', items);
+    final seen = <String>{};
+    for (final r in items) {
+      try {
+        final t = parseMusicItem(r);
+        if (t == null) continue;
+        if (seen.add(t.id)) out.add(t);
+        if (out.length >= max) break;
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return out;
+}
+
 /// Ordered radio/watch-next panels → tracks (junk-gated).
 /// next → contents.twoColumnWatchNextResults.playlist.playlist.contents[]
 /// each with playlistPanelVideoRenderer (videoId/title/shortByline).
@@ -636,6 +657,55 @@ String? _shelfTitle(Map<String, dynamic> s) {
   }
 }
 
+/// Playlist-card scan (YTM shelf parity): carousel two-row items that
+/// point at PLAYLISTS (browseEndpoint VL/PL/RD…), not artists (UC…) or
+/// videos. Returns (shelfTitle, cardTitle, browseId) — the caller
+/// resolves tracks via playlistTracks. This is how "New releases" /
+/// "Trending 20 India" style shelves become playable rails.
+List<(String, String, String)> parsePlaylistCards(
+    Map<String, dynamic> root,
+    {int maxCards = 4}) {
+  final out = <(String, String, String)>[];
+  try {
+    final shelves = <Map<String, dynamic>>[];
+    collectMaps(root, 'musicCarouselShelfRenderer', shelves);
+    for (final s in shelves) {
+      try {
+        final shelf = _shelfTitle(s) ?? '';
+        if (shelf.isEmpty) continue;
+        dynamic contents =
+            _map(s['contents'])?['contents'] ?? s['contents'];
+        if (contents is! List) continue;
+        for (final w in contents) {
+          try {
+            if (w is! Map) continue;
+            final wm = w.cast<String, dynamic>();
+            final item = _map(wm['musicTwoRowItemRenderer']) ?? wm;
+            if (item['title'] == null ||
+                item['navigationEndpoint'] == null) {
+              continue;
+            }
+            final nav =
+                _map(_map(item['navigationEndpoint'])?['browseEndpoint']);
+            final bid = (nav?['browseId'] ?? '').toString();
+            if (bid.isEmpty ||
+                bid.startsWith('UC') ||
+                bid.startsWith('FE') ||
+                bid.startsWith('SP')) {
+              continue;
+            }
+            final card = (_runsText(item['title']) ?? '').trim();
+            if (card.isEmpty) continue;
+            if (out.any((e) => e.$3 == bid)) continue;
+            out.add((shelf, card, bid));
+            if (out.length >= maxCards) return out;
+          } catch (_) {}
+        }
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return out;
+}
 /// Shelf parse: title → tracks (first title wins), per-shelf cap,
 /// shelf cap. Supports list/twoRow/bare shapes.
 Map<String, List<YtTrack>> parseShelves(

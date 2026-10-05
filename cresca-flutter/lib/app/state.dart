@@ -719,7 +719,6 @@ class AppState extends ChangeNotifier {
   /// refresh with incremental +120ms waves. Never demo data (H8).
   /// Re-entry guarded (screen post-frame + AppState.init both trigger).
   bool _homeLoading = false;
-
   Future<void> loadHome({bool force = false}) async {
     if (_homeLoading) return;
     _homeLoading = true;
@@ -745,6 +744,29 @@ class AppState extends ChangeNotifier {
             if (c != null && c.isNotEmpty) cachedRails.add(RailData(s, c));
           } catch (_) {}
         }
+        // Cached server-driven browse rails (YTM titles preserved).
+        try {
+          final idx = prefs?.getStringList('home_browse_index') ?? const [];
+          for (final raw in idx.take(4).toList().reversed) {
+            try {
+              final parts = raw.split('§');
+              if (parts.length != 3) continue;
+              final c = await repo.loadSnapshot(
+                  parts[1], HomeFeed.sectionTtlMs);
+              if (c != null && c.isNotEmpty) {
+                cachedRails.insert(
+                    0,
+                    RailData(
+                        HomeSection(
+                            title: parts[0],
+                            subtitle: 'YouTube Music',
+                            query: parts[2],
+                            cacheKey: parts[1]),
+                        c));
+              }
+            } catch (_) {}
+          }
+        } catch (_) {}
         if (cachedRails.isNotEmpty) {
           rails = cachedRails;
           homeStatus = HomeStatus.ready;
@@ -753,10 +775,26 @@ class AppState extends ChangeNotifier {
       } catch (_) {}
 
       // Waves: Top Picks + 4-way parallel rails, +120ms incremental.
+      // Server-driven YTM shelves first (native HomeFeed shape: Quick
+      // Picks → new releases → moods/charts): FEmusic_home browse,
+      // real YTM titles kept ("Quick picks", "New releases", ...).
+      // Playlist-card shelves ("Featured playlists...") are skipped —
+      // cards aren't playable tracks (honest rails only, H8).
       final topFuture = repo
           .searchMusic(topSeed.query, max: 15)
           .timeout(const Duration(seconds: 30))
           .catchError((_) => <YtTrack>[]);
+      final browseFuture = repo
+          .homeShelves(maxShelves: 8, perShelf: 12)
+          .timeout(const Duration(seconds: 30))
+          .catchError((_) => <String, List<YtTrack>>{});
+      // Playlist-card shelves (YTM kiosk parity): "Trending 20 India" /
+      // "New releases"-style cards resolve to real tracks via
+      // playlistTracks. Max 2 cards, parallel, 25 s cap.
+      final cardsFuture = repo
+          .browsePlaylistCards(maxCards: 2)
+          .timeout(const Duration(seconds: 40))
+          .catchError((_) => <(String, String, String)>[]);
       final sections = [HomeFeed.released, ...HomeFeed.core];
       final fresh = <RailData>[];
       for (var i = 0; i < sections.length; i += 4) {
@@ -791,6 +829,80 @@ class AppState extends ChangeNotifier {
         }
       } catch (_) {}
 
+      // Server-driven YTM shelves enrich AFTER the query waves paint
+      // (never block them): FEmusic_home track shelves first, then
+      // playlist-card shelves ("Trending 20 India"-style cards resolve
+      // via playlistTracks). Real YTM titles kept throughout.
+      try {
+        final browse = await browseFuture;
+        var touched = false;
+        for (final e in browse.entries) {
+          try {
+            final title = e.key.trim();
+            final low = title.toLowerCase();
+            if (title.isEmpty || e.value.length < 3) continue;
+            if (low.contains('playlist') ||
+                low.contains('chart') ||
+                low.contains('video')) {
+              continue;
+            }
+            final slug = low.replaceAll(RegExp(r'[^a-z0-9]+'), '_');
+            final sec = HomeSection(
+              title: title,
+              subtitle: 'YouTube Music',
+              query: '__browse__$slug',
+              cacheKey: 'home_browse_$slug',
+            );
+            if (fresh.any((r) => r.section.cacheKey == sec.cacheKey)) {
+              continue;
+            }
+            fresh.add(RailData(sec, e.value.take(15).toList()));
+            unawaited(repo.saveSnapshot(sec.cacheKey, e.value));
+            touched = true;
+            if (fresh
+                    .where((r) => r.section.query
+                        .startsWith('__browse__'))
+                    .length >=
+                4) {
+              break;
+            }
+          } catch (_) {}
+        }
+        try {
+          final cards = await cardsFuture;
+          for (final (shelf, card, bid) in cards) {
+            try {
+              if (fresh
+                  .any((r) => r.section.cacheKey == 'home_pl_$bid')) {
+                continue;
+              }
+              final tracks = await repo
+                  .playlistTracks(bid, max: 15)
+                  .timeout(const Duration(seconds: 25));
+              if (tracks.length < 3) continue;
+              final sec = HomeSection(
+                title: card,
+                subtitle: shelf,
+                query: '__browsepl__$bid',
+                cacheKey: 'home_pl_$bid',
+              );
+              fresh.add(RailData(sec, tracks));
+              unawaited(repo.saveSnapshot(sec.cacheKey, tracks));
+              touched = true;
+            } catch (_) {}
+          }
+        } catch (_) {}
+        if (touched) {
+          try {
+            await prefs?.setStringList(
+                'home_browse_index',
+                [for (final r in fresh) '${r.section.title}§${r.section.cacheKey}§${r.section.query}']);
+          } catch (_) {}
+          rails = _mergeRails(fresh);
+          notifyListeners();
+        }
+      } catch (_) {}
+
       // Personalized: Because-you-played (2 seeds) + More-like-artist.
       try {
         await _loadPersonalized(fresh);
@@ -815,12 +927,22 @@ class AppState extends ChangeNotifier {
 
   List<RailData> _mergeRails(List<RailData> fresh) {
     try {
+      // Browse (server-driven YTM) rails keep their arrival order
+      // first — both track shelves (__browse__) and playlist-card
+      // rails (__browsepl__); query rails follow in catalog order.
+      final browse = fresh.where((r) =>
+          r.section.query.startsWith('__browse__') ||
+          r.section.query.startsWith('__browsepl__'));
+      final rest = fresh.where((r) =>
+          !r.section.query.startsWith('__browse__') &&
+          !r.section.query.startsWith('__browsepl__'));
       final order = [
         HomeFeed.released.title,
         ...HomeFeed.core.map((e) => e.title)
       ];
-      final byTitle = {for (final r in fresh) r.section.title: r};
+      final byTitle = {for (final r in rest) r.section.title: r};
       return [
+        ...browse,
         for (final t in order)
           if (byTitle[t] != null) byTitle[t]!,
       ];
