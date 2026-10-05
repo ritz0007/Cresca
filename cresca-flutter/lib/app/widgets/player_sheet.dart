@@ -64,12 +64,18 @@ class _PlayerSheetState extends State<PlayerSheet> {
         if (track == null) {
           return const Center(child: Text('Nothing playing'));
         }
-        return Stack(
-          children: [
-            // Artwork mesh wash (Apple-Music/BitChord backdrop).
-            const Positioned.fill(
-              child: MeshBackdrop(),
-            ),
+        // Apple-Music player is always dark (user direction: player
+        // keeps its Apple-Music treatment). Forcing the dark theme
+        // here keeps the hardcoded white type/icons legible even when
+        // the app runs in light mode.
+        return Theme(
+          data: crescaTheme(Brightness.dark),
+          child: Stack(
+            children: [
+              // Artwork mesh wash (Apple-Music/BitChord backdrop).
+              const Positioned.fill(
+                child: MeshBackdrop(),
+              ),
             CustomScrollView(
               controller: widget.scroll,
               slivers: [
@@ -154,6 +160,7 @@ class _PlayerSheetState extends State<PlayerSheet> {
               ],
             ),
           ],
+          ),
         );
       },
     );

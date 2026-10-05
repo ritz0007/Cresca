@@ -286,6 +286,42 @@ String? _watchId(Map<String, dynamic>? nav) {
   }
 }
 
+/// YTM shelf subtitles lead with a content-type badge on official
+/// uploads ("Song • AP Dhillon • 3:50"): the badge is never the artist.
+/// Skips badges and returns the first real segment (artist channel).
+String _artistSeg(List<String> segs) {
+  const badges = {
+    'song',
+    'songs',
+    'video',
+    'videos',
+    'album',
+    'albums',
+    'playlist',
+    'playlists',
+    'single',
+    'singles',
+    'ep',
+    'eps',
+    'episode',
+    'episodes',
+    'podcast',
+    'podcasts',
+    'artist',
+    'artists',
+    'movie',
+    'movies',
+    'film',
+    'show',
+    'shows',
+    'trailer',
+  };
+  for (final s in segs) {
+    if (s.isNotEmpty && !badges.contains(s.toLowerCase())) return s;
+  }
+  return segs.isEmpty ? '' : segs.first;
+}
+
 YtTrack? parseMusicItem(Map<String, dynamic> r) {
   try {
     if (_isReelNav(r)) return null;
@@ -321,15 +357,18 @@ YtTrack? parseMusicItem(Map<String, dynamic> r) {
           final c1 = _map(
               _map(flex[1])?['musicResponsiveListItemFlexColumnRenderer']);
           final sub = _runsText(c1?['text']) ?? '';
-          // Subtitle is "Artist • Album • Duration": first = artist,
-          // trailing M:SS = duration (hour-long comps die here).
+          // Subtitle is "Artist • Album • Duration" (official uploads
+          // lead with a type badge: "Song • Artist • 3:50" — skipped).
+          // First real segment = artist, trailing M:SS = duration
+          // (hour-long comps die here).
           final segs = sub
               .split('•')
               .map((e) => e.trim())
               .where((e) => e.isNotEmpty)
               .toList();
-          if (segs.isNotEmpty && segs.first.isNotEmpty) {
-            artist = segs.first;
+          final who = _artistSeg(segs);
+          if (who.isNotEmpty) {
+            artist = who;
           }
           if (segs.isNotEmpty) {
             durationSec = parseLengthSec(segs.last) ?? -1;
@@ -419,7 +458,9 @@ YtTrack? parseTwoRowItem(Map<String, dynamic> r) {
     String artist = 'YouTube';
     try {
       final sub = _runsText(r['subtitle']) ?? '';
-      final first = sub.split('•').first.trim();
+      final segs =
+          sub.split('•').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+      final first = _artistSeg(segs);
       if (first.isNotEmpty) artist = first;
     } catch (_) {}
     if (isMusicJunk(title, artist)) return null;

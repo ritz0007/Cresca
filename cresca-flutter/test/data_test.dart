@@ -180,6 +180,13 @@ void main() {
       expect(t.title, 'Tum Hi Ho');
       expect(t.artist, 'Arijit Singh');
       expect(t.watchUrl, contains('watch?v='));
+      // Official uploads lead with a type badge: skipped, real artist kept.
+      expect(
+          parseMusicItem(musicItem(sub: 'Song • Arijit Singh • 4:22'))!
+              .artist,
+          'Arijit Singh');
+      expect(
+          parseMusicItem(musicItem(sub: 'Video • A • 4:00'))!.artist, 'A');
       expect(parseMusicItem(musicItem(live: true, sub: 'Chan • LIVE')),
           isNull);
       expect(parseMusicItem(musicItem(reel: true)), isNull);

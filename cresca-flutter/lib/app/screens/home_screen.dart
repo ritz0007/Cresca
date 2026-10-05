@@ -9,7 +9,10 @@ import '../../core/home_feed.dart';
 import '../../core/track.dart';
 import '../app.dart';
 import '../design.dart';
+import '../library.dart' show UserPlaylist;
+import '../radio_store.dart' show SavedRadio;
 import '../state.dart';
+import '../widgets/profile_sheet.dart';
 import '../widgets/track_row.dart';
 import 'see_all.dart';
 
@@ -97,6 +100,12 @@ class _HomeScreenState extends State<HomeScreen> {
             slivers: [
               SliverAppBar(
                 pinned: true,
+                // Spotify parity: settings live top-left on home.
+                leading: IconButton(
+                  icon: const Icon(Icons.settings_outlined),
+                  tooltip: 'Settings',
+                  onPressed: () => openProfileSheet(context),
+                ),
                 title: Text(_greeting()),
                 actions: [
                   if (state.homeStatus == HomeStatus.loading)
@@ -209,6 +218,7 @@ class _FilterChips extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 4, 16, 10),
       child: Row(
@@ -216,24 +226,27 @@ class _FilterChips extends StatelessWidget {
           for (final f in const ['All', 'Music', 'Podcasts'])
             Padding(
               padding: const EdgeInsets.only(right: 8),
-              child: ChoiceChip(
-                label: Text(f),
-                selected: filter == f,
-                selectedColor: spotifyGreen,
-                labelStyle: TextStyle(
-                  fontWeight: FontWeight.w700,
-                  color: filter == f
-                      ? Colors.black
-                      : Theme.of(context)
-                          .colorScheme
-                          .onSurface,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () => onPick(f),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 16, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: filter == f
+                        ? spotifyGreen
+                        : scheme.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Text(f,
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w700,
+                        color: filter == f
+                            ? Colors.black
+                            : scheme.onSurface,
+                      )),
                 ),
-                backgroundColor: Theme.of(context)
-                    .colorScheme
-                    .surfaceContainerHighest,
-                shape: const StadiumBorder(),
-                showCheckmark: false,
-                onSelected: (_) => onPick(f),
               ),
             ),
         ],
@@ -266,8 +279,8 @@ class _PodcastsEmpty extends StatelessWidget {
   }
 }
 
-/// Spotify recents grid: 2-col × up-to-4 rows of 56dp-art cells
-/// (Liked Songs gradient tile + recent/top picks).
+/// Spotify recents grid: 2-col × up-to-4 rows of 56dp-art cells —
+/// recent PLAYLISTS + RADIOS (never songs), Liked Songs tile first.
 class _RecentsGrid extends StatelessWidget {
   final AppState state;
   const _RecentsGrid({required this.state});
@@ -276,18 +289,15 @@ class _RecentsGrid extends StatelessWidget {
   Widget build(BuildContext context) {
     final cells = <_Cell>[];
     if (state.library.liked.isNotEmpty) {
-      cells.add(
-          _Cell.liked(likedCount: state.library.liked.length));
+      cells.add(const _Cell.liked());
     }
-    final seen = <String>{};
-    for (final t in [
-      ...state.library.recent,
-      ...state.topPicks,
-      for (final r in state.rails) ...r.tracks,
-    ]) {
+    for (final p in state.library.playlists) {
       if (cells.length >= 8) break;
-      if (!seen.add(t.id)) continue;
-      cells.add(_Cell.track(t));
+      cells.add(_Cell.playlist(p));
+    }
+    for (final r in state.library.radios) {
+      if (cells.length >= 8) break;
+      cells.add(_Cell.radio(r));
     }
     if (cells.isEmpty) return const SizedBox.shrink();
     return Padding(
@@ -311,16 +321,21 @@ class _RecentsGrid extends StatelessWidget {
 }
 
 class _Cell {
-  final YtTrack? track;
+  final UserPlaylist? playlist;
+  final SavedRadio? radio;
   final bool likedTile;
-  final int likedCount;
-  const _Cell.track(YtTrack t)
-      : track = t,
-        likedTile = false,
-        likedCount = 0;
-  const _Cell.liked({required this.likedCount})
-      : track = null,
+  const _Cell.liked()
+      : playlist = null,
+        radio = null,
         likedTile = true;
+  const _Cell.playlist(UserPlaylist p)
+      : playlist = p,
+        radio = null,
+        likedTile = false;
+  const _Cell.radio(SavedRadio r)
+      : playlist = null,
+        radio = r,
+        likedTile = false;
 }
 
 class _RecentCell extends StatelessWidget {
@@ -357,20 +372,64 @@ class _RecentCell extends StatelessWidget {
           state.actPlay(state.library.liked, 0);
         }
       };
-    } else {
-      final t = cell.track!;
-      art = ClipRRect(
-        borderRadius: const BorderRadius.only(
-          topLeft: Radius.circular(8),
-          bottomLeft: Radius.circular(8),
-        ),
-        child: TrackArt(track: t, size: 56),
-      );
-      title = t.title;
+    } else if (cell.playlist != null) {
+      final p = cell.playlist!;
+      art = p.tracks.isNotEmpty
+          ? ClipRRect(
+              borderRadius: const BorderRadius.only(
+                topLeft: Radius.circular(8),
+                bottomLeft: Radius.circular(8),
+              ),
+              child: TrackArt(track: p.tracks.first, size: 56),
+            )
+          : Container(
+              width: 56,
+              height: 56,
+              decoration: BoxDecoration(
+                color: scheme.surfaceContainerHigh,
+                borderRadius: const BorderRadius.only(
+                  topLeft: Radius.circular(8),
+                  bottomLeft: Radius.circular(8),
+                ),
+              ),
+              child: Icon(Icons.folder_outlined,
+                  color: scheme.onSurfaceVariant),
+            );
+      title = p.name;
       onTap = () {
-        final q = [t];
-        state.actPlay(q, 0);
+        if (p.tracks.isNotEmpty) {
+          state.actPlay(p.tracks, 0);
+        }
       };
+    } else {
+      // Radio cell (only remaining variant).
+      final r = cell.radio!;
+      final seedThumb = r.thumbUrl.isNotEmpty
+          ? r.thumbUrl
+          : r.seed.thumbUrl;
+      art = seedThumb.isNotEmpty
+          ? ClipRRect(
+              borderRadius: const BorderRadius.only(
+                topLeft: Radius.circular(8),
+                bottomLeft: Radius.circular(8),
+              ),
+              child: TrackArt(track: r.seed, size: 56),
+            )
+          : Container(
+              width: 56,
+              height: 56,
+              decoration: BoxDecoration(
+                color: scheme.surfaceContainerHigh,
+                borderRadius: const BorderRadius.only(
+                  topLeft: Radius.circular(8),
+                  bottomLeft: Radius.circular(8),
+                ),
+              ),
+              child: Icon(Icons.radio_outlined,
+                  color: scheme.onSurfaceVariant),
+            );
+      title = r.title;
+      onTap = () => state.startRadio(r.seed);
     }
     return GestureDetector(
       onTap: onTap,

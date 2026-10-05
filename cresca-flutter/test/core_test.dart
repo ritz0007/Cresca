@@ -47,6 +47,17 @@ void main() {
       expect(t.displayArtist(), 'Darshan Raval');
     });
 
+    test('displayArtist strips Topic-channel suffix', () {
+      const t = YtTrack(
+        id: 'a',
+        title: 'x',
+        artist: 'AP Dhillon - Topic',
+        thumbUrl: '',
+        watchUrl: '',
+      );
+      expect(t.displayArtist(), 'AP Dhillon');
+    });
+
     test('displayArtist never blank', () {
       const t = YtTrack(
         id: 'a',

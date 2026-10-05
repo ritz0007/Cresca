@@ -672,15 +672,11 @@ class FloatingTabBar extends StatelessWidget {
         ],
       ),
     );
-    // TRUE glass attempt (Axiom Regular): bounds the blur with a plain
-    // rect clip (standard floating-panel pattern). Rounded ClipRRect
-    // compositing broke painting on SwiftShader; a linear ClipRect is
-    // the last untested shape. Verified live below before keeping.
-    return ClipRect(
-      child: BackdropFilter(
-        filter: ImageFilter.blur(sigmaX: 26, sigmaY: 26),
-        child: material,
-      ),
-    );
+    // Glass, not blur (user direction): the material is the
+    // translucent adaptive tint + hairline top edge alone — no
+    // BackdropFilter. Blur sampled the whole screen on SwiftShader
+    // and read muddy; the tinted glass reads Apple-clean and is
+    // compositor-safe everywhere.
+    return material;
   }
 }

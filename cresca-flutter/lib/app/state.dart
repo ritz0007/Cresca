@@ -864,7 +864,10 @@ class AppState extends ChangeNotifier {
   }
 
   /// Endless discovery rails (H4): appended as the user scrolls.
+  bool _discoveryLoading = false;
   Future<void> loadMoreDiscovery() async {
+    if (_discoveryLoading) return;
+    _discoveryLoading = true;
     try {
       final pos = rails.length;
       final sec = HomeFeed.discoveryAt(pos, discoveryCycle);
@@ -880,7 +883,10 @@ class AppState extends ChangeNotifier {
       } else {
         discoveryCycle++;
       }
-    } catch (_) {}
+    } catch (_) {
+    } finally {
+      _discoveryLoading = false;
+    }
   }
 
   Future<void> hardRefresh() async {

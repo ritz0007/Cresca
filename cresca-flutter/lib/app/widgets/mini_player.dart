@@ -80,18 +80,23 @@ class _MiniPlayerState extends State<_MiniBodyHost>
         } catch (_) {}
       },
       // Liquid-glass floating card (D3): frosted, specular rim.
-      child: Padding(
-        // Bottom gutter is 0 here: it sits directly above the floating
-        // tab bar (own 10dp gutter), so the two read as one chrome unit.
-        padding: const EdgeInsets.fromLTRB(12, 4, 12, 0),
-        child: AnimatedContainer(
-          duration: Duration(milliseconds: state.motionMs(180)),
-          transform: Matrix4.translationValues(_dx, 0, 0),
-          child: Glass(
-            radius: 18,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
+      // Material wrapper: this rides in the app-shell overlay (Stack
+      // outside any Scaffold), so ListTile/ink widgets below would
+      // otherwise find no Material ancestor and red-screen.
+      child: Material(
+        type: MaterialType.transparency,
+        child: Padding(
+          // Bottom gutter is 0 here: it sits directly above the floating
+          // tab bar (own 10dp gutter), so the two read as one chrome unit.
+          padding: const EdgeInsets.fromLTRB(12, 4, 12, 0),
+          child: AnimatedContainer(
+            duration: Duration(milliseconds: state.motionMs(180)),
+            transform: Matrix4.translationValues(_dx, 0, 0),
+            child: Glass(
+              radius: 18,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
                 Row(
                   children: [
                     if (_peekRight)
@@ -141,13 +146,16 @@ class _MiniPlayerState extends State<_MiniBodyHost>
                                     ),
                                   );
                                 }
-                                // Spotify mini style: white glyph, no fill.
+                                // Spotify mini style: theme-ink glyph, no fill
+                                // (white-on-dark, black-on-light).
                                 return IconButton(
                                   iconSize: 32,
                                   icon: Icon(
                                     playing ? Icons.pause : Icons.play_arrow,
                                   ),
-                                  color: Colors.white,
+                                  color: Theme.of(context)
+                                      .colorScheme
+                                      .onSurface,
                                   tooltip: playing ? 'Pause' : 'Play',
                                   onPressed: () =>
                                       state.controller.togglePlay(),
@@ -179,6 +187,7 @@ class _MiniPlayerState extends State<_MiniBodyHost>
               ],
             ),
           ),
+        ),
         ),
       ),
     );

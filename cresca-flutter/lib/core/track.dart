@@ -45,7 +45,13 @@ class YtTrack {
   /// prefix when sane, else "Unknown Artist". Never blank.
   String displayArtist() {
     try {
-      final a = artist.trim();
+      var a = artist.trim();
+      // Auto-generated topic channels ("AP Dhillon - Topic") carry the
+      // real artist before the suffix.
+      if (a.length > 8 &&
+          a.toLowerCase().endsWith(' - topic')) {
+        a = a.substring(0, a.length - 8).trim();
+      }
       if (isArtistLike(a)) return a.isEmpty ? 'Unknown Artist' : a;
       final dash = title.indexOf(' - ');
       if (dash >= 2 && dash <= 80) {
