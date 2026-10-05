@@ -475,6 +475,15 @@ class PlayerController {
       for (final url in urls) {
         if (gen != _loadGen) return;
         try {
+          // Fast pre-flight: a 0-byte Range probe fails throttled URLs
+          // in ~seconds instead of a full ExoPlayer open timeout, so
+          // time-to-first-byte stays sane on hostile networks.
+          if (!await resolver.probeUrl(url)) {
+            try {
+              resolver.dropCachedUrl(track.watchUrl);
+            } catch (_) {}
+            continue;
+          }
           await _setWindow(track, url, seekMs: seekMs);
           working = url;
           break;

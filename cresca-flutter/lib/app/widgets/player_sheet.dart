@@ -380,6 +380,32 @@ class _ArtCardState extends State<_ArtCard>
   Widget build(BuildContext context) {
     final track = widget.track;
     final art = track.thumbUrl.replaceAll('hqdefault', 'maxresdefault');
+    // Motion kill-switch (user direction: no animations): static art
+    // when motion is off — no breathe, no pause shrink.
+    final motion = AppScope.of(context).motionOn;
+    final artBox = Container(
+      width: 320,
+      height: 320,
+      margin: const EdgeInsets.symmetric(horizontal: 24),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(10),
+        boxShadow: const [
+          BoxShadow(blurRadius: 24, color: Colors.black45)
+        ],
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(10),
+        child: TrackArt(
+            track: YtTrack(
+                id: track.id,
+                title: track.title,
+                artist: track.artist,
+                thumbUrl: art,
+                watchUrl: track.watchUrl),
+            size: 320),
+      ),
+    );
+    if (!motion) return artBox;
     return StreamBuilder<bool>(
       stream:
           AppScope.of(context).controller.player.playingStream,
@@ -404,30 +430,7 @@ class _ArtCardState extends State<_ArtCard>
                                   math.pi));
               return Transform.scale(scale: s, child: child);
             },
-            child: Container(
-              width: 320,
-              height: 320,
-              margin:
-                  const EdgeInsets.symmetric(horizontal: 24),
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(10),
-                boxShadow: const [
-                  BoxShadow(
-                      blurRadius: 24, color: Colors.black45)
-                ],
-              ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(10),
-                child: TrackArt(
-                    track: YtTrack(
-                        id: track.id,
-                        title: track.title,
-                        artist: track.artist,
-                        thumbUrl: art,
-                        watchUrl: track.watchUrl),
-                    size: 320),
-              ),
-            ),
+            child: artBox,
           ),
         );
       },
@@ -587,18 +590,11 @@ class _Transport extends StatelessWidget {
                           strokeWidth: 3),
                     ),
                   )
-                : IconButton.filled(
+                : IconButton(
                     iconSize: 80,
-                    style: IconButton.styleFrom(
-                        backgroundColor:
-                            Theme.of(context).colorScheme.primary,
-                        foregroundColor: Theme.of(context)
-                            .colorScheme
-                            .onPrimary,
-                        padding:
-                            const EdgeInsets.all(9)),
                     icon: Icon(
-                        playing ? Icons.pause : Icons.play_arrow),
+                        playing ? Icons.pause : Icons.play_arrow,
+                        color: Colors.white),
                     tooltip: playing ? 'Pause' : 'Play',
                     onPressed: () =>
                         state.controller.togglePlay(),

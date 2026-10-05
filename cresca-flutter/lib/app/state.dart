@@ -71,7 +71,9 @@ class AppState extends ChangeNotifier {
   /// Appearance: system / light / dark (L4).
   String appearance = 'system';
 
-  bool motionOn = true;
+  // Motion kill-switch (user direction: animations off by default;
+  // toggle stays in Profile).
+  bool motionOn = false;
   int refreshCount = 0;
 
   HomeStatus homeStatus = HomeStatus.loading;
@@ -111,7 +113,7 @@ class AppState extends ChangeNotifier {
       prefs = await SharedPreferences.getInstance();
     } catch (_) {}
     try {
-      motionOn = prefs?.getBool(motionPrefKey) ?? true;
+      motionOn = prefs?.getBool(motionPrefKey) ?? false;
       refreshCount = prefs?.getInt('home_refresh_count') ?? 0;
     } catch (_) {}
     final urlCache = UrlCache();
