@@ -19,7 +19,12 @@ import '../app.dart';
 /// Lyrics section for the player sheet: fetches once per track id.
 class LyricsSection extends StatefulWidget {
   final YtTrack track;
-  const LyricsSection({super.key, required this.track});
+
+  /// Publishes synced lines for the art-mode preview row (BitChord:
+  /// current line under the title). Plain/absent → empty list.
+  final ValueChanged<List<LyricLine>>? onLines;
+  const LyricsSection(
+      {super.key, required this.track, this.onLines});
 
   @override
   State<LyricsSection> createState() => _LyricsSectionState();
@@ -148,10 +153,12 @@ class _LyricsSectionState extends State<LyricsSection> {
 
   Future<void> _load() async {
     setState(() => _state = const LyricsLoading());
+    widget.onLines?.call(const []);
     final memo =
         AppScope.of(context).lyricsMemo[widget.track.id];
     if (memo != null) {
       setState(() => _state = memo);
+      _publish(memo);
       return;
     }
     final client = http.Client();
@@ -173,12 +180,23 @@ class _LyricsSectionState extends State<LyricsSection> {
       if (res is LyricsNotFound) res = await lrc;
       if (!mounted) return;
       setState(() => _state = res);
+      _publish(res);
       try {
         AppScope.of(context).lyricsMemo[widget.track.id] = res;
       } catch (_) {}
     } catch (_) {
       if (mounted) setState(() => _state = const LyricsNotFound());
     }
+  }
+
+  void _publish(LyricsState s) {
+    try {
+      if (s is LyricsSynced) {
+        widget.onLines?.call(s.lines);
+      } else {
+        widget.onLines?.call(const []);
+      }
+    } catch (_) {}
   }
 
   @override
@@ -423,11 +441,11 @@ class _KaraokeViewState extends State<_KaraokeView> {
                       color: active
                           ? Colors.white
                           : Colors.white54,
-                      fontSize: active ? 26 : 16,
+                      fontSize: active ? 32 : 20,
                       fontWeight: active
                           ? FontWeight.w800
                           : FontWeight.w400,
-                      height: 1.7,
+                      height: 1.55,
                     ),
                     child: Text(line.text),
                   ),

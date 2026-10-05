@@ -417,6 +417,26 @@ class StreamResolver {
   /// refetches. Retry ×3 then skip lives in the queue engine (P12).
   void dropCachedUrl(String watchUrl) => urlCache.drop(watchUrl);
 
+  /// Fast pre-flight: 0-byte Range probe (6 s cap). True on 200/206 —
+  /// the URL opens cleanly in ExoPlayer. False (403/timeout) skips the
+  /// candidate without paying a full player-open timeout.
+  Future<bool> probeUrl(String url) async {
+    try {
+      final res = await httpClient
+          .get(
+            Uri.parse(url),
+            headers: const {
+              'User-Agent': 'Cresca/1.0 (Android)',
+              'Range': 'bytes=0-0',
+            },
+          )
+          .timeout(const Duration(seconds: 6));
+      return res.statusCode == 200 || res.statusCode == 206;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// Disk snapshot encode (caller owns file IO; null honors the 30s floor).
   String? encodeUrlSnapshot() {
     try {

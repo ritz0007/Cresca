@@ -18,6 +18,7 @@ import '../../core/discovery.dart';
 import '../../core/queue.dart';
 import '../../core/track.dart';
 import '../../data/details.dart';
+import '../../data/lyrics.dart';
 import '../app.dart';
 import '../design.dart';
 import '../state.dart';
@@ -56,6 +57,15 @@ class PlayerSheet extends StatefulWidget {
 class _PlayerSheetState extends State<PlayerSheet> {
   double? _dragPos;
   final GlobalKey _lyricsKey = GlobalKey();
+  final ValueNotifier<List<LyricLine>> _lyricLines = ValueNotifier(const []);
+
+  @override
+  void dispose() {
+    try {
+      _lyricLines.dispose();
+    } catch (_) {}
+    super.dispose();
+  }
 
   void _scrollToLyrics() {
     try {
@@ -137,10 +147,22 @@ class _PlayerSheetState extends State<PlayerSheet> {
                                     ])),
                       ),
                       const SizedBox(height: 4),
+                      // Current-line preview (BitChord art mode): tap
+                      // jumps to the full karaoke below.
+                      _LyricPreview(
+                          state: state,
+                          lines: _lyricLines,
+                          onTap: _scrollToLyrics),
                       // Lyrics-as-hero (BitChord): karaoke first, big
                       // type; transport follows below.
                       LyricsSection(
-                          key: _lyricsKey, track: track),
+                          key: _lyricsKey,
+                          track: track,
+                          onLines: (lines) {
+                            try {
+                              _lyricLines.value = lines;
+                            } catch (_) {}
+                          }),
                       const SizedBox(height: 4),
                       _SeekBar(
                         state: state,
@@ -349,6 +371,64 @@ class _OutputPill extends StatelessWidget {
   }
 }
 
+/// Current-line preview (BitChord art mode): the live lyric line
+/// under the title, chevron included; tap scrolls to full karaoke.
+/// Empty (still loading / plain / none) renders nothing.
+class _LyricPreview extends StatelessWidget {
+  final AppState state;
+  final ValueNotifier<List<LyricLine>> lines;
+  final VoidCallback onTap;
+  const _LyricPreview(
+      {required this.state, required this.lines, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<List<LyricLine>>(
+      valueListenable: lines,
+      builder: (_, ls, _) {
+        if (ls.isEmpty) return const SizedBox.shrink();
+        return StreamBuilder<Duration>(
+          stream: state.controller.player.positionStream,
+          builder: (_, snap) {
+            final pos =
+                (snap.data ?? Duration.zero).inMilliseconds;
+            var cur = ls.first.text;
+            for (final l in ls) {
+              if (l.startMs <= pos) {
+                cur = l.text;
+              } else {
+                break;
+              }
+            }
+            return GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: onTap,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(24, 10, 24, 2),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(cur,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 15,
+                              fontWeight: FontWeight.w600)),
+                    ),
+                    const Icon(Icons.chevron_right,
+                        color: Colors.white54, size: 20),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
 class _ArtCard extends StatefulWidget {
   final YtTrack track;
   const _ArtCard({required this.track});
@@ -380,32 +460,41 @@ class _ArtCardState extends State<_ArtCard>
   Widget build(BuildContext context) {
     final track = widget.track;
     final art = track.thumbUrl.replaceAll('hqdefault', 'maxresdefault');
-    // Motion kill-switch (user direction: no animations): static art
-    // when motion is off — no breathe, no pause shrink.
+    // BitChord art mode: edge-to-edge art running under the status
+    // bar, blending into the backdrop at its base (no card, no
+    // margins, no radius). Motion kill-switch: static when off.
     final motion = AppScope.of(context).motionOn;
-    final artBox = Container(
-      width: 320,
-      height: 320,
-      margin: const EdgeInsets.symmetric(horizontal: 24),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(10),
-        boxShadow: const [
-          BoxShadow(blurRadius: 24, color: Colors.black45)
-        ],
-      ),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(10),
-        child: TrackArt(
-            track: YtTrack(
-                id: track.id,
-                title: track.title,
-                artist: track.artist,
-                thumbUrl: art,
-                watchUrl: track.watchUrl),
-            size: 320),
-      ),
+    Widget artBox(double width) => SizedBox(
+          width: width,
+          height: width * 1.02,
+          child: ShaderMask(
+            // Blend: art melts into the blurred backdrop below.
+            shaderCallback: (r) => const LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [Colors.white, Colors.white, Colors.transparent],
+              stops: [0.0, 0.82, 1.0],
+            ).createShader(r),
+            blendMode: BlendMode.dstIn,
+            child: TrackArt(
+                track: YtTrack(
+                    id: track.id,
+                    title: track.title,
+                    artist: track.artist,
+                    thumbUrl: art,
+                    watchUrl: track.watchUrl),
+                size: width),
+          ),
+        );
+    final full = LayoutBuilder(
+      builder: (_, cons) {
+        final w = cons.maxWidth.isFinite
+            ? cons.maxWidth
+            : MediaQuery.of(context).size.width;
+        return artBox(w);
+      },
     );
-    if (!motion) return artBox;
+    if (!motion) return full;
     return StreamBuilder<bool>(
       stream:
           AppScope.of(context).controller.player.playingStream,
@@ -430,7 +519,7 @@ class _ArtCardState extends State<_ArtCard>
                                   math.pi));
               return Transform.scale(scale: s, child: child);
             },
-            child: artBox,
+            child: full,
           ),
         );
       },
