@@ -415,14 +415,15 @@ class _KaraokeViewState extends State<_KaraokeView> {
                   },
                   child: AnimatedDefaultTextStyle(
                     duration: const Duration(milliseconds: 280),
-                    textAlign: TextAlign.center,
+                    // BitChord hero type: left-aligned, large active.
+                    textAlign: TextAlign.left,
                     style: TextStyle(
                       color: active
                           ? Colors.white
                           : Colors.white54,
-                      fontSize: active ? 19 : 15,
+                      fontSize: active ? 26 : 16,
                       fontWeight: active
-                          ? FontWeight.w700
+                          ? FontWeight.w800
                           : FontWeight.w400,
                       height: 1.7,
                     ),

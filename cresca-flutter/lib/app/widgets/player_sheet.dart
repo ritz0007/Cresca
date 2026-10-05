@@ -8,7 +8,9 @@
 
 import 'dart:async';
 import 'dart:math' as math;
+import 'dart:ui' show ImageFilter;
 
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
 
@@ -53,6 +55,18 @@ class PlayerSheet extends StatefulWidget {
 
 class _PlayerSheetState extends State<PlayerSheet> {
   double? _dragPos;
+  final GlobalKey _lyricsKey = GlobalKey();
+
+  void _scrollToLyrics() {
+    try {
+      final ctx = _lyricsKey.currentContext;
+      if (ctx != null) {
+        Scrollable.ensureVisible(ctx,
+            alignment: 0.1,
+            duration: const Duration(milliseconds: 350));
+      }
+    } catch (_) {}
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -72,9 +86,10 @@ class _PlayerSheetState extends State<PlayerSheet> {
           data: crescaTheme(Brightness.dark),
           child: Stack(
             children: [
-              // Artwork mesh wash (Apple-Music/BitChord backdrop).
-              const Positioned.fill(
-                child: MeshBackdrop(),
+              // Full-bleed artwork wash (BitChord/YTM backdrop): the
+              // track art blurred + dark scrim, not the mesh gradient.
+              Positioned.fill(
+                child: _ArtBlurBackdrop(track: track),
               ),
             CustomScrollView(
               controller: widget.scroll,
@@ -89,12 +104,14 @@ class _PlayerSheetState extends State<PlayerSheet> {
                           decoration: BoxDecoration(
                               color: Colors.white54,
                               borderRadius: BorderRadius.circular(2))),
-                      const SizedBox(height: 16),
+                      const SizedBox(height: 10),
+                      // Compact header (BitChord): small art + title /
+                      // artist + overflow.
+                      _MiniHeader(
+                          state: state, track: track),
+                      const SizedBox(height: 12),
                       // Full-bleed artwork: idle breathe × pause shrink.
                       _ArtCard(track: track),
-                      const SizedBox(height: 8),
-                      // Rolling ticker on art (P2; lyrics ride it in P3).
-                      _Ticker(text: '${track.title} • ${track.displayArtist()}'),
                       const SizedBox(height: 8),
                       // Title/artist with shadow; artist tap → artist page.
                       Text(track.title,
@@ -119,7 +136,12 @@ class _PlayerSheetState extends State<PlayerSheet> {
                                       Shadow(blurRadius: 8)
                                     ])),
                       ),
-                      const SizedBox(height: 8),
+                      const SizedBox(height: 4),
+                      // Lyrics-as-hero (BitChord): karaoke first, big
+                      // type; transport follows below.
+                      LyricsSection(
+                          key: _lyricsKey, track: track),
+                      const SizedBox(height: 4),
                       _SeekBar(
                         state: state,
                         dragPos: _dragPos,
@@ -147,12 +169,13 @@ class _PlayerSheetState extends State<PlayerSheet> {
                         ),
                       _ActionsRow(state: state, track: track),
                       const SizedBox(height: 8),
-                      LyricsSection(
-                          key: ValueKey(track.id), track: track),
-                      const SizedBox(height: 12),
                       DetailsSection(
                           key: ValueKey('det-${track.id}'),
                           track: track),
+                      const SizedBox(height: 10),
+                      _OutputPill(
+                          state: state,
+                          onLyrics: _scrollToLyrics),
                       const SizedBox(height: 24),
                     ],
                   ),
@@ -163,6 +186,165 @@ class _PlayerSheetState extends State<PlayerSheet> {
           ),
         );
       },
+    );
+  }
+}
+
+/// Full-bleed artwork wash (BitChord/YTM backdrop): maxres art,
+/// blurred via ImageFiltered (compositor-safe: no BackdropFilter),
+/// dark scrim top-to-bottom for legibility.
+class _ArtBlurBackdrop extends StatelessWidget {
+  final YtTrack track;
+  const _ArtBlurBackdrop({required this.track});
+
+  @override
+  Widget build(BuildContext context) {
+    final art =
+        track.thumbUrl.replaceAll('hqdefault', 'maxresdefault');
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        if (art.isNotEmpty)
+          ImageFiltered(
+            imageFilter: ImageFilter.blur(sigmaX: 28, sigmaY: 28),
+            child: CachedNetworkImage(
+              imageUrl: art,
+              fit: BoxFit.cover,
+              errorWidget: (_, _, _) => const SizedBox.shrink(),
+            ),
+          )
+        else
+          Container(color: Colors.black),
+        Container(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [
+                Colors.black.withValues(alpha: 0.42),
+                Colors.black.withValues(alpha: 0.18),
+                Colors.black.withValues(alpha: 0.62),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Compact header (BitChord): 48dp art + title/artist + overflow.
+class _MiniHeader extends StatelessWidget {
+  final AppState state;
+  final YtTrack track;
+  const _MiniHeader({required this.state, required this.track});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: Row(
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(6),
+            child: TrackArt(track: track, size: 44),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(track.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w700,
+                        fontSize: 14)),
+                Text(track.displayArtist(),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                        color: Colors.white70, fontSize: 12)),
+              ],
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.more_horiz, color: Colors.white),
+            tooltip: 'More',
+            onPressed: () => showTrackMenu(context, state, track,
+                state.controller.engine.snapshot()),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Output pill (BitChord): lyrics shortcut | device indicator |
+/// queue, with the "This phone" caption. Device switching isn't
+/// implemented — the middle segment honestly reports the only
+/// output (no fake picker).
+class _OutputPill extends StatelessWidget {
+  final AppState state;
+  final VoidCallback onLyrics;
+  const _OutputPill({required this.state, required this.onLyrics});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        Container(
+          margin: const EdgeInsets.symmetric(horizontal: 72),
+          padding:
+              const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+          decoration: BoxDecoration(
+            color: Colors.white.withValues(alpha: 0.16),
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(
+                color: Colors.white.withValues(alpha: 0.25),
+                width: 0.5),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              IconButton(
+                icon: const Icon(Icons.lyrics_outlined,
+                    color: Colors.white, size: 22),
+                tooltip: 'Lyrics',
+                onPressed: onLyrics,
+              ),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 14, vertical: 8),
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.14),
+                  borderRadius: BorderRadius.circular(18),
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.headphones_outlined,
+                        color: Colors.white, size: 20),
+                    SizedBox(width: 10),
+                    Icon(Icons.person_outline,
+                        color: Colors.white70, size: 20),
+                  ],
+                ),
+              ),
+              IconButton(
+                icon: const Icon(Icons.queue_music_outlined,
+                    color: Colors.white, size: 22),
+                tooltip: 'Queue',
+                onPressed: () => openQueueSheet(context),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 6),
+        const Text('This phone',
+            style: TextStyle(color: Colors.white54, fontSize: 12)),
+      ],
     );
   }
 }
@@ -253,59 +435,6 @@ class _ArtCardState extends State<_ArtCard>
   }
 }
 
-/// Rolling ticker (P2): constant pan while sounding.
-class _Ticker extends StatefulWidget {
-  final String text;
-  const _Ticker({required this.text});
-
-  @override
-  State<_Ticker> createState() => _TickerState();
-}
-
-class _TickerState extends State<_Ticker>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _c;
-
-  @override
-  void initState() {
-    super.initState();
-    _c = AnimationController(
-        vsync: this, duration: const Duration(seconds: 12))
-      ..repeat();
-  }
-
-  @override
-  void didUpdateWidget(covariant _Ticker old) {
-    super.didUpdateWidget(old);
-    if (old.text != widget.text) _c.reset();
-  }
-
-  @override
-  void dispose() {
-    _c.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(
-      height: 22,
-      child: AnimatedBuilder(
-        animation: _c,
-        builder: (_, _) => FractionallySizedBox(
-          alignment: Alignment(-1 + 2 * _c.value, 0),
-          widthFactor: 1.6,
-          child: Text(widget.text,
-              maxLines: 1,
-              overflow: TextOverflow.visible,
-              textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.white70)),
-        ),
-      ),
-    );
-  }
-}
-
 /// Glowing seek bar: tap + drag scrub, knob swell, time labels (P4).
 class _SeekBar extends StatelessWidget {
   final AppState state;
@@ -369,7 +498,11 @@ class _SeekBar extends StatelessWidget {
                         style: const TextStyle(
                             color: Colors.white70,
                             fontSize: 12)),
-                    Text(fmtMs(total.toInt()),
+                    // BitChord/YTM parity: remaining, not total.
+                    Text(
+                        total <= 0
+                            ? fmtMs(0)
+                            : '-${fmtMs((total - value).clamp(0.0, total).toInt())}',
                         style: const TextStyle(
                             color: Colors.white70,
                             fontSize: 12)),
@@ -438,15 +571,15 @@ class _Transport extends StatelessWidget {
               },
             ),
             IconButton(
-              iconSize: 53,
+              iconSize: 62,
               icon: const Icon(Icons.skip_previous, color: Colors.white),
               tooltip: 'Previous',
               onPressed: () => state.controller.previous(),
             ),
             loading
                 ? const SizedBox(
-                    width: 92,
-                    height: 92,
+                    width: 96,
+                    height: 96,
                     child: Padding(
                       padding: EdgeInsets.all(24),
                       child: CircularProgressIndicator(
@@ -455,7 +588,7 @@ class _Transport extends StatelessWidget {
                     ),
                   )
                 : IconButton.filled(
-                    iconSize: 74,
+                    iconSize: 80,
                     style: IconButton.styleFrom(
                         backgroundColor:
                             Theme.of(context).colorScheme.primary,
@@ -471,7 +604,7 @@ class _Transport extends StatelessWidget {
                         state.controller.togglePlay(),
                   ),
             IconButton(
-              iconSize: 53,
+              iconSize: 62,
               icon: const Icon(Icons.skip_next, color: Colors.white),
               tooltip: 'Next',
               onPressed: () => state.controller.next(),
