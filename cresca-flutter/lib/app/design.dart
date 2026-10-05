@@ -19,6 +19,8 @@
 // - [D4] iOS tab bar styling: no pill indicator (tinted icon + label),
 //   frosted background, top hairline.
 
+import 'dart:ui' show ImageFilter;
+
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -169,24 +171,35 @@ class Glass extends StatelessWidget {
   Widget build(BuildContext context) {
     final dark =
         Theme.of(context).brightness == Brightness.dark;
-    // Solid frosted surface (Spotify-parity). Two compositor notes from
-    // the paint-bisect on SwiftShader (jam16): (1) BackdropFilter glass
-    // layers composite OVER their children — content hit-tests fine but
-    // never paints; (2) a bare `ClipRRect` shell around the decorated
-    // container also swallowed child painting. Border-radius decoration
-    // alone (no clip node) + Border.all hairline paints fully.
+    // TRUE Regular glass (Axiom): translucent adaptive tint over a
+    // bounded backdrop blur. Live paint-bisect on jam16 (SwiftShader):
+    // a `ClipRRect` shell around a decorated container (blur or not)
+    // swallowed child painting entirely — semantics/hit-tests lived,
+    // pixels didn't. A LINEAR `ClipRect` bounding the blur region
+    // paints perfectly (tab bar proven on-device), so the material is:
+    // ClipRect(bounds) → BackdropFilter(blur) → gradient-tinted
+    // rounded-rim Container. Rounded corners come from the decoration;
+    // the clip stays square so the blur samples only this element's
+    // band, never the whole screen.
     final tint = dark
-        ? const Color(0xF01C1C1E)
-        : const Color(0xF8FFFFFF);
+        ? Colors.white.withValues(alpha: 0.12)
+        : Colors.white.withValues(alpha: 0.55);
     final rim = dark
-        ? Colors.white.withValues(alpha: 0.22)
+        ? Colors.white.withValues(alpha: 0.26)
         : Colors.white.withValues(alpha: 0.85);
-    return Container(
+    final deep = dark
+        ? Colors.black.withValues(alpha: 0.55)
+        : Colors.white.withValues(alpha: 0.85);
+    final child2 = Container(
       padding: padding,
       decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [tint, deep],
+        ),
         borderRadius: BorderRadius.circular(radius),
-        color: tint,
-        // Specular rim hairline (uniform; avoids ClipRRect).
+        // Specular rim hairline (uniform; avoids any Clip*R*ect).
         border: Border.all(color: rim, width: 1),
         boxShadow: [
           BoxShadow(
@@ -198,6 +211,143 @@ class Glass extends StatelessWidget {
         ],
       ),
       child: child,
+    );
+    return ClipRect(
+      child: BackdropFilter(
+        filter: ImageFilter.blur(
+            sigmaX: blur, sigmaY: blur),
+        child: child2,
+      ),
+    );
+  }
+}
+
+/// iOS frosted tab bar shell [D4]: blur + top hairline, no pill.
+/// (Unused legacy shell kept for reference; the real bar is
+/// FloatingTabBar's full-bleed Apple glass below.)
+
+/// Apple-glass top bar (Regular variant): bounded-bounded blur band
+/// with hairline bottom, title/actions row, top safe area. Use as
+/// `appBar: GlassBar(title: …)` (implements PreferredSizeWidget).
+class GlassBar extends StatelessWidget implements PreferredSizeWidget {
+  final String title;
+  final List<Widget> actions;
+  const GlassBar({super.key, required this.title, this.actions = const []});
+
+  @override
+  Size get preferredSize => const Size.fromHeight(56);
+
+  @override
+  Widget build(BuildContext context) {
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final style = TextStyle(
+        color: dark ? Colors.white : Colors.black,
+        fontSize: 17,
+        fontWeight: FontWeight.w700);
+    return ClipRect(
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 26, sigmaY: 26),
+        child: Container(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: dark
+                  ? [
+                      Colors.white.withValues(alpha: 0.10),
+                      Colors.white.withValues(alpha: 0.04),
+                    ]
+                  : [
+                      Colors.white.withValues(alpha: 0.82),
+                      Colors.white.withValues(alpha: 0.62),
+                    ],
+            ),
+            border: Border(
+              bottom: BorderSide(
+                color: dark
+                    ? Colors.white.withValues(alpha: 0.18)
+                    : Colors.black.withValues(alpha: 0.12),
+                width: 0.8,
+              ),
+            ),
+          ),
+          child: SafeArea(
+            bottom: false,
+            child: SizedBox(
+              height: 56,
+              child: NavigationToolbar(
+                leading: const SizedBox.shrink(),
+                middle: Padding(
+                  padding: const EdgeInsets.only(left: 16),
+                  child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(title, style: style)),
+                ),
+                trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      ...actions,
+                      const SizedBox(width: 8),
+                    ]),
+                centerMiddle: false,
+                middleSpacing: 0,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Apple-glass sheet root (Regular): rounded-top translucent material
+/// that grows opaque toward its base so list rows stay legible
+/// (Axiom: sheets adopt glass automatically; content above stays
+/// bold/bright). Wrap a sheet's root widget with this.
+class GlassSheetSurface extends StatelessWidget {
+  final Widget child;
+  const GlassSheetSurface({super.key, required this.child});
+
+  @override
+  Widget build(BuildContext context) {
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    return ClipRect(
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 30, sigmaY: 30),
+        child: Container(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              stops: const [0.0, 0.42, 1.0],
+              colors: dark
+                  ? [
+                      Colors.white.withValues(alpha: 0.10),
+                      Colors.white.withValues(alpha: 0.05),
+                      const Color(0xF11A1A1A),
+                    ]
+                  : [
+                      Colors.white.withValues(alpha: 0.80),
+                      Colors.white.withValues(alpha: 0.86),
+                      const Color(0xF7FAFAFA),
+                    ],
+            ),
+            borderRadius: const BorderRadius.only(
+              topLeft: Radius.circular(28),
+              topRight: Radius.circular(28),
+            ),
+            border: Border(
+              top: BorderSide(
+                color: dark
+                    ? Colors.white.withValues(alpha: 0.22)
+                    : Colors.black.withValues(alpha: 0.10),
+                width: 1,
+              ),
+            ),
+          ),
+          child: child,
+        ),
+      ),
     );
   }
 }
@@ -391,8 +541,18 @@ class _MeshPainter extends CustomPainter {
 class FloatingTabBar extends StatelessWidget {
   final int current;
   final ValueChanged<int> onTap;
-  const FloatingTabBar(
-      {super.key, required this.current, required this.onTap});
+
+  /// System navigation-bar inset (measured ABOVE any SafeArea so the
+  /// material can paint over the full nav-bar zone — SafeArea consumes
+  /// the inset for its children, which left raw content visible in the
+  /// gesture strip).
+  final double bottomInset;
+  const FloatingTabBar({
+    super.key,
+    required this.current,
+    required this.onTap,
+    this.bottomInset = 24,
+  });
 
   static const _items = [
     (Icons.home_outlined, Icons.home, 'Listen Now'),
@@ -424,7 +584,7 @@ class FloatingTabBar extends StatelessWidget {
     // ClipRRect. Solo BackdropFilter (own bounds = full-bleed bar rect)
     // is safe; screens were verified pixel-perfect after each step.
     final selected = dark ? Colors.white : Colors.black;
-    final bottomInset = MediaQuery.of(context).padding.bottom;
+    final bottomInsetV = bottomInset;
     // Full-bleed Apple-glass tab bar: measured live on jam16 — a solo
     // BackdropFilter samples the WHOLE screen (not its own bounds) on
     // SwiftShader, blurring every card behind it. Axiom-faithful fallback:
@@ -508,10 +668,19 @@ class FloatingTabBar extends StatelessWidget {
             ),
           ),
           // Material runs over the system navigation-bar inset.
-          SizedBox(height: bottomInset),
+          SizedBox(height: bottomInsetV),
         ],
       ),
     );
-    return material;
+    // TRUE glass attempt (Axiom Regular): bounds the blur with a plain
+    // rect clip (standard floating-panel pattern). Rounded ClipRRect
+    // compositing broke painting on SwiftShader; a linear ClipRect is
+    // the last untested shape. Verified live below before keeping.
+    return ClipRect(
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 26, sigmaY: 26),
+        child: material,
+      ),
+    );
   }
 }

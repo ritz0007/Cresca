@@ -20,6 +20,8 @@ import '../app.dart';
 import '../design.dart';
 import '../state.dart';
 import 'lyrics_panel.dart';
+import 'jam_sheet.dart';
+import 'video_sheet.dart';
 import 'queue_sheet.dart';
 import 'track_menu.dart';
 import 'track_row.dart';
@@ -145,8 +147,6 @@ class _PlayerSheetState extends State<PlayerSheet> {
                       DetailsSection(
                           key: ValueKey('det-${track.id}'),
                           track: track),
-                      const SizedBox(height: 12),
-                      const _Phase3Stubs(),
                       const SizedBox(height: 24),
                     ],
                   ),
@@ -591,12 +591,6 @@ class _ActionsRow extends StatelessWidget {
       mainAxisAlignment: MainAxisAlignment.spaceEvenly,
       children: [
         disc(
-          tip: 'Video',
-          icon: Icons.ondemand_video_outlined,
-          onTap: () => _toast(context,
-              'Video mode arrives in Phase 3 — audio for now'),
-        ),
-        disc(
           tip: liked ? 'Unlike' : 'Like',
           icon: liked ? Icons.favorite : Icons.favorite_border,
           filled: liked,
@@ -620,8 +614,16 @@ class _ActionsRow extends StatelessWidget {
         disc(
           tip: 'JAM',
           icon: Icons.group_outlined,
-          onTap: () => _toast(
-              context, 'JAM listen-together arrives in Phase 4'),
+          onTap: () => openJamSheet(context),
+        ),
+        disc(
+          tip: 'Video',
+          icon: Icons.ondemand_video_outlined,
+          onTap: () async {
+            try {
+              await openVideoSheet(context, state, track);
+            } catch (_) {}
+          },
         ),
         disc(
           tip: 'More',
@@ -630,26 +632,6 @@ class _ActionsRow extends StatelessWidget {
               context, state, track, state.controller.engine.snapshot()),
         ),
       ],
-    );
-  }
-}
-
-/// Honest note for the one remaining Phase-3 surface (video):
-/// never fake content (H8).
-class _Phase3Stubs extends StatelessWidget {
-  const _Phase3Stubs();
-
-  @override
-  Widget build(BuildContext context) {
-    return const Padding(
-      padding: EdgeInsets.symmetric(horizontal: 24),
-      child: Column(
-        children: [
-          Text('Video mode arrives in Phase 4.',
-              textAlign: TextAlign.center,
-              style: TextStyle(color: Colors.white54, fontSize: 12)),
-        ],
-      ),
     );
   }
 }

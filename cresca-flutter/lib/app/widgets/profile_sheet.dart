@@ -20,8 +20,9 @@ Future<void> openProfileSheet(BuildContext context) async {
         initialChildSize: 0.85,
         minChildSize: 0.5,
         maxChildSize: 0.95,
-        builder: (_, scroll) =>
-            ProfileSheet(scroll: scroll),
+        builder: (_, scroll) => GlassSheetSurface(
+          child: ProfileSheet(scroll: scroll),
+        ),
       ),
     );
   } catch (_) {}

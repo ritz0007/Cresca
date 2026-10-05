@@ -10,6 +10,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import 'package:app_links/app_links.dart' show AppLinks;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -27,6 +28,8 @@ import '../data/lyrics.dart';
 import '../data/details.dart';
 import '../data/repository.dart';
 import '../data/resolve.dart';
+import '../jam/protocol.dart';
+import '../jam/session.dart';
 import 'crash.dart';
 import 'downloads.dart';
 import 'library.dart';
@@ -51,6 +54,10 @@ class AppState extends ChangeNotifier {
   late final CrashLog crash;
   late final DownloadStore downloads;
   late final DetailsStore details = DetailsStore();
+  late final JamSession jam;
+  String jamName = '';
+  AppLinks? _jamLinks;
+  StreamSubscription? _jamLinkSub;
   final YtSession ytSession = YtSession();
   final SpotifySession spotify = SpotifySession();
   final UpdateChecker updates = UpdateChecker();
@@ -136,16 +143,6 @@ class AppState extends ChangeNotifier {
       cacheDir: filesDir,
     );
     controller.onSaveSession = _writeSession;
-    controller.onAdvanced = () async {
-      try {
-        await ensureRadioTail();
-      } catch (_) {}
-    };
-    controller.onQueueChanged = () {
-      try {
-        notifyListeners();
-      } catch (_) {}
-    };
     controller.onError = (m) {
       try {
         notifyListeners();
@@ -167,6 +164,68 @@ class AppState extends ChangeNotifier {
         notifyListeners();
       } catch (_) {}
     };
+    jam = JamSession(controller, JamAppHooks(
+      queueSnapshot: () => controller.engine.snapshot(),
+      currentIndex: () => controller.engine.currentIndex,
+      isPlaying: () {
+        try {
+          return controller.player.playing;
+        } catch (_) {
+          return false;
+        }
+      },
+      positionMs: () {
+        try {
+          return controller.player.position.inMilliseconds;
+        } catch (_) {
+          return 0;
+        }
+      },
+      currentTrack: () => controller.engine.current,
+      toast: _bannerToast,
+      poke: notifyListeners,
+    ));
+    controller.onAdvanced = () async {
+      try {
+        jam.onPlayerEvent();
+        await ensureRadioTail();
+      } catch (_) {}
+    };
+    controller.onQueueChanged = () {
+      try {
+        jam.onPlayerEvent();
+        notifyListeners();
+      } catch (_) {}
+    };
+    controller.onTransportChanged = () {
+      try {
+        jam.onPlayerEvent();
+        notifyListeners();
+      } catch (_) {}
+    };
+    // JAM create rate-limit client side falls back to the server.
+    try {
+      jamName = prefs?.getString('jam_name') ?? '';
+    } catch (_) {}
+    // JAM deep links (cresca://jam/CODE): prefill + auto-join (F2).
+    try {
+      _jamLinks = AppLinks();
+      _jamLinkSub = _jamLinks!.uriLinkStream.listen((uri) {
+        try {
+          if (uri.host == 'jam' || uri.host == 'jamroom') {
+            final seg = uri.pathSegments.isEmpty
+                ? uri.host
+                : uri.pathSegments.first;
+            final code = (seg.isNotEmpty && jamValidCode(seg))
+                ? seg
+                : (uri.queryParameters['code'] ?? '');
+            if (jamValidCode(code)) {
+              jamJoin(code, auto: true);
+            }
+          }
+        } catch (_) {}
+      }, onError: (_) {});
+    } catch (_) {}
     try {
       await library.load();
       await downloads.load();
@@ -193,6 +252,8 @@ class AppState extends ChangeNotifier {
   void dispose() {
     try {
       _debounce?.cancel();
+      _jamLinkSub?.cancel();
+      jam.dispose();
       downloads.dispose();
       details.dispose();
       controller.dispose();
@@ -505,6 +566,84 @@ class AppState extends ChangeNotifier {
   void dismissUpdate() {
     try {
       pendingUpdate = null;
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  // ---------- JAM (Phase 4, F1–F10 façade) ----------
+
+  void _bannerToast(String msg) {
+    try {
+      jam.statusLine = msg;
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  /// Queue the sheet shows: host = live engine; guest = snapshot (F3:
+  /// guest's local queue IS the host queue).
+  List<YtTrack> jamQueueView() {
+    try {
+      return jam.isHost
+          ? controller.engine.snapshot()
+          : [for (final j in jam.snapshotQueue) _jamToYt(j)];
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  YtTrack _jamToYt(JamTrack t) => YtTrack(
+        id: t.id,
+        title: t.title.isEmpty ? 'Unknown' : t.title,
+        artist: t.artist.isEmpty ? 'YouTube' : t.artist,
+        thumbUrl: t.thumb,
+        watchUrl: t.url.isEmpty
+            ? 'https://music.youtube.com/watch?v=${t.id}'
+            : t.url,
+      );
+
+  Future<void> jamSetName(String name) async {
+    try {
+      jamName = name.trim();
+      await prefs?.setString('jam_name', jamName);
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  Future<void> jamCreate() async {
+    try {
+      await jam.createJam(
+          jamName.isEmpty ? 'Host' : jamName);
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  Future<void> jamJoin(String code, {bool auto = false}) async {
+    try {
+      if (auto) jam.pendingCode = code;
+      await jam.joinJam(
+          jamName.isEmpty ? 'Guest' : jamName,
+          auto ? code : code);
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  void jamSetGuestAllowed(bool on) {
+    try {
+      jam.setGuestAllowed(on);
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  void jamLeave() {
+    try {
+      jam.leaveJam();
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  void jamEnd() {
+    try {
+      jam.endJam();
       notifyListeners();
     } catch (_) {}
   }
@@ -934,7 +1073,8 @@ class AppState extends ChangeNotifier {
   }
 
   /// Chained autoplay: ≤5 remain → extend from the tail (200 cap).
-  Future<void> ensureRadioTail() async {    try {
+  Future<void> ensureRadioTail() async {
+    try {
       if (radioTracks.isEmpty) {
         // Plain queue: top up from related once (endless fixed-20).
         final cur = controller.engine.current;
@@ -1027,8 +1167,18 @@ class AppState extends ChangeNotifier {
 
   // ---------- row actions (M1, identical everywhere) ----------
 
+  /// JAM guest gate (F6): a guest without host-granted control may
+  /// queue-add (wish) but cannot start new playback contexts.
+  bool get jamPlaybackBlocked =>
+      jam.connected && !jam.isHost && !jam.guestAllowed;
+
   Future<void> actPlay(List<YtTrack> context, int index) async {
     try {
+      if (jamPlaybackBlocked) {
+        jam.statusLine = 'Only the host controls the JAM';
+        notifyListeners();
+        return;
+      }
       await controller.playQueue(context, index);
       if (context.isNotEmpty &&
           index >= 0 &&
@@ -1042,6 +1192,13 @@ class AppState extends ChangeNotifier {
 
   Future<void> actPlayNext(YtTrack t) async {
     try {
+      if (jamPlaybackBlocked) {
+        // Wishes welcome: queue-top rides the room's add path.
+        unawaited(jam.guestQueueAdd(t));
+        jam.statusLine = 'Only the host controls the JAM';
+        notifyListeners();
+        return;
+      }
       controller.engine.playNext(t);
       notifyListeners();
     } catch (_) {}
@@ -1049,6 +1206,12 @@ class AppState extends ChangeNotifier {
 
   Future<void> actAddToQueue(YtTrack t) async {
     try {
+      if (jamPlaybackBlocked) {
+        unawaited(jam.guestQueueAdd(t));
+        jam.statusLine = 'Song sent to the host for approval';
+        notifyListeners();
+        return;
+      }
       controller.engine.addToQueue(t);
       notifyListeners();
     } catch (_) {}

@@ -134,13 +134,17 @@ class _CrescaAppState extends State<CrescaApp> {
               // full-screen scaffold bottom chrome straight on top of
               // the pill (overlapping bars → misaligned/empty look).
             ),
-            // Shared bottom chrome: mini player pinned above the
-            // floating glass pill.
+            // Shared bottom chrome: mini player pinned above the Apple
+            // full-bleed glass bar. Inset is measured HERE (above the
+            // bar), so the material covers the whole navigation zone —
+            // no SafeArea, no gutters (Axiom full-bleed bar + user
+            // direction: use the entire area over the nav bar).
             Align(
               alignment: Alignment.bottomCenter,
-              child: SafeArea(
-                top: false,
-                child: Column(
+              child: Builder(builder: (context) {
+                final bottomInset =
+                    MediaQuery.of(context).padding.bottom;
+                return Column(
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
@@ -148,10 +152,11 @@ class _CrescaAppState extends State<CrescaApp> {
                     FloatingTabBar(
                       current: _tab,
                       onTap: _onTab,
+                      bottomInset: bottomInset,
                     ),
                   ],
-                ),
-              ),
+                );
+              }),
             ),
             // A1: splash + intro overlay.
             AnimatedSwitcher(

@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import '../../core/queue.dart';
 import '../../core/track.dart';
 import '../app.dart';
+import '../design.dart';
 import '../state.dart';
 import 'track_menu.dart';
 import 'track_row.dart';
@@ -21,7 +22,9 @@ Future<void> openQueueSheet(BuildContext context) async {
         initialChildSize: 0.7,
         minChildSize: 0.4,
         maxChildSize: 0.95,
-        builder: (_, scroll) => QueueSheet(scroll: scroll),
+        builder: (_, scroll) => GlassSheetSurface(
+          child: QueueSheet(scroll: scroll),
+        ),
       ),
     );
   } catch (_) {}

@@ -234,19 +234,13 @@ class StreamResolver {
     }
   }
 
-  /// Ranked audio URLs, best-first. Phone leg first (NewPipe-equivalent:
-  /// current phone client + fresh sts yields directly-fetchable URLs
-  /// logged-out), then the MUSIC vs VR race, then WEB_REMIX.
+  /// Ranked audio URLs, best-first. MUSIC vs VR race first (native
+  /// parity — these URLs fetch cleanly), then WEB_REMIX, then the
+  /// phone leg, then extractor manifest in [audioUrls]. The phone leg
+  /// used to go first but its URLs 403 at ExoPlayer open on this
+  /// network while blocking all fallback (non-empty list wins).
   Future<List<String>> tubeAudioUrls(String videoId) async {
     try {
-      // Phone first: proven fetchable without a session (206 partial
-      // content on plain Range GETs); music/VR urls 403 at fetch when
-      // their n-throttling is ciphered.
-      try {
-        final phone =
-            await _phoneLeg(videoId).timeout(const Duration(seconds: 15));
-        if (phone.isNotEmpty) return phone;
-      } catch (_) {}
       final vrFuture = _playerLeg(videoId, TubeClient.androidVr);
       List<String> music = [];
       try {
@@ -258,12 +252,21 @@ class StreamResolver {
         if (vr.isNotEmpty) return vr;
       } catch (_) {}
       try {
-        return await _playerLeg(videoId, TubeClient.webRemix);
-      } catch (_) {
-        return [];
-      }
+        final remix =
+            await _playerLeg(videoId, TubeClient.webRemix);
+        if (remix.isNotEmpty) return remix;
+      } catch (_) {}
+      // Phone leg last: its URLs can 403 at fetch while a non-empty
+      // list blocks extractor fallback — only use when nothing else
+      // resolved.
+      try {
+        final phone =
+            await _phoneLeg(videoId).timeout(const Duration(seconds: 15));
+        if (phone.isNotEmpty) return phone;
+      } catch (_) {}
+      return const [];
     } catch (_) {
-      return [];
+      return const [];
     }
   }
 
@@ -291,6 +294,37 @@ class StreamResolver {
     }
   }
 
+  /// Ranked muxed (video+audio) URLs, best-first distinct heights —
+  /// P9 video mode (VideoSheet quality picker + native videoOptions).
+  Future<List<(String, int)>> videoMuxedUrls(String watchUrl) async {
+    try {
+      final vid = extractVideoId(watchUrl);
+      if (vid == null) return const [];
+      final manifest = await _explode()
+          .videos
+          .streams
+          .getManifest(vid)
+          .timeout(const Duration(seconds: 30));
+      final out = <(String, int)>[];
+      final seen = <int>{};
+      for (final s in manifest.muxed.toList()
+        ..sort((a, b) =>
+            b.videoResolution.height.compareTo(
+                a.videoResolution.height))) {
+        final h = s.videoResolution.height;
+        if (h <= 0 || !seen.add(h)) continue;
+        try {
+          final u = s.url.toString();
+          if (u.isEmpty) continue;
+          out.add((u, h));
+        } catch (_) {}
+      }
+      return out;
+    } catch (_) {
+      return const [];
+    }
+  }
+
   /// Ranked audio URLs for a watch URL. Fast path first (remembers best),
   /// extractor fallback, empty on failure.
   Future<List<String>> audioUrls(String watchUrl) async {
@@ -313,6 +347,38 @@ class StreamResolver {
             watchUrl, ranked.first, DateTime.now().millisecondsSinceEpoch);
       }
       return ranked;
+    } catch (_) {
+      return [];
+    }
+  }
+
+  /// Full candidate list: tube legs first, then deciphered extractor
+  /// manifest URLs appended (deduped). Playback tries each in order —
+  /// when every InnerTube URL 403s at fetch (throttled network), the
+  /// deciphered manifest URLs still get their chance instead of the
+  /// track being skipped.
+  Future<List<String>> audioUrlsAll(String watchUrl) async {
+    try {
+      final vid = extractVideoId(watchUrl);
+      if (vid == null) return [];
+      final out = <String>[];
+      if (useInnerTube()) {
+        try {
+          for (final u in await tubeAudioUrls(vid)) {
+            if (u.isNotEmpty && !out.contains(u)) out.add(u);
+          }
+        } catch (_) {}
+      }
+      try {
+        for (final u in await _manifestUrls(vid)) {
+          if (u.isNotEmpty && !out.contains(u)) out.add(u);
+        }
+      } catch (_) {}
+      if (out.isNotEmpty) {
+        urlCache.remember(watchUrl, out.first,
+            DateTime.now().millisecondsSinceEpoch);
+      }
+      return out;
     } catch (_) {
       return [];
     }

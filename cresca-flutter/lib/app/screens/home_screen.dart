@@ -24,6 +24,7 @@ class _HomeScreenState extends State<HomeScreen> {
   final ScrollController _scroll = ScrollController();
   double _pull = 0;
   bool _armed = false;
+  String _filter = 'All';
 
   @override
   void initState() {
@@ -96,7 +97,7 @@ class _HomeScreenState extends State<HomeScreen> {
             slivers: [
               SliverAppBar(
                 pinned: true,
-                title: const Text('Listen Now'),
+                title: Text(_greeting()),
                 actions: [
                   if (state.homeStatus == HomeStatus.loading)
                     const Padding(
@@ -108,6 +109,13 @@ class _HomeScreenState extends State<HomeScreen> {
                               strokeWidth: 2)),
                     ),
                 ],
+              ),
+              SliverToBoxAdapter(
+                child: _FilterChips(
+                  filter: _filter,
+                  onPick: (f) =>
+                      setState(() => _filter = f),
+                ),
               ),
               SliverToBoxAdapter(
                 child: Padding(
@@ -127,37 +135,360 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ),
               ),
-              if (state.homeStatus == HomeStatus.loading &&
-                  state.topPicks.isEmpty)
-                const SliverListSkeleton(),
-              if (state.homeStatus == HomeStatus.error &&
-                  state.topPicks.isEmpty &&
-                  state.rails.isEmpty)
-                SliverFillRemaining(
-                  hasScrollBody: false,
-                  child: _ErrorCard(
-                    message: state.homeError,
-                    onRetry: () => state.loadHome(force: true),
+              if (_filter == 'Podcasts')
+                const SliverToBoxAdapter(
+                    child: _PodcastsEmpty()),
+              if (_filter != 'Podcasts') ...[
+                if (state.homeStatus ==
+                        HomeStatus.loading &&
+                    state.topPicks.isEmpty)
+                  const SliverListSkeleton(),
+                if (state.homeStatus == HomeStatus.error &&
+                    state.topPicks.isEmpty &&
+                    state.rails.isEmpty)
+                  SliverFillRemaining(
+                    hasScrollBody: false,
+                    child: _ErrorCard(
+                      message: state.homeError,
+                      onRetry: () =>
+                          state.loadHome(force: true),
+                    ),
                   ),
-                ),
-              if (state.pendingUpdate != null)
+                if (state.pendingUpdate != null)
+                  SliverToBoxAdapter(
+                      child:
+                          _UpdateBanner(state: state)),
                 SliverToBoxAdapter(
-                    child: _UpdateBanner(state: state)),
-              if (state.topPicks.isNotEmpty) ...[
+                    child: _RecentsGrid(state: state)),
                 SliverToBoxAdapter(
-                    child: _TopPicks(tracks: state.topPicks)),
+                    child: _JumpBackIn(state: state)),
+                if (state.topPicks.isNotEmpty) ...[
+                  SliverToBoxAdapter(
+                      child: _TopPicks(
+                          tracks: state.topPicks)),
+                  SliverToBoxAdapter(
+                      child: _HeroCard(
+                          tracks: state.topPicks)),
+                ],
                 SliverToBoxAdapter(
-                    child: _HeroCard(tracks: state.topPicks)),
+                    child: _Moods(state: state)),
+                for (final rail in state.rails)
+                  SliverToBoxAdapter(
+                      child: _Rail(
+                          rail: rail, state: state)),
               ],
-              SliverToBoxAdapter(child: _Moods(state: state)),
-              for (final rail in state.rails)
-                SliverToBoxAdapter(
-                    child: _Rail(rail: rail, state: state)),
               // Bottom chrome (mini player + pill) is app-shell; the
               // list scrolls under the glass (Spotify parity).
               const SliverPadding(padding: EdgeInsets.only(bottom: 210)),
             ],
           ),
+        ),
+      ),
+    );
+  }
+}
+
+String _greeting() {
+  try {
+    final h = DateTime.now().hour;
+    if (h < 12) return 'Good morning';
+    if (h < 18) return 'Good afternoon';
+    return 'Good evening';
+  } catch (_) {
+    return 'Listen Now';
+  }
+}
+
+/// Spotify filter chips (All / Music / Podcasts). All = full home,
+/// Music = same music catalog, Podcasts = honest empty state (music
+/// app — never fake rows).
+class _FilterChips extends StatelessWidget {
+  final String filter;
+  final ValueChanged<String> onPick;
+  const _FilterChips({required this.filter, required this.onPick});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 4, 16, 10),
+      child: Row(
+        children: [
+          for (final f in const ['All', 'Music', 'Podcasts'])
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: ChoiceChip(
+                label: Text(f),
+                selected: filter == f,
+                selectedColor: spotifyGreen,
+                labelStyle: TextStyle(
+                  fontWeight: FontWeight.w700,
+                  color: filter == f
+                      ? Colors.black
+                      : Theme.of(context)
+                          .colorScheme
+                          .onSurface,
+                ),
+                backgroundColor: Theme.of(context)
+                    .colorScheme
+                    .surfaceContainerHighest,
+                shape: const StadiumBorder(),
+                showCheckmark: false,
+                onSelected: (_) => onPick(f),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Honest empty state for the Podcasts filter (music-only app).
+class _PodcastsEmpty extends StatelessWidget {
+  const _PodcastsEmpty();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Padding(
+      padding: EdgeInsets.fromLTRB(16, 24, 16, 48),
+      child: Column(
+        children: [
+          Icon(Icons.podcasts_outlined, size: 48),
+          SizedBox(height: 12),
+          Text('No podcasts here',
+              style:
+                  TextStyle(fontWeight: FontWeight.w700, fontSize: 17)),
+          SizedBox(height: 6),
+          Text('Cresca is music-only — your songs live under All.',
+              textAlign: TextAlign.center),
+        ],
+      ),
+    );
+  }
+}
+
+/// Spotify recents grid: 2-col × up-to-4 rows of 56dp-art cells
+/// (Liked Songs gradient tile + recent/top picks).
+class _RecentsGrid extends StatelessWidget {
+  final AppState state;
+  const _RecentsGrid({required this.state});
+
+  @override
+  Widget build(BuildContext context) {
+    final cells = <_Cell>[];
+    if (state.library.liked.isNotEmpty) {
+      cells.add(
+          _Cell.liked(likedCount: state.library.liked.length));
+    }
+    final seen = <String>{};
+    for (final t in [
+      ...state.library.recent,
+      ...state.topPicks,
+      for (final r in state.rails) ...r.tracks,
+    ]) {
+      if (cells.length >= 8) break;
+      if (!seen.add(t.id)) continue;
+      cells.add(_Cell.track(t));
+    }
+    if (cells.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 2, 16, 4),
+      child: GridView.builder(
+        shrinkWrap: true,
+        physics: const NeverScrollableScrollPhysics(),
+        gridDelegate:
+            const SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 2,
+          mainAxisSpacing: 8,
+          crossAxisSpacing: 8,
+          mainAxisExtent: 56,
+        ),
+        itemCount: cells.length,
+        itemBuilder: (_, i) =>
+            _RecentCell(cell: cells[i], state: state),
+      ),
+    );
+  }
+}
+
+class _Cell {
+  final YtTrack? track;
+  final bool likedTile;
+  final int likedCount;
+  const _Cell.track(YtTrack t)
+      : track = t,
+        likedTile = false,
+        likedCount = 0;
+  const _Cell.liked({required this.likedCount})
+      : track = null,
+        likedTile = true;
+}
+
+class _RecentCell extends StatelessWidget {
+  final _Cell cell;
+  final AppState state;
+  const _RecentCell({required this.cell, required this.state});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    Widget art;
+    String title;
+    VoidCallback onTap;
+    if (cell.likedTile) {
+      art = Container(
+        width: 56,
+        height: 56,
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(colors: [
+            Color(0xFF4B2DD0),
+            Color(0xFF8A9BB5),
+          ]),
+          borderRadius: BorderRadius.only(
+            topLeft: Radius.circular(8),
+            bottomLeft: Radius.circular(8),
+          ),
+        ),
+        child: const Icon(Icons.favorite,
+            color: Colors.white, size: 24),
+      );
+      title = 'Liked Songs';
+      onTap = () {
+        if (state.library.liked.isNotEmpty) {
+          state.actPlay(state.library.liked, 0);
+        }
+      };
+    } else {
+      final t = cell.track!;
+      art = ClipRRect(
+        borderRadius: const BorderRadius.only(
+          topLeft: Radius.circular(8),
+          bottomLeft: Radius.circular(8),
+        ),
+        child: TrackArt(track: t, size: 56),
+      );
+      title = t.title;
+      onTap = () {
+        final q = [t];
+        state.actPlay(q, 0);
+      };
+    }
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        decoration: BoxDecoration(
+          color: scheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(
+          children: [
+            art,
+            const SizedBox(width: 8),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.only(right: 8),
+                child: Text(title,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w700)),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Spotify "Jump back in": horizontal large cards (art + type +
+/// title + subtitle) from recent, falling back to top picks.
+class _JumpBackIn extends StatelessWidget {
+  final AppState state;
+  const _JumpBackIn({required this.state});
+
+  @override
+  Widget build(BuildContext context) {
+    final seen = <String>{};
+    final picks = <YtTrack>[];
+    for (final t in [
+      ...state.library.recent,
+      ...state.topPicks,
+    ]) {
+      if (picks.length >= 10) break;
+      if (!seen.add(t.id)) continue;
+      picks.add(t);
+    }
+    if (picks.isEmpty) return const SizedBox.shrink();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 14, 16, 10),
+          child: Text('Jump back in',
+              style:
+                  TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
+        ),
+        SizedBox(
+          height: 236,
+          child: ListView.builder(
+            scrollDirection: Axis.horizontal,
+            padding:
+                const EdgeInsets.symmetric(horizontal: 16),
+            itemCount: picks.length,
+            itemBuilder: (_, i) =>
+                _JumpCard(track: picks[i], queue: picks, index: i),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _JumpCard extends StatelessWidget {
+  final YtTrack track;
+  final List<YtTrack> queue;
+  final int index;
+  const _JumpCard(
+      {required this.track,
+      required this.queue,
+      required this.index});
+
+  @override
+  Widget build(BuildContext context) {
+    final state = AppScope.of(context);
+    return GestureDetector(
+      onTap: () => state.actPlay(queue, index),
+      child: Container(
+        width: 160,
+        margin: const EdgeInsets.only(right: 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            ClipRRect(
+              borderRadius: BorderRadius.circular(8),
+              child: TrackArt(track: track, size: 160),
+            ),
+            const SizedBox(height: 6),
+            Text('Song',
+                style: TextStyle(
+                    fontSize: 11.5,
+                    color: Theme.of(context)
+                        .colorScheme
+                        .onSurfaceVariant)),
+            Text(track.title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontWeight: FontWeight.w700)),
+            Text(track.displayArtist(),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                    fontSize: 12,
+                    color: Theme.of(context)
+                        .colorScheme
+                        .onSurfaceVariant)),
+          ],
         ),
       ),
     );

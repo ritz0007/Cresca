@@ -491,10 +491,10 @@ void main() {
       const w = 'https://www.youtube.com/watch?v=AAAAAAAAAAA';
       final results = await Future.wait([r.audioUrl(w), r.audioUrl(w)]);
       expect(results, ['https://a/1', 'https://a/1']);
-      // One race shared by both callers: music + vr POSTs + sts GET
-      // (mock returns JSON, so no sts → phone POST skipped; music
-      // wins, stragglers ignored).
-      expect(posts, 3);
+      // One race shared by both callers: music + vr POSTs only
+      // (native parity order — music wins, stragglers ignored; phone
+      // sts GET + remix never run).
+      expect(posts, 2);
     });
 
     test('403 everywhere falls back to manifest; drop refetches', () async {

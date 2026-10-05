@@ -5,6 +5,7 @@
 import 'package:flutter/material.dart';
 
 import '../app.dart';
+import '../design.dart';
 import 'track_row.dart';
 
 Future<void> openDownloadsSheet(BuildContext context) async {
@@ -17,8 +18,9 @@ Future<void> openDownloadsSheet(BuildContext context) async {
         initialChildSize: 0.7,
         minChildSize: 0.4,
         maxChildSize: 0.95,
-        builder: (_, scroll) =>
-            DownloadsSheet(scroll: scroll),
+        builder: (_, scroll) => GlassSheetSurface(
+          child: DownloadsSheet(scroll: scroll),
+        ),
       ),
     );
   } catch (_) {}

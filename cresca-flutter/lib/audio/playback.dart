@@ -206,6 +206,10 @@ class PlayerController {
   /// this to notifyListeners.
   void Function()? onQueueChanged;
 
+  /// Fired on transport state flip (play/pause within a track) — JAM
+  /// host broadcasts pause/play to the room on it.
+  void Function()? onTransportChanged;
+
   void _emit() {
     try {
       onQueueChanged?.call();
@@ -413,9 +417,11 @@ class PlayerController {
 
   // ---------- internals ----------
 
-  /// Loads the current track: resolve URL (single-flight, 45s cap) then
-  /// build the 2-ahead gapless window. 403 → drop + ×3 retry → auto-skip
-  /// (≤5, then honest error).
+  /// Loads the current track: resolve ranked URLs then build the
+  /// 2-ahead gapless window. Each URL is tried in order — a stale
+  /// phone-leg URL 403s at ExoPlayer open, so fall through to music/VR
+  /// then extractor URLs (native parity) instead of skipping the track.
+  /// All fail → drop + ×3 re-resolve → auto-skip (≤5, then honest error).
   Future<void> _loadCurrent(
       {required bool autoplay, int seekMs = 0}) async {
     final gen = ++_loadGen;
@@ -450,21 +456,43 @@ class PlayerController {
         unawaited(handler.broadcastState());
         return;
       }
-      var url = await resolver.audioUrl(track.watchUrl);
+      var urls = await resolver.audioUrlsAll(track.watchUrl);
       var tries = 0;
-      while ((url == null || url.isEmpty) && tries < 3) {
+      while (urls.isEmpty && tries < 3) {
         try {
           resolver.dropCachedUrl(track.watchUrl);
         } catch (_) {}
         tries++;
-        url = await resolver.audioUrl(track.watchUrl);
+        urls = await resolver.audioUrlsAll(track.watchUrl);
       }
       if (gen != _loadGen) return;
-      if (url == null || url.isEmpty) {
+      if (urls.isEmpty) {
         await _onUnresolvable(track);
         return;
       }
-      await _setWindow(track, url, seekMs: seekMs);
+      // Try each ranked URL in order; 403s throw at setAudioSources.
+      String? working;
+      for (final url in urls) {
+        if (gen != _loadGen) return;
+        try {
+          await _setWindow(track, url, seekMs: seekMs);
+          working = url;
+          break;
+        } catch (_) {
+          try {
+            resolver.dropCachedUrl(track.watchUrl);
+          } catch (_) {}
+        }
+      }
+      if (working == null) {
+        await _onUnresolvable(track);
+        return;
+      }
+      // Remember the URL that actually opened (not just the first).
+      try {
+        resolver.urlCache.remember(track.watchUrl, working,
+            DateTime.now().millisecondsSinceEpoch);
+      } catch (_) {}
       if (gen != _loadGen) return;
       if (autoplay && !deferPlay) {
         try {
@@ -524,22 +552,11 @@ class PlayerController {
   }
 
   AudioSource _cachedSource(YtTrack t, String url) {
-    try {
-      final safe = t.id.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
-      final file = File('${cacheDir.path}/$audioCacheDirName/$safe.m4a');
-      // Experimental in just_audio 0.10, but it is the documented
-      // videoId-keyed disk cache (mirrors native customCacheKey).
-      // NOTE: no custom headers — headers force just_audio's localhost
-      // proxy path; direct ExoPlayer fetch matches the native stack.
-      // ignore: experimental_member_use
-      return LockCachingAudioSource(
-        Uri.parse(url),
-        cacheFile: file,
-        tag: _mediaTag(t),
-      );
-    } catch (_) {
-      return AudioSource.uri(Uri.parse(url), tag: _mediaTag(t));
-    }
+    // Direct ExoPlayer fetch (native parity, UA `Cresca/1.0 (Android)`
+    // set on the player). googlevideo 403s just_audio's=localhost
+    // proxy fetches from this network; every streamed byte flows
+    // straight from the CDN so caching rides the OS page cache only.
+    return AudioSource.uri(Uri.parse(url), tag: _mediaTag(t));
   }
 
   MediaItem _mediaTag(YtTrack t) {
@@ -599,6 +616,7 @@ class PlayerController {
   void _onPlayerState(PlayerState s) {
     try {
       unawaited(handler.broadcastState());
+      onTransportChanged?.call();
       if (s.processingState == ProcessingState.completed) {
         final has = engine.hasNext(exhaustHookArmed: true);
         if (endAction(has) == EndAction.advance) {
