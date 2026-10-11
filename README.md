@@ -192,6 +192,8 @@ foreground service with media playback, and notifications (for player and
 updater status on Android 13 plus). Runtime permission prompts appear where
 the OS requires them.
 
+Full policy: [PRIVACY.md](PRIVACY.md).
+
 ## Contributing
 
 Bug reports, ideas, and pull requests are welcome.
