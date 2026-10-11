@@ -110,4 +110,81 @@ class YtSession {
       await _store.delete(key: _kVisitor);
     } catch (_) {}
   }
+
+  /// Clears the cached PO-token (BotGuard short-lived; native keeps it
+  /// across logout, so this is opt-in for solver refresh flows).
+  Future<void> clearPoToken() async {
+    try {
+      poToken = '';
+      await _store.delete(key: _kPoToken);
+    } catch (_) {}
+  }
+}
+
+/// Mandatory-login gate for InnerTube fetches (native
+/// YtSessionManager.MANDATORY_LOGIN_FOR_INNERTUBE, default false so
+/// logged-out users keep working via fallback while proven).
+const bool mandatoryLoginForInnerTube = false;
+
+/// True when fetches may proceed: always in scaffold mode, else only
+/// when a login session is present. Never throws.
+bool canFetchInnerTube(String cookies) {
+  try {
+    if (!mandatoryLoginForInnerTube) return true;
+    return cookiesLoggedIn(cookies);
+  } catch (_) {
+    return false;
+  }
+}
+
+/// Session health snapshot for the InnerTube fast path
+/// (native YtSessionManager.capture logging 1:1). Never throws.
+class SessionHealth {
+  final bool hasLogin;
+  final bool hasVisitor;
+  final bool hasPoToken;
+  const SessionHealth({
+    required this.hasLogin,
+    required this.hasVisitor,
+    required this.hasPoToken,
+  });
+}
+
+SessionHealth sessionHealth({
+  required String cookies,
+  required String visitor,
+  required String poToken,
+}) {
+  try {
+    return SessionHealth(
+      hasLogin: cookiesLoggedIn(cookies),
+      hasVisitor: visitor.trim().isNotEmpty,
+      hasPoToken: poToken.trim().isNotEmpty,
+    );
+  } catch (_) {
+    return const SessionHealth(
+        hasLogin: false, hasVisitor: false, hasPoToken: false);
+  }
+}
+
+/// Request headers minus the package-identifying one (native
+/// LoginWebView.filteredHeaders 1:1). Pure; never throws.
+Map<String, String> filteredHeaders(
+  Map<String, String> original,
+  String cookie,
+  String userAgent,
+) {
+  final out = <String, String>{};
+  try {
+    for (final entry in original.entries) {
+      final k = entry.key;
+      if (k.toLowerCase() == 'x-requested-with') continue;
+      if (k.toLowerCase() == 'user-agent') continue;
+      if (k.toLowerCase() == 'cookie') continue;
+      out[k] = entry.value;
+    }
+    out['User-Agent'] = userAgent;
+    if (cookie.trim().isNotEmpty) out['Cookie'] = cookie;
+  } catch (_) {}
+  return out;
 }

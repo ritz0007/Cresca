@@ -1,0 +1,20 @@
+name: Cresca
+options:
+  bundleIdPrefix: com.cresca
+targets:
+  Cresca:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: CrescaIOSApp.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cresca.app
+        MARKETING_VERSION: 2.0.0
+        CURRENT_PROJECT_VERSION: 22
+    info:
+      properties:
+        CFBundleDisplayName: Cresca Music
+        UIBackgroundModes: [audio]
+        UILaunchScreen: {}

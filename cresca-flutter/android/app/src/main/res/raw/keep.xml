@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Live-alert heart icons are referenced by NAME at runtime
+     (audio_service custom MediaControl androidIcon strings), so R8
+     resource shrinking would strip them in release builds (R6: works
+     in debug, dead notification action on device). -->
+<resources xmlns:tools="http://schemas.android.com/tools"
+    tools:keep="@drawable/ic_cresca_heart,@drawable/ic_cresca_heart_outline" />

@@ -56,12 +56,18 @@ class JamSession extends ChangeNotifier {
   bool connected = false;
   bool guestAllowed = false;
   bool soloPaused = false;
+  bool degraded = false;
   int membersCount = 1;
   List<JamMember> members = const [];
   JamNow? now;
   List<JamTrack> snapshotQueue = const [];
+  int queueGen = 0;
+  int stateGen = 0;
   String statusLine = '';
   int _holdAttempts = 0;
+  int _applyGen = 0;
+  double _easeSpeed = 1.0;
+  Timer? _easeRestore;
 
   /// Deep-link landing code (sheet prefills; auto-join consumes).
   String _pendingCode = '';
@@ -113,16 +119,22 @@ class JamSession extends ChangeNotifier {
     _pump?.cancel();
     _holdTimer?.cancel();
     _holdSync?.cancel();
+    _easeRestore?.cancel();
     code = '';
     connected = false;
     isHost = false;
     guestAllowed = false;
     soloPaused = false;
+    degraded = false;
     members = const [];
     membersCount = 1;
     now = null;
     snapshotQueue = const [];
+    queueGen = 0;
+    stateGen = 0;
     statusLine = '';
+    _applyGen++; // cancel stale async applies (fallback table)
+    _easeSpeed = 1.0;
   }
 
   // ---- event pump (wire → room state → player) ----
@@ -160,6 +172,14 @@ class JamSession extends ChangeNotifier {
             if (isHost && connected) {
               _broadcastAsHost(force: true);
             }
+          case JamHandoffNotice(:final hostId, :final degraded):
+            this.degraded = degraded;
+            if (hostId.isNotEmpty) {
+              statusLine = degraded
+                  ? 'Host away — holding locally…'
+                  : 'Host handed off — following…';
+            }
+            mark();
           case JamAddWish(:final track, :final by):
             if (isHost && connected) {
               try {
@@ -192,6 +212,9 @@ class JamSession extends ChangeNotifier {
   }
 
   // ---- host broadcast path ----
+  int _hostStateGen = 0;
+  int _hostQueueGen = 0;
+
   void _broadcastAsHost({bool force = false}) {
     try {
       final cur = hooks.currentTrack();
@@ -203,15 +226,16 @@ class JamSession extends ChangeNotifier {
         thumb: cur.thumbUrl,
         url: cur.watchUrl,
       );
-      client.sendState(
-          t, hooks.positionMs(), hooks.isPlaying(),
-          force: force);
+      _hostStateGen++;
+      client.sendState(t, hooks.positionMs(), hooks.isPlaying(),
+          force: force, gen: _hostStateGen);
       final stamp = DateTime.now().millisecondsSinceEpoch;
       if (force || stamp - _hostQueueStamp >= jamQueueFloorMs) {
         _hostQueueStamp = stamp;
+        _hostQueueGen++;
         client.sendQueue(
-            [for (final t in hooks.queueSnapshot()) _toJam(t)],
-            cur.id);
+            [for (final t in hooks.queueSnapshot()) _toJam(t)], cur.id,
+            gen: _hostQueueGen);
       }
     } catch (_) {}
   }
@@ -283,14 +307,20 @@ class JamSession extends ChangeNotifier {
   // ---- guest mirror ----
   void _applyWire(JamEvent e) {
     switch (e) {
-      case JamState(:final now, :final force):
+      case JamState(:final now, :final force, :final gen):
+        // Server-authoritative generation: stale/duplicate states drop.
+        if (gen > 0 && gen < stateGen) return;
+        if (gen > 0) stateGen = gen;
         this.now = now;
         connected = true;
+        degraded = false;
         if (!isHost) {
           unawaited(_applyHostState(now, force: force));
         }
         notifyListeners();
-      case JamQueue(:final tracks) when !isHost:
+      case JamQueue(:final tracks, :final gen) when !isHost:
+        if (gen > 0 && gen < queueGen) return; // stale snapshot drops
+        if (gen > 0) queueGen = gen;
         snapshotQueue = tracks;
         notifyListeners();
       case JamMembers(:final members) when members.isNotEmpty:
@@ -305,8 +335,11 @@ class JamSession extends ChangeNotifier {
     }
   }
 
-  /// Adopt + follow (F3/F4/F6/F7, F10).
+  /// Adopt + follow (F3/F4/F6/F7, F10). Advance mode: chase only past
+  /// [jamChaseMs] (hard seek), ease the middle band with a small speed
+  /// nudge, hold inside [jamEaseMs] (no rubber-banding).
   Future<void> _applyHostState(JamNow s, {required bool force}) async {
+    final gen = ++_applyGen;
     try {
       final cur = hooks.currentTrack();
       final sameTrack = cur != null && cur.id == s.track.id;
@@ -325,6 +358,7 @@ class JamSession extends ChangeNotifier {
         }
         soloPaused = !s.playing;
         await controller.playQueue(queue, idx);
+        if (gen != _applyGen) return; // superseded: stale apply dies
         if (!s.playing) {
           try {
             await controller.player.pause();
@@ -332,20 +366,30 @@ class JamSession extends ChangeNotifier {
                 Duration(milliseconds: s.pos < 0 ? 0 : s.pos));
           } catch (_) {}
           soloPaused = true;
+        } else {
+          // Fresh take-over: restore 1.0× in case an ease nudge lingered.
+          _restoreSpeed();
         }
         notifyListeners();
         return;
       }
-      // Same track: follow position only when meaningfully behind.
+      // Same track: follow position only when meaningfully off.
       if (s.playing && !soloPaused) {
         final pos = hooks.positionMs();
-        final drift = (pos - expected).abs();
-        if (drift > 800) {
-          try {
-            await controller.player.seek(
-                Duration(milliseconds: expected < 0 ? 0 : expected));
-          } catch (_) {}
+        final drift = pos - expected;
+        switch (jamDriftAction(drift)) {
+          case 'chase':
+            _restoreSpeed();
+            try {
+              await controller.player.seek(
+                  Duration(milliseconds: expected < 0 ? 0 : expected));
+            } catch (_) {}
+          case 'ease':
+            _nudgeSpeed(drift);
+          case 'hold':
+            _restoreSpeed();
         }
+        if (gen != _applyGen) return;
       }
       // Host pause while guest not solo-paused: follow pause (F4).
       if (!s.playing && !soloPaused && hooks.isPlaying()) {
@@ -365,6 +409,30 @@ class JamSession extends ChangeNotifier {
       }
     } catch (_) {}
     return;
+  }
+
+  /// Ease-band speed nudge (±6%): converges small drifts without an
+  /// audible seek. Auto-restores to 1.0× after 4 s; chase/hold paths
+  /// restore immediately. All best-effort (player may not support it).
+  void _nudgeSpeed(int driftMs) {
+    try {
+      final want = jamEaseSpeed(driftMs);
+      if ((_easeSpeed - want).abs() < 0.001) return;
+      _easeSpeed = want;
+      unawaited(controller.player.setSpeed(want));
+      _easeRestore?.cancel();
+      _easeRestore = Timer(const Duration(seconds: 4), _restoreSpeed);
+    } catch (_) {}
+  }
+
+  void _restoreSpeed() {
+    try {
+      _easeRestore?.cancel();
+      _easeRestore = null;
+      if ((_easeSpeed - 1.0).abs() < 0.001) return;
+      _easeSpeed = 1.0;
+      unawaited(controller.player.setSpeed(1.0));
+    } catch (_) {}
   }
 
   YtTrack _toYt(JamTrack t) => YtTrack(
@@ -505,6 +573,7 @@ class JamSession extends ChangeNotifier {
     _pump?.cancel();
     _holdTimer?.cancel();
     _holdSync?.cancel();
+    _easeRestore?.cancel();
     super.dispose();
   }
 }

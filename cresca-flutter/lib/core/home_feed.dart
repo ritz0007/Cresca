@@ -3,6 +3,14 @@
 // DISCOVERY_POOL + discoveryAt cycle keys, personalized + artistSeeds
 // with label-word filtering). Loading lives in AppState; this file is
 // the rail catalog so tests pin rotation/keys/filters.
+//
+// Taste layer (topSeedForTaste/tasteSeedQueries/freshRotation): picks the
+// Top Picks seed from recency-weighted affinity ([TasteProfile]) instead
+// of blind rotation, and rotates freshness so refreshes never repeat the
+// same page. Ranked-track assembly lives in discovery.dart
+// (rankTopPicks); fetch orchestration in repository.topPicksFor.
+
+import 'discovery.dart';
 
 class HomeSection {
   final String title;
@@ -73,6 +81,104 @@ class HomeFeed {
 
   static HomeSection topSeed(int refreshCount) =>
       topSeeds[refreshCount % topSeeds.length];
+
+  /// Taste-biased Top Picks seed: the highest-affinity artists rotate
+  /// through the seed slot by [refreshCount] (freshness rotation — never
+  /// the same page twice in a row), falling back to the static pool when
+  /// taste is empty. Keeps the `home_top` cache key so snapshots stay
+  /// compatible.
+  static HomeSection topSeedForTaste(
+    int refreshCount, {
+    TasteProfile? taste,
+    List<String> recentArtists = const [],
+    List<String> likedArtists = const [],
+  }) {
+    try {
+      final ranked = tasteSeedQueries(
+        taste: taste,
+        recentArtists: recentArtists,
+        likedArtists: likedArtists,
+        max: 3,
+      );
+      if (ranked.isEmpty) return topSeed(refreshCount);
+      final pick = ranked[refreshCount % ranked.length];
+      final fallback = topSeed(refreshCount);
+      // Never repeat the previous page: when taste yields a single seed
+      // and it matches the fallback query, take the next static seed.
+      if (ranked.length == 1 && pick == fallback.query) {
+        return topSeed(refreshCount + 1);
+      }
+      return HomeSection(
+        title: 'Top Picks For You',
+        subtitle: 'Tuned to your taste',
+        query: pick,
+        cacheKey: 'home_top',
+      );
+    } catch (_) {
+      return topSeed(refreshCount);
+    }
+  }
+
+  /// Ranked Top Picks seed queries from taste: profile affinity first,
+  /// then recency order, then the static pool as filler. All distinct,
+  /// longest-first trimmed to [max].
+  static List<String> tasteSeedQueries({
+    TasteProfile? taste,
+    List<String> recentArtists = const [],
+    List<String> likedArtists = const [],
+    int max = 4,
+  }) {
+    try {
+      final out = <String>[];
+      void add(String q) {
+        final t = q.trim();
+        if (t.length < 3 || t.length > 60) return;
+        if (out.any((e) => e.toLowerCase() == t.toLowerCase())) return;
+        if (out.length < max) out.add(t);
+      }
+
+      final affinity = taste?.topArtists(max) ?? const [];
+      for (final a in affinity) {
+        add('$a songs');
+      }
+      for (final a in [...recentArtists, ...likedArtists]) {
+        final seeds = artistSeeds([a], 1);
+        for (final s in seeds) {
+          add('$s songs');
+        }
+        if (out.length >= max) break;
+      }
+      // Static filler keeps rails full for thin taste (rotation varies).
+      var i = out.length;
+      while (out.length < max) {
+        final q = topSeeds[i % topSeeds.length].query;
+        if (!out.contains(q)) out.add(q);
+        i++;
+        if (i > out.length + topSeeds.length) break;
+      }
+      return out.take(max).toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  /// Freshness rotation for surfaced track ids: drops ids shown within
+  /// the last [memory] refreshes so Top Picks pages never repeat. The
+  /// caller persists the returned list (cap [memory]) and feeds the
+  /// dropped ids back as `shownIds` next refresh.
+  static List<String> freshRotation(
+    List<String> shownHistory,
+    List<String> justShown, {
+    int memory = 60,
+  }) {
+    try {
+      final out = [...justShown, ...shownHistory];
+      final seen = <String>{};
+      return out.where((id) => seen.add(id)).take(memory).toList();
+    } catch (_) {
+      return shownHistory;
+    }
+  }
 
   /// Core rails after Top Picks (fixed order, like server shelves).
   static const core = [

@@ -9,7 +9,9 @@
 
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
+import '../core/track.dart' show extractVideoId;
 import 'resolve.dart' show modernTubeHeaders;
+import 'streamkit/bundle.dart' as sk;
 
 class VideoDetails {
   final int views;
@@ -82,6 +84,18 @@ VideoDetails? detailsFromVideo(Video v) => detailsFromFields(
       duration: v.duration,
     );
 
+/// Bundle TrackMeta → VideoDetails (likes stay -1: player responses
+/// never carry them; the extractor backfills on About-panel open).
+/// Pure; unit-tested.
+VideoDetails detailsFromMeta(sk.TrackMeta m) => VideoDetails(
+      views: m.viewCount,
+      likes: m.likeCount,
+      uploadDate: m.uploadDate,
+      description: m.description,
+      durationSec: m.durationSec,
+      dashUrl: '',
+    );
+
 /// Per-session memo + extractor handle. All failures → null.
 class DetailsStore {
   YoutubeExplode? _yt;
@@ -112,6 +126,17 @@ class DetailsStore {
         current = hit;
         return hit;
       }
+      // Bundle memo is keyed by videoId (rememberMeta at resolve):
+      // zero requests after playback, even for deep links / restored
+      // queues whose watchUrl form differs.
+      try {
+        final vid = extractVideoId(watchUrl);
+        final byId = vid != null ? memo[vid] : null;
+        if (byId != null) {
+          current = byId;
+          return byId;
+        }
+      } catch (_) {}
       final v = await _explode()
           .videos
           .get(watchUrl)
@@ -123,6 +148,16 @@ class DetailsStore {
     } catch (_) {
       return null;
     }
+  }
+
+  /// Zero-request path: memoize bundle metadata at resolve time (wired
+  /// to PlayerController.onBundleResolved). No-op for detail-less
+  /// metas. Never throws.
+  void rememberMeta(String videoId, sk.TrackMeta meta) {
+    try {
+      if (videoId.isEmpty || !meta.hasDetails) return;
+      memo[videoId] = detailsFromMeta(meta);
+    } catch (_) {}
   }
 }
 

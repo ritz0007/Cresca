@@ -8,11 +8,15 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:background_downloader/background_downloader.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:http/http.dart' as http;
 import 'package:open_file/open_file.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
+
+import '../core/motion.dart'
+    show barSlideMs, motionMs, shimmerMs, tabExitMs;
 
 const String updateRepo = 'ritz0007/Cresca';
 const int updateIntervalMs = 24 * 60 * 60 * 1000;
@@ -314,5 +318,173 @@ class UpdateChecker {
     try {
       _http.close();
     } catch (_) {}
+  }
+}
+
+/// Update banner motion (H9/Y4): the prompt slides down + fades in
+/// over 220 ms ([barSlideMs]); dismiss slides up + fades over 180 ms.
+/// Transform/opacity only — 60 fps, dark/light + large-text safe
+/// (fractional slide, no fixed heights).
+///
+/// Wrap banner content and drive [visible] from
+/// `state.pendingUpdate != null`. Content stays mounted while the
+/// exit runs so the dismiss is visible; pass [onDismissed] to drop it
+/// (or keep it mounted — zero-size when fully hidden).
+class UpdateBannerMotion extends StatefulWidget {
+  final bool visible;
+  final bool motionOn;
+  final Widget child;
+  const UpdateBannerMotion({
+    super.key,
+    required this.visible,
+    required this.child,
+    this.motionOn = true,
+  });
+
+  @override
+  State<UpdateBannerMotion> createState() =>
+      _UpdateBannerMotionState();
+}
+
+class _UpdateBannerMotionState extends State<UpdateBannerMotion>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c;
+  // 120Hz polish: hoisted curves (were allocated per build); the
+  // banner content paints behind a boundary so the slide/fade never
+  // repaints rows beneath it.
+  late final Animation<double> _fade;
+  late final Animation<Offset> _slide;
+  late final Animation<double> _size;
+
+  Duration get _enter =>
+      Duration(milliseconds: motionMs(widget.motionOn, barSlideMs));
+  Duration get _exit =>
+      Duration(milliseconds: motionMs(widget.motionOn, tabExitMs));
+
+  @override
+  void initState() {
+    super.initState();
+    _c = AnimationController(vsync: this, value: 0);
+    _fade = CurvedAnimation(parent: _c, curve: Curves.easeOut);
+    _slide = Tween(
+      begin: const Offset(0, -0.18),
+      end: Offset.zero,
+    ).animate(CurvedAnimation(parent: _c, curve: Curves.easeOut));
+    _size = CurvedAnimation(parent: _c, curve: Curves.easeOut);
+    _c.duration = _enter;
+    _c.reverseDuration = _exit;
+    if (widget.visible) _c.value = 1;
+  }
+
+  @override
+  void didUpdateWidget(covariant UpdateBannerMotion old) {
+    super.didUpdateWidget(old);
+    _c.duration = _enter;
+    _c.reverseDuration = _exit;
+    if (widget.visible != old.visible) {
+      if (widget.visible) {
+        _c.forward();
+      } else {
+        _c.reverse();
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!widget.motionOn) {
+      return widget.visible
+          ? widget.child
+          : const SizedBox.shrink();
+    }
+    return FadeTransition(
+      opacity: _fade,
+      child: SlideTransition(
+        position: _slide,
+        child: SizeTransition(
+          sizeFactor: _size,
+          alignment: Alignment.topCenter,
+          child: RepaintBoundary(child: widget.child),
+        ),
+      ),
+    );
+  }
+}
+
+/// Download progress shimmer: opacity pulse only (never
+/// position/blur) while [active]. Wraps the update progress bar.
+/// Idle when motion is off or the download isn't running.
+class UpdateProgressShimmer extends StatefulWidget {
+  final bool motionOn;
+  final bool active;
+  final Widget child;
+  const UpdateProgressShimmer({
+    super.key,
+    required this.child,
+    this.motionOn = true,
+    this.active = true,
+  });
+
+  @override
+  State<UpdateProgressShimmer> createState() =>
+      _UpdateProgressShimmerState();
+}
+
+class _UpdateProgressShimmerState
+    extends State<UpdateProgressShimmer>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c;
+  // 120Hz polish: hoisted curve (was `CurvedAnimation(...)` allocated
+  // inside the per-frame builder — churned at 120 Hz while active).
+  late final Animation<double> _pulse;
+
+  @override
+  void initState() {
+    super.initState();
+    _c = AnimationController(
+      vsync: this,
+      duration: Duration(milliseconds: shimmerMs),
+    );
+    _pulse = CurvedAnimation(parent: _c, curve: Curves.easeInOut);
+    if (widget.motionOn && widget.active) {
+      _c.repeat(reverse: true);
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant UpdateProgressShimmer old) {
+    super.didUpdateWidget(old);
+    if (widget.motionOn && widget.active) {
+      if (!_c.isAnimating) _c.repeat(reverse: true);
+    } else {
+      _c.stop();
+    }
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!widget.motionOn || !widget.active) {
+      return widget.child;
+    }
+    return AnimatedBuilder(
+      animation: _c,
+      builder: (_, child) => Opacity(
+        opacity: 0.55 + 0.45 * _pulse.value,
+        child: child,
+      ),
+      child: RepaintBoundary(child: widget.child),
+    );
   }
 }

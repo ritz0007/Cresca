@@ -57,7 +57,9 @@ try:
             pass
         if request.path in ("/", "/health"):
             body = json.dumps({"ok": True,
-                               "rooms": len(rooms)}).encode()
+                               "rooms": len(rooms),
+                               "v": PROTO_V,
+                               "caps": SERVER_CAPS}).encode()
             return Response(200, "OK",
                             Headers([("Content-Type", "application/json")]),
                             body)
@@ -73,7 +75,9 @@ except ImportError:  # older websockets releases
             pass
         if path in ("/", "/health"):
             body = json.dumps({"ok": True,
-                               "rooms": len(rooms)}).encode()
+                               "rooms": len(rooms),
+                               "v": PROTO_V,
+                               "caps": SERVER_CAPS}).encode()
             return (200, [("Content-Type", "application/json")], body)
         return None
 
@@ -84,7 +88,11 @@ MAX_QUEUE = cfg_int("JAM_MAX_QUEUE", 60)
 ROOM_TTL_S = cfg_int("JAM_ROOM_TTL_HOURS", 3) * 3600
 EMPTY_TTL_S = cfg_int("JAM_EMPTY_TTL_S", 60)
 CREATE_PER_MIN = cfg_int("JAM_CREATE_PER_MIN", 5)
+JOIN_PER_MIN = cfg_int("JAM_JOIN_PER_MIN", 20)  # reconnect-storm guard/IP/min
 MAX_MSG = 8 * 1024
+MAX_BUF_BYTES = 64 * 1024  # backpressure: skip laggy sockets
+PROTO_V = 2
+SERVER_CAPS = ["clock2", "ease", "opid", "qgen", "ecodes", "handoff"]
 MIN_STATE_MS = 0.8      # host state floor (seconds)
 MIN_QUEUE_MS = 1.0      # host queue-snapshot floor (seconds)
 HEARTBEAT_S = 25        # websocket ping interval (seconds)
@@ -165,11 +173,15 @@ class Room:
         self.now = None
         self.queue = []
         self.cur_id = ""
+        self.state_gen = 0
+        self.queue_gen = 0
+        self.seen_ops = set()
         self.members = {}  # websocket -> {"id":..., "name":...}
 
 
 rooms = {}          # code -> Room
 creates_by_ip = {}  # ip -> [timestamps]
+joins_by_ip = {}    # ip -> [timestamps] (reconnect-storm guard)
 
 
 async def send(ws, obj):
@@ -177,6 +189,35 @@ async def send(ws, obj):
         await ws.send(json.dumps(obj, separators=(",", ":")))
     except Exception:
         pass
+
+
+async def err(ws, code, msg):
+    # Explicit error codes with client-readable reasons (advance mode
+    # `ecodes` cap). v1 clients ignore `code` and read `msg` as before.
+    await send(ws, {"type": "error", "code": code, "msg": msg})
+
+
+def negotiated_hello(code, me, room):
+    # Version-gated hello (see Node server.js): legacy shape + extras.
+    return {"type": "joined", "code": code, "you": me["id"],
+            "host": room.host_id, "name": me["name"],
+            "v": PROTO_V, "caps": SERVER_CAPS,
+            "st": int(time.time() * 1000)}
+
+
+def note_op(room, op):
+    # Idempotent op relay: True = first sight (relay), False = replay.
+    try:
+        if not op:
+            return True  # legacy frame without op id: always relay
+        if op in room.seen_ops:
+            return False
+        room.seen_ops.add(op)
+        if len(room.seen_ops) > 500:
+            room.seen_ops.pop()
+        return True
+    except Exception:
+        return True
 
 
 def member_list(room):
@@ -195,6 +236,13 @@ async def broadcast(room, obj, except_ws=None):
     for ws in list(room.members.keys()):
         if ws is except_ws:
             continue
+        try:
+            # Backpressure guard: skip laggy sockets (they re-sync via
+            # sync_req); never buffer into a wedged connection.
+            if getattr(ws, "buffered_amount", 0) > MAX_BUF_BYTES:
+                continue
+        except Exception:
+            pass
         try:
             if raw is None:
                 raw = json.dumps(obj, separators=(",", ":"))
@@ -216,7 +264,7 @@ def host_ws(room):
     return None
 
 
-async def leave_room(room, ws):
+async def leave_room(room, ws, reason=None):
     me = room.members.get(ws)
     room.members.pop(ws, None)
     if not room.members:
@@ -229,7 +277,10 @@ async def leave_room(room, ws):
             room.host_id = nxt["id"]
         except StopIteration:
             pass
-        await broadcast(room, {"type": "host", "host": room.host_id})
+        if reason == "host-gone":
+            # Graceful handoff (same shape as legacy `host` + flag).
+            await broadcast(room, {"type": "host", "host": room.host_id,
+                                   "handoff": True})
     await broadcast_members(room)
 
 
@@ -242,20 +293,18 @@ async def handle(ws, msg, state):
 
     if mtype == "create":
         if room is not None:
-            await send(ws, {"type": "error", "msg": "already in a room"})
+            await err(ws, "ALREADY_IN_ROOM", "already in a room")
             return
         ip = state["ip"]
         now = time.time()
         hits = [t for t in creates_by_ip.get(ip, []) if now - t < 60]
         if len(hits) >= CREATE_PER_MIN:
-            await send(ws, {"type": "error",
-                            "msg": "slow down, try again soon"})
+            await err(ws, "RATE_LIMIT", "slow down, try again soon")
             return
         hits.append(now)
         creates_by_ip[ip] = hits
         if len(rooms) >= MAX_ROOMS:
-            await send(ws, {"type": "error",
-                            "msg": "server is full right now"})
+            await err(ws, "SERVER_FULL", "server is full right now")
             return
         code = make_code()
         guard = 0
@@ -268,34 +317,42 @@ async def handle(ws, msg, state):
         rooms[code] = room
         state["room"], state["me"] = room, me
         await send(ws, {"type": "created", "code": code})
-        await send(ws, {"type": "joined", "code": code, "you": me["id"],
-                        "host": room.host_id, "name": me["name"]})
+        await send(ws, negotiated_hello(code, me, room))
         await broadcast_members(room)
 
     elif mtype == "join":
         if room is not None:
-            await send(ws, {"type": "error", "msg": "already in a room"})
+            await err(ws, "ALREADY_IN_ROOM", "already in a room")
             return
+        jip = state["ip"]
+        jnow = time.time()
+        jhits = [t for t in joins_by_ip.get(jip, []) if jnow - t < 60]
+        if len(jhits) >= JOIN_PER_MIN:
+            await err(ws, "RATE_LIMIT", "slow down, try again soon")
+            return
+        jhits.append(jnow)
+        joins_by_ip[jip] = jhits
         code = clean_str(msg.get("code"), 16).strip().upper()
         r = rooms.get(code)
         if r is None:
-            await send(ws, {"type": "error", "msg": "no JAM with that code"})
+            await err(ws, "NO_ROOM", "no JAM with that code")
             return
         if len(r.members) >= MAX_MEMBERS:
-            await send(ws, {"type": "error", "msg": "that JAM is full"})
+            await err(ws, "ROOM_FULL", "that JAM is full")
             return
         me = {"id": uid(), "name": clean_name(msg.get("name"))}
         room = r
         room.members[ws] = me
         room.empty_at = 0.0
         state["room"], state["me"] = room, me
-        await send(ws, {"type": "joined", "code": code, "you": me["id"],
-                        "host": room.host_id, "name": me["name"]})
+        # Fast hello + snapshot: single round trip on a cold socket.
+        await send(ws, negotiated_hello(code, me, room))
         if room.now:
-            await send(ws, {"type": "state", "state": room.now})
+            await send(ws, {"type": "state", "state": room.now,
+                            "gen": room.state_gen})
         if room.queue:
             await send(ws, {"type": "queue", "tracks": room.queue,
-                            "cur": room.cur_id})
+                            "cur": room.cur_id, "gen": room.queue_gen})
         await send(ws, {"type": "allow", "on": room.allow_guests})
         await broadcast_members(room)
 
@@ -318,10 +375,13 @@ async def handle(ws, msg, state):
             pos = 0
         # `st` is the SERVER clock: the one shared timebase the room
         # measures against, so phone-clock skew can't drift the music.
+        # `gen` is the authoritative state generation (guests drop stale).
+        room.state_gen += 1
         room.now = {"track": track, "pos": pos,
                     "playing": msg.get("playing") is True,
                     "at": int(now * 1000), "st": int(now * 1000)}
-        await broadcast(room, {"type": "state", "state": room.now},
+        await broadcast(room, {"type": "state", "state": room.now,
+                               "gen": room.state_gen},
                         except_ws=ws)
 
     elif mtype == "queue":
@@ -344,8 +404,10 @@ async def handle(ws, msg, state):
                 clean.append(c)
         room.queue = clean
         room.cur_id = clean_str(msg.get("cur"), 16)
+        room.queue_gen += 1
         await broadcast(room, {"type": "queue", "tracks": clean,
-                               "cur": room.cur_id}, except_ws=ws)
+                               "cur": room.cur_id, "gen": room.queue_gen},
+                        except_ws=ws)
 
     elif mtype == "add":
         # Anyone can suggest a song. Relayed to the host, which appends it
@@ -358,11 +420,15 @@ async def handle(ws, msg, state):
             return
         if me["id"] == room.host_id:
             return  # host adds locally
+        op = clean_str(msg.get("op", msg.get("opId", "")), 32)
+        if not note_op(room, op):
+            return  # replay: ack-and-drop (idempotent)
         hw = host_ws(room)
         if hw is None:
-            await send(ws, {"type": "error", "msg": "host is away"})
+            await err(ws, "HOST_AWAY", "host is away")
             return
-        await send(hw, {"type": "add", "track": track, "by": me["name"]})
+        await send(hw, {"type": "add", "track": track, "by": me["name"],
+                        **({"op": op} if op else {})})
 
     elif mtype == "control":
         # Guest transport wish (next/prev/play/pause/seek/play_at).
@@ -374,12 +440,14 @@ async def handle(ws, msg, state):
         action = clean_str(msg.get("action"), 16)
         if not room.allow_guests and action in ("next", "prev",
                                                 "play_at", "seek"):
-            await send(ws, {"type": "error",
-                            "msg": "only the host controls playback"})
+            await err(ws, "NO_CONTROL", "only the host controls playback")
             return
+        op = clean_str(msg.get("op", msg.get("opId", "")), 32)
+        if not note_op(room, op):
+            return  # replay: ack-and-drop (idempotent)
         hw = host_ws(room)
         if hw is None:
-            await send(ws, {"type": "error", "msg": "host is away"})
+            await err(ws, "HOST_AWAY", "host is away")
             return
         try:
             pos = max(0, int(msg.get("pos", 0)))
@@ -387,7 +455,8 @@ async def handle(ws, msg, state):
             pos = 0
         await send(hw, {"type": "control", "action": action,
                         "id": clean_str(msg.get("id"), 16),
-                        "pos": pos, "by": me["name"]})
+                        "pos": pos, "by": me["name"],
+                        **({"op": op} if op else {})})
 
     elif mtype == "allow":
         me = state["me"]
@@ -446,7 +515,7 @@ async def handle(ws, msg, state):
         state["room"], state["me"] = None, None
 
     else:
-        await send(ws, {"type": "error", "msg": "unknown message"})
+        await err(ws, "UNKNOWN", "unknown message")
 
 
 async def on_conn(ws):
@@ -463,7 +532,7 @@ async def on_conn(ws):
                     raw = raw.decode("utf-8", "ignore")
                 msg = json.loads(raw)
             except Exception:
-                await send(ws, {"type": "error", "msg": "bad message"})
+                await err(ws, "BAD_MSG", "bad message")
                 continue
             if not isinstance(msg, dict) or not isinstance(
                     msg.get("type"), str):
@@ -477,7 +546,11 @@ async def on_conn(ws):
     finally:
         try:
             if state["room"] is not None:
-                await leave_room(state["room"], ws)
+                me = state.get("me")
+                room = state["room"]
+                was_host = bool(me and me["id"] == room.host_id)
+                await leave_room(room, ws,
+                                 "host-gone" if was_host else None)
         except Exception:
             pass
 
@@ -493,7 +566,8 @@ async def reaper():
                         or (now - r.created_at > ROOM_TTL_S)):
                     try:
                         await broadcast(r, {"type": "ended",
-                                            "why": "JAM expired"})
+                                            "why": "JAM expired",
+                                            "code": "EXPIRED"})
                         for peer in list(r.members.keys()):
                             try:
                                 await peer.close()
@@ -508,6 +582,12 @@ async def reaper():
                     creates_by_ip[ip] = fresh
                 else:
                     creates_by_ip.pop(ip, None)
+            for ip, hits in list(joins_by_ip.items()):
+                fresh = [t for t in hits if now - t < 60]
+                if fresh:
+                    joins_by_ip[ip] = fresh
+                else:
+                    joins_by_ip.pop(ip, None)
         except Exception:
             pass
 

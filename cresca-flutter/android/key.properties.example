@@ -1,0 +1,7 @@
+# Copy to android/key.properties (gitignored — NEVER commit the real
+# file) and fill in your upload-key values. CI writes this file from
+# secrets before `flutter build appbundle`.
+storeFile=C:/keys/cresca-upload.jks
+storePassword=CHANGE_ME
+keyAlias=cresca
+keyPassword=CHANGE_ME

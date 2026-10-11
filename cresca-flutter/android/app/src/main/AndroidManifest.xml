@@ -1,10 +1,29 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Release posture (startup/release crew):
+         Permissions (minimal — no storage/location/contacts):
+         - INTERNET: stream + artwork + update check.
+         - FOREGROUND_SERVICE + FOREGROUND_SERVICE_MEDIA_PLAYBACK:
+           audio_service foreground playback (mediaPlayback type below).
+         - POST_NOTIFICATIONS (runtime-requested): playback + Live
+           Updates cards. Device-Music downloads use scoped
+           MediaStore via background_downloader — no legacy
+           READ/WRITE_EXTERNAL_STORAGE declared.
+         - usesCleartextTraffic=true: retained for CDN/artwork compat
+           (streams resolve to mixed http(s) hosts); API traffic stays
+           https. Revisit only if all hosts prove https.
+         Orientation: portrait is locked in Dart (lockPortrait in
+         lib/main.dart, A2) — NOT via android:screenOrientation, so a
+         future video-fullscreen route can opt into landscape for its
+         own route with SystemChrome.setPreferredOrientations and
+         restore portrait on pop. The configChanges set below already
+         covers orientation|screenSize|..., so that path needs no
+         manifest change. -->
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <application
-        android:label="cresca_app"
+        android:label="Cresca Music"
         android:name="${applicationName}"
         android:usesCleartextTraffic="true"
         android:icon="@mipmap/ic_launcher">

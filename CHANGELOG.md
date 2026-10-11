@@ -1,5 +1,80 @@
 # Changelog — Cresca Music
 
+## 1.5.1 (Flutter port — unreleased; pubspec still `1.5.0+20`)
+- Full Flutter rewrite of the native app per `RESTRUCTURE.md` (catalog
+  A1–A9, T1–T2, H1–H11, R1–R3, S1–S4, M1, P1–P16, L1–L6, G1–G2,
+  C1–C5, Y1–Y4). 27 commits since `v1.4.1`; commit messages report
+  `flutter analyze` clean and 138 dart/flutter tests green, live-verified
+  on jam16. Native `app/` still ships until Phase 5 archives it.
+- Animations / motion: global kill-switch with per-widget static paths,
+  press-scale .94, tab drift+fade, staggered rails, shimmer skeletons
+  (`lib/app/design.dart`, `lib/core/motion.dart`, `lib/app/app.dart`).
+  Default is currently OFF (`motionOn = false`, persisted in
+  `lib/app/state.dart`) — native default was ON (catalog A4); confirm
+  the intended default before release.
+- Adaptive text: `AdaptiveText` + WCAG luminance/contrast helpers in
+  `lib/app/design.dart` (pure/static, compositor-safe, no animation or
+  BackdropFilter in the helpers).
+- Discovery algorithm: vibe + smart-shuffle scoring
+  (`lib/core/discovery.dart`), home-feed model (`lib/core/home_feed.dart`),
+  pure-Dart queue engine (`lib/core/queue.dart`), YTM server-driven home
+  shelves via `parsePlaylistCards`/`parsePlaylistItems` with cached index
+  and post-query enrichment waves.
+- Lyrics: 4-leg fetch (YouTube captions → LRCLIB → KuGou → lyrics.ovh) +
+  scoring + LRC/VTT/SRT/timedtext parsers (`lib/data/lyrics.dart`),
+  karaoke panel with ≥9 s gap dots, 3 s manual-hold, tap-to-seek
+  (`lib/app/widgets/lyrics_panel.dart`), KuGou hash/search/download leg
+  with provider attribution + Change retry row, translation + Hinglish
+  romanization companion (`lib/data/translate.dart`).
+- Video: P9 session-driven music-video mode with 1080p DASH + caps +
+  muxed fallback + quality picker, fullscreen landscape dialog,
+  first-frame gate, next-video prefetch
+  (`lib/app/widgets/video_sheet.dart`).
+- Search: debounced (250 ms) music-only search with instant cached results
+  first, <180 ms suggestions, artist row, S3 song gates (30 s–10 min, no
+  Shorts/LIVE/episodes/trailers, junk-title filter) enforced in
+  `lib/core/track.dart` + `lib/data/repository.dart`.
+- Offline: downloads as `Artist - Title.m4a` via `background_downloader`
+  with in-app vs device-Music location switch, MB list, offline-first
+  replay (`lib/app/downloads.dart`,
+  `lib/app/widgets/downloads_sheet.dart`); TTL caches per C1 numbers
+  (`lib/data/cache.dart`); cold-start session restore with no autoplay
+  (`lib/core/session.dart`).
+- Also in this port: Phase 4 JAM protocol/client/session/sheet/tests,
+  Y4 daily update check + banner + download/install
+  (`lib/app/updates.dart`), on-device crash ring A9
+  (`lib/app/crash.dart`), Y2 Live Updates driver + Y3 notification
+  permission (`lib/system/live_updates.dart`), Spotify PKCE auth slice
+  (`lib/auth/spotify.dart`), encrypted YouTube session G1
+  (`lib/auth/session.dart`, session sheet).
+- Fixes since the port began (per commit messages): Range pre-flight skips
+  403s in seconds; shell-overlay mini-player Material-wrapper crash fix;
+  artist resolve skips YTM type badges + strips "Topic"; endless-scroll
+  reentry guard; tab bar pinned to bottom; Glass compositor
+  ClipRRect/BackdropFilter paint-bisect fix; NewPipe-equivalent phone
+  resolve leg (current ANDROID client + session sts); AudioServiceActivity
+  + cleartext-localhost proxy + skip-budget placement fixes.
+- Known issues (must clear before release):
+  - Release builds still sign with DEBUG keys
+    (`cresca-flutter/android/app/build.gradle.kts`:
+    `signingConfig = signingConfigs.getByName("debug")`,
+    "Signing with the debug keys for now"). No `key.properties` exists
+    under `android/` or `cresca-flutter/android/`. Phase 5 requires
+    reusing `app/cresca-release.keystore` via a gitignored
+    `android/key.properties` — not done.
+  - Android build pins AGP 9.1.0 + Kotlin Gradle Plugin
+    `org.jetbrains.kotlin.android` 2.4.0 with the
+    `kotlin { compilerOptions { jvmTarget = JVM_17 } }` DSL; expect
+    KGP/AGP deprecation or migration warnings on the release build —
+    capture and record the exact warning text before sign-off.
+  - Version bookkeeping: `cresca-flutter/pubspec.yaml` still
+    `1.5.0+20`; bump name/code for 1.5.1 at release time.
+  - Application ID changed to `com.cresca.cresca_app` (native was
+    `com.cresca.app`): side-by-side install, no upgrade path — decide
+    the ID story before release.
+  - Manifest sets `usesCleartextTraffic="true"` (localhost just_audio
+    proxy); scope or document before release.
+
 ## 1.4.1
 - Updater reliability: verified-complete installs only (partial files no
   longer reach the installer — no more "problem parsing the package"),

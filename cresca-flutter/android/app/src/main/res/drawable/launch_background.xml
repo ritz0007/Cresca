@@ -1,12 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Modify this file to customize your launch splash screen -->
+<!-- Brand launch background (light): white surround matches the
+     light-mode logo mark (@drawable/cresca_logo) and the Flutter boot
+     bridge, so cold start has no flash. -->
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
-    <item android:drawable="@android:color/white" />
+    <item>
+        <color android:color="#FFFFFFFF" />
+    </item>
 
-    <!-- You can insert your own image assets here -->
-    <!-- <item>
+    <item>
         <bitmap
             android:gravity="center"
-            android:src="@mipmap/launch_image" />
-    </item> -->
+            android:src="@drawable/cresca_logo" />
+    </item>
 </layer-list>

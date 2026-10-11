@@ -5,6 +5,7 @@
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
 
+import '../../core/motion.dart';
 import '../../core/track.dart';
 import '../app.dart';
 import '../design.dart';
@@ -35,6 +36,8 @@ class _MiniPlayerState extends State<_MiniBodyHost>
   double _dx = 0;
   bool _peekLeft = false;
   bool _peekRight = false;
+  bool _pressed = false;
+  YtTrack? _lastTrack;
 
   @override
   Widget build(BuildContext context) {
@@ -50,10 +53,48 @@ class _MiniPlayerState extends State<_MiniBodyHost>
   Widget _miniBody(AppState state) {
     final engine = state.controller.engine;
     final track = engine.current;
-    if (track == null) return const SizedBox.shrink();
+    // Keep the last track alive one frame so the exit (slide+fade)
+    // can play instead of popping to nothing.
+    if (track != null) _lastTrack = track;
+    final display = track ?? _lastTrack;
+    if (display == null) return const SizedBox.shrink();
+    final hasTrack = track != null;
     final scheme = Theme.of(context).colorScheme;
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    // Narrow phones (360dp): shrink trailing glyphs so the
+    // art + title + two buttons never overflow the row.
+    final narrow =
+        MediaQuery.sizeOf(context).width < 380;
+    final trailingIconSize = narrow ? 22.0 : 26.0;
+    final enterMs = state.motionMs(220);
+    if (!hasTrack) {
+      // Collapse the slot after the exit fade finishes so an empty
+      // queue leaves no invisible gap (re-entry cancels via _lastTrack
+      // being repopulated above).
+      Future<void>.delayed(
+          Duration(milliseconds: enterMs + 60), () {
+        if (!mounted) return;
+        try {
+          if (widget.state.controller.engine.current == null &&
+              _lastTrack != null) {
+            setState(() => _lastTrack = null);
+          }
+        } catch (_) {}
+      });
+    }
+    // Swipe gestures live on the whole card; the expand tap lives
+    // only on the art+title region so the IconButtons below sit
+    // outside the tap region (no nested buttons in AT).
     return GestureDetector(
-      onTap: () => openPlayerSheet(context),
+      behavior: HitTestBehavior.translucent,
+      onVerticalDragEnd: (d) {
+        try {
+          final v = d.primaryVelocity ?? 0;
+          // Swipe-up-to-expand affordance (vertical only; horizontal
+          // still drives next/prev below).
+          if (v < -300 && hasTrack) openPlayerSheet(context);
+        } catch (_) {}
+      },
       onHorizontalDragUpdate: (d) {
         try {
           setState(() {
@@ -79,50 +120,121 @@ class _MiniPlayerState extends State<_MiniBodyHost>
           });
         } catch (_) {}
       },
-      // Liquid-glass floating card (D3): frosted, specular rim.
-      // Material wrapper: this rides in the app-shell overlay (Stack
-      // outside any Scaffold), so ListTile/ink widgets below would
-      // otherwise find no Material ancestor and red-screen.
-      child: Material(
-        type: MaterialType.transparency,
-        child: Padding(
-          // Bottom gutter is 0 here: it sits directly above the floating
-          // tab bar (own 10dp gutter), so the two read as one chrome unit.
-          padding: const EdgeInsets.fromLTRB(12, 4, 12, 0),
-          child: AnimatedContainer(
-            duration: Duration(milliseconds: state.motionMs(180)),
-            transform: Matrix4.translationValues(_dx, 0, 0),
-            child: Glass(
-              radius: 18,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                Row(
-                  children: [
-                    if (_peekRight)
-                      const Padding(
-                        padding: EdgeInsets.only(left: 4),
-                        child: Icon(Icons.chevron_left, size: 20),
-                      ),
-                    Expanded(
-                      child: ListTile(
-                        dense: true,
-                        leading: _MiniArt(track: track),
-                        title: Text(
-                          track.title,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        subtitle: Text(
-                          track.displayArtist(),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        trailing: Row(
+      // Entrance/exit: 12px slide + fade (~220ms, transform/opacity
+      // only). Exit plays against _lastTrack so clearing the queue
+      // fades the card out instead of popping it.
+      child: AnimatedSlide(
+        duration: Duration(milliseconds: enterMs),
+        curve: Curves.easeOut,
+        offset: hasTrack ? Offset.zero : const Offset(0, 0.18),
+        child: AnimatedOpacity(
+          duration: Duration(milliseconds: enterMs),
+          curve: Curves.easeOut,
+          opacity: hasTrack ? 1.0 : 0.0,
+          child: ExcludeSemantics(
+            excluding: !hasTrack,
+            child: Material(
+                type: MaterialType.transparency,
+                child: Padding(
+                  // Bottom gutter is 0 here: it sits directly above the floating
+                  // tab bar (own 10dp gutter), so the two read as one chrome unit.
+                  padding: const EdgeInsets.fromLTRB(12, 4, 12, 0),
+                  child: AnimatedContainer(
+                    duration:
+                        Duration(milliseconds: state.motionMs(180)),
+                    transform: Matrix4.translationValues(_dx, 0, 0),
+                    // Tap press-scale 0.94 / 120ms (transform only).
+                    child: AnimatedScale(
+                      duration: Duration(
+                          milliseconds: state.motionMs(pressMs)),
+                      curve: Curves.easeOut,
+                      scale: _pressed ? pressedScale : 1.0,
+                      child: Glass(
+                        radius: 16,
+                        child: Column(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            _EqBars(running: true),
-                            StreamBuilder<PlayerState>(
+                            Padding(
+                              padding: const EdgeInsets.fromLTRB(
+                                  4, 6, 4, 6),
+                              child: Row(
+                              children: [
+                                if (_peekRight)
+                                  const Padding(
+                                    padding: EdgeInsets.only(left: 4),
+                                    child: Icon(Icons.chevron_left,
+                                        size: 18),
+                                  ),
+                                Expanded(
+                                  child: Semantics(
+                                    button: true,
+                                    label: hasTrack
+                                        ? 'Now playing ${display.title} by ${display.displayArtist()}. Tap to expand player.'
+                                        : 'Mini player',
+                                    child: GestureDetector(
+                                      behavior:
+                                          HitTestBehavior.opaque,
+                                      onTap: () {
+                                        if (hasTrack) {
+                                          openPlayerSheet(context);
+                                        }
+                                      },
+                                      onTapDown: (_) {
+                                        try {
+                                          setState(() =>
+                                              _pressed = true);
+                                        } catch (_) {}
+                                      },
+                                      onTapUp: (_) {
+                                        try {
+                                          setState(() =>
+                                              _pressed = false);
+                                        } catch (_) {}
+                                      },
+                                      onTapCancel: () {
+                                        try {
+                                          setState(() =>
+                                              _pressed = false);
+                                        } catch (_) {}
+                                      },
+                                      child: ListTile(
+                                    dense: true,
+                                    contentPadding:
+                                        const EdgeInsets.symmetric(
+                                            horizontal: 8),
+                                    leading: _MiniArt(
+                                        track: display),
+                                    title: Text(
+                                      display.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                              color: glassText(dark),
+                              fontSize: 14,
+                              fontWeight: FontWeight.w600,
+                              letterSpacing: -0.1,
+                              height: 1.25),
+                        ),
+                        subtitle: Text(
+                          display.displayArtist(),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                              color: glassSubtext(dark),
+                              fontSize: 12,
+                              height: 1.3),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                ConstrainedBox(
+                  constraints:
+                      const BoxConstraints(maxWidth: 120),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      StreamBuilder<PlayerState>(
                               stream: state.controller.player.playerStateStream,
                               builder: (_, snap) {
                                 final playing =
@@ -135,44 +247,133 @@ class _MiniPlayerState extends State<_MiniBodyHost>
                                         ProcessingState.buffering ||
                                     state.controller.resolving;
                                 if (loading) {
-                                  return const SizedBox(
-                                    width: 40,
-                                    height: 40,
-                                    child: Padding(
-                                      padding: EdgeInsets.all(8),
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
+                                  return Row(
+                                    mainAxisSize:
+                                        MainAxisSize.min,
+                                    children: [
+                                      const SizedBox(
+                                        width: 30,
+                                        height: 30,
+                                        child: Padding(
+                                          padding:
+                                              EdgeInsets.all(
+                                                  5),
+                                          child:
+                                              CircularProgressIndicator(
+                                            strokeWidth:
+                                                2,
+                                          ),
+                                        ),
                                       ),
-                                    ),
+                                      IconButton(
+                                        iconSize: trailingIconSize,
+                                        icon: const Icon(Icons
+                                            .skip_next),
+                                        color: Theme.of(
+                                                context)
+                                            .colorScheme
+                                            .onSurface,
+                                        tooltip: 'Next',
+                                        onPressed: () =>
+                                            state.controller
+                                                .next(),
+                                      ),
+                                    ],
                                   );
                                 }
-                                // Spotify mini style: theme-ink glyph, no fill
-                                // (white-on-dark, black-on-light).
-                                return IconButton(
-                                  iconSize: 32,
-                                  icon: Icon(
-                                    playing ? Icons.pause : Icons.play_arrow,
-                                  ),
-                                  color: Theme.of(context)
-                                      .colorScheme
-                                      .onSurface,
-                                  tooltip: playing ? 'Pause' : 'Play',
-                                  onPressed: () =>
-                                      state.controller.togglePlay(),
+                                // Reference mini style: plain white
+                                // glyphs, pause + next, no fill.
+                                // Play/pause morph: scale + rotation (180ms).
+                                return Row(
+                                  mainAxisSize:
+                                      MainAxisSize.min,
+                                  children: [
+                                    IconButton(
+                                      iconSize: trailingIconSize,
+                                      icon: AnimatedSwitcher(
+                                        duration: Duration(
+                                            milliseconds:
+                                                state.motionMs(
+                                                    180)),
+                                        transitionBuilder:
+                                            (child, anim) {
+                                          final curved =
+                                              CurvedAnimation(
+                                                  parent: anim,
+                                                  curve: Curves
+                                                      .easeOut);
+                                          return ScaleTransition(
+                                            scale: Tween<
+                                                        double>(
+                                                    begin: 0.6,
+                                                    end: 1.0)
+                                                .animate(
+                                                    curved),
+                                            child:
+                                                RotationTransition(
+                                              turns: Tween<
+                                                      double>(
+                                                  begin:
+                                                      -0.12,
+                                                  end: 0.0)
+                                                  .animate(
+                                                      curved),
+                                              child: FadeTransition(
+                                                  opacity:
+                                                      curved,
+                                                  child:
+                                                      child),
+                                            ),
+                                          );
+                                        },
+                                        child: Icon(
+                                          playing
+                                              ? Icons.pause
+                                              : Icons
+                                                  .play_arrow,
+                                          key: ValueKey<bool>(
+                                              playing),
+                                        ),
+                                      ),
+                                      color: Theme.of(
+                                              context)
+                                          .colorScheme
+                                          .onSurface,
+                                      tooltip: playing
+                                          ? 'Pause'
+                                          : 'Play',
+                                      onPressed: () =>
+                                          state.controller
+                                              .togglePlay(),
+                                    ),
+                                    IconButton(
+                                      iconSize: trailingIconSize,
+                                      icon: const Icon(Icons
+                                          .skip_next),
+                                      color: Theme.of(
+                                              context)
+                                          .colorScheme
+                                          .onSurface,
+                                      tooltip: 'Next',
+                                      onPressed: () =>
+                                          state.controller
+                                              .next(),
+                                    ),
+                                  ],
                                 );
                               },
                             ),
-                          ],
-                        ),
-                      ),
-                    ),
+                    ],
+                  ),
+                ),
                     if (_peekLeft)
                       const Padding(
                         padding: EdgeInsets.only(right: 4),
-                        child: Icon(Icons.chevron_right, size: 20),
+                        child: Icon(Icons.chevron_right, size: 18),
                       ),
                   ],
-                ),
+                              ),
+                            ),
                 if (state.controller.errorLine != null)
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -188,9 +389,13 @@ class _MiniPlayerState extends State<_MiniBodyHost>
             ),
           ),
         ),
-        ),
       ),
-    );
+    ),
+  ),
+  ),
+  ),
+),
+);
   }
 }
 
@@ -200,18 +405,42 @@ class _MiniArt extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(width: 40, height: 40, child: _ArtProxy(track: track));
+    // Artwork crossfade on track change (320ms, subtle 0.96→1 scale).
+    final state = AppScope.of(context);
+    return SizedBox(
+      width: 44,
+      height: 44,
+      child: AnimatedSwitcher(
+        duration: Duration(milliseconds: state.motionMs(320)),
+        transitionBuilder: (child, anim) {
+          final curved =
+              CurvedAnimation(parent: anim, curve: Curves.easeOut);
+          return FadeTransition(
+            opacity: curved,
+            child: ScaleTransition(
+              scale:
+                  Tween<double>(begin: 0.96, end: 1.0).animate(curved),
+              child: child,
+            ),
+          );
+        },
+        child: _ArtProxy(key: ValueKey(track.id), track: track),
+      ),
+    );
   }
 }
 
 class _ArtProxy extends StatelessWidget {
   final YtTrack track;
-  const _ArtProxy({required this.track});
+  const _ArtProxy({super.key, required this.track});
 
   @override
   Widget build(BuildContext context) {
     // Reuses the row art (cached thumb + gradient fallback).
-    return TrackArt(track: track, size: 40);
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(10),
+      child: TrackArt(track: track, size: 44),
+    );
   }
 }
 
@@ -229,13 +458,31 @@ class _Progress extends StatelessWidget {
         final f = total.inMilliseconds <= 0
             ? 0.0
             : (pos.inMilliseconds / total.inMilliseconds).clamp(0.0, 1.0);
-        return ExcludeSemantics(
-          child: LinearProgressIndicator(
-            value: f,
-            minHeight: 2,
-            backgroundColor: Theme.of(context)
-                .colorScheme
-                .surfaceContainerHighest,
+        // Smooth the bar between position ticks (no setState storms:
+        // the stream drives rebuilds, TweenAnimationBuilder eases the
+        // painted value between them; transform/opacity-free paint).
+        return TweenAnimationBuilder<double>(
+          duration: Duration(milliseconds: state.motionMs(200)),
+          curve: Curves.linear,
+          tween: Tween<double>(begin: 0, end: f),
+          builder: (_, value, _) => ExcludeSemantics(
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(2),
+              child: LinearProgressIndicator(
+              value: value,
+              minHeight: 2.5,
+              backgroundColor: Theme.of(context)
+                  .colorScheme
+                  .surfaceContainerHighest
+                  .withValues(alpha: 0.6),
+              valueColor: AlwaysStoppedAnimation<Color>(
+                Theme.of(context)
+                    .colorScheme
+                    .onSurface
+                    .withValues(alpha: 0.9),
+              ),
+              ),
+            ),
           ),
         );
       },
@@ -272,9 +519,22 @@ class _EqBarsState extends State<_EqBars> with SingleTickerProviderStateMixin {
 
   @override
   Widget build(BuildContext context) {
-    if (!widget.running) {
+    bool motionOn = true;
+    try {
+      motionOn = AppScope.of(context).motionOn;
+    } catch (_) {}
+    // Kill-switch: freeze on static bars instead of repeating.
+    if (!widget.running || !motionOn) {
+      try {
+        if (_c.isAnimating) _c.stop();
+      } catch (_) {}
       return const SizedBox(width: 18, height: 18);
     }
+    try {
+      if (!_c.isAnimating) {
+        _c.repeat(reverse: true);
+      }
+    } catch (_) {}
     final color = Theme.of(context).colorScheme.primary;
     return AnimatedBuilder(
       animation: _c,

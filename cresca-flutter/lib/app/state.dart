@@ -15,9 +15,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-import '../audio/playback.dart';
+import '../audio/playback.dart' hide audioCacheDirName;
 import '../auth/session.dart';
 import '../auth/spotify.dart';
+import '../core/discovery.dart';
 import '../core/home_feed.dart';
 import '../core/motion.dart';
 import '../core/queue.dart';
@@ -30,6 +31,12 @@ import '../data/repository.dart';
 import '../data/resolve.dart';
 import '../jam/protocol.dart';
 import '../jam/session.dart';
+import '../podcasts/models.dart';
+import '../podcasts/playback_support.dart';
+import '../podcasts/service.dart';
+import '../podcasts/store.dart';
+import 'package:just_audio/just_audio.dart' show AudioPlayer;
+import '../system/live_updates.dart';
 import 'crash.dart';
 import 'downloads.dart';
 import 'library.dart';
@@ -45,6 +52,69 @@ class RailData {
   const RailData(this.section, this.tracks);
 }
 
+/// Songs-only gate for every home/see-all/suggestion list: honest
+/// playable tracks only. Drops playlist/video/podcast cards and other
+/// non-playable rows (shorts/reels, junk titles, bad ids, blank
+/// titles). Repository parsers already S3-gate network payloads; this
+/// is the defensive display-side pass over cached + mixed-source
+/// lists. Never throws.
+bool isPlayableSongTrack(YtTrack t) {
+  try {
+    if (t.id.length != 11) return false;
+    if (!RegExp(r'^[A-Za-z0-9_-]{11}$').hasMatch(t.id)) return false;
+    if (t.title.trim().isEmpty) return false;
+    if (isShortsUrl(t.watchUrl) || isReelEndpoint(t.watchUrl)) {
+      return false;
+    }
+    if (isMusicJunk(t.title, t.artist)) return false;
+    try {
+      final vid = extractVideoId(t.watchUrl);
+      if (vid != null && vid != t.id) return false;
+      if (vid == null && !t.watchUrl.contains(t.id)) return false;
+    } catch (_) {
+      return false;
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+/// Songs-only filter: playable tracks only, deduped, order-kept.
+List<YtTrack> songsOnlyTracks(List<YtTrack> tracks) {
+  try {
+    final seen = <String>{};
+    final out = <YtTrack>[];
+    for (final t in tracks) {
+      try {
+        if (!isPlayableSongTrack(t)) continue;
+        if (seen.add(t.id)) out.add(t);
+      } catch (_) {}
+    }
+    return out;
+  } catch (_) {
+    return [];
+  }
+}
+
+/// Minimum playable tracks for a rail to be shown (never empty rails).
+const int minRailTracks = 3;
+
+/// Defensive wrapper over the discovery crew's vibe ranking
+/// ([rankByVibe]): ranked pool on success, input order on any failure.
+List<YtTrack> rankByVibeDefensive(
+  YtTrack seed,
+  List<YtTrack> pool, {
+  Set<String> relatedIds = const {},
+}) {
+  try {
+    if (pool.length < 2) return List.of(pool);
+    return rankByVibe(seed, pool, relatedIds: relatedIds);
+  } catch (_) {
+    return List.of(pool);
+  }
+}
+
 class AppState extends ChangeNotifier {
   final Directory filesDir;
   late final YoutubeRepository repo;
@@ -56,12 +126,29 @@ class AppState extends ChangeNotifier {
   late final DetailsStore details = DetailsStore();
   late final JamSession jam;
   String jamName = '';
+
+  /// Live Updates driver (Y2). Toggle in Profile; API-36-gated
+  /// natively, silent elsewhere.
+  final LiveUpdates live = LiveUpdates();
+  bool liveEnabled = true;
   AppLinks? _jamLinks;
   StreamSubscription? _jamLinkSub;
   final YtSession ytSession = YtSession();
   final SpotifySession spotify = SpotifySession();
   final UpdateChecker updates = UpdateChecker();
   SharedPreferences? prefs;
+
+  /// Podcast slice (MVP integration): subscriptions + resume store,
+  /// network service, episode identity registry, rate + sleep timer.
+  /// Episodes ride the normal queue as YtTrack; [episodeIds] marks
+  /// which ids are episodes so lyrics fetch and music autoplay refill
+  /// skip them. All silent, additive, never throws.
+  late final PodcastStore podcastStore;
+  late PodcastService podcastService;
+  final Set<String> episodeIds = <String>{};
+  double podcastSpeed = 1.0;
+  SleepTimer? _episodeSleep;
+  final Map<String, int> _epSaveAtMs = <String, int>{};
 
   /// Pending update (banner source, H9/Y4).
   AppUpdate? pendingUpdate;
@@ -76,10 +163,74 @@ class AppState extends ChangeNotifier {
   bool motionOn = false;
   int refreshCount = 0;
 
+  /// Where the current queue was started (Home / Search / Library /
+  /// Radio / Trending / Playlist …). Shown as "Playing from X" in the
+  /// full player (reference UI). Defaults to Search.
+  String playOrigin = 'Search';
+
   HomeStatus homeStatus = HomeStatus.loading;
   String homeError = '';
   List<YtTrack> topPicks = [];
   HomeSection topSeed = HomeFeed.topSeeds.first;
+
+  /// Taste pool behind Top Picks: every fetched wave accumulates here
+  /// (deduped, capped) so per-visit rotation + pull-to-refresh can
+  /// re-rank from breadth instead of reshuffling the same 15.
+  final List<YtTrack> _topPool = [];
+
+  void _noteTopPool(List<YtTrack> ts) {
+    try {
+      final seen = {for (final t in _topPool) t.id};
+      for (final t in ts) {
+        if (t.id.isEmpty || !seen.add(t.id)) continue;
+        _topPool.add(t);
+      }
+      while (_topPool.length > 60) {
+        _topPool.removeAt(0);
+      }
+    } catch (_) {}
+  }
+
+  /// Per-visit refresh (called when the Home tab is selected):
+  /// rotates the seed title, re-ranks the accumulated pool with the
+  /// current taste + a fresh rotation salt, and repaints — no network,
+  /// instant, visibly different every visit. Falls back to the current
+  /// list when the pool is thin.
+  void visitHome() {
+    try {
+      refreshCount++;
+      try {
+        final p = prefs;
+        if (p != null) {
+          unawaited(Future(() => p.setInt(
+              'home_refresh_count', refreshCount)));
+        }
+      } catch (_) {}
+      topSeed = HomeFeed.topSeed(refreshCount);
+      if (_topPool.length >= 6) {
+        try {
+          final taste = buildTasteProfile(
+            recent: library.recent,
+            liked: library.liked,
+          );
+          final ranked = rankTopPicks(
+            List.of(_topPool),
+            taste: taste,
+            recentIds: {
+              for (final t in library.recent) t.id
+            },
+            likedIds: {
+              for (final t in library.liked) t.id
+            },
+            max: 15,
+            rotationSalt: refreshCount,
+          );
+          if (ranked.length >= 3) topPicks = ranked;
+        } catch (_) {}
+      }
+      notifyListeners();
+    } catch (_) {}
+  }
   List<RailData> rails = [];
   int discoveryCycle = 0;
 
@@ -145,6 +296,31 @@ class AppState extends ChangeNotifier {
       cacheDir: filesDir,
     );
     controller.onSaveSession = _writeSession;
+    // Notification like heart: toggles the current track's like and
+    // reports its state for the filled/outline icon. Toggling in-app
+    // re-broadcasts so the notification flips too.
+    controller.onLikeToggle = () async {
+      try {
+        final cur = controller.engine.current;
+        if (cur == null) return;
+        await library.toggleLike(cur);
+        notifyListeners();
+      } catch (_) {}
+    };
+    controller.isCurrentLiked = () {
+      try {
+        final cur = controller.engine.current;
+        if (cur == null) return false;
+        return library.isLiked(cur.id);
+      } catch (_) {
+        return false;
+      }
+    };
+    controller.onBundleResolved = (track, bundle) {
+      try {
+        details.rememberMeta(track.id, bundle.meta);
+      } catch (_) {}
+    };
     controller.onError = (m) {
       try {
         notifyListeners();
@@ -152,6 +328,19 @@ class AppState extends ChangeNotifier {
     };
     library = LibraryStore(filesDir);
     crash = CrashLog(filesDir);
+    // Podcast stores load off the hot path (backgrounded, never
+    // awaited — boot must not wait on them).
+    podcastStore = PodcastStore(filesDir);
+    unawaited(podcastStore.load());
+    try {
+      podcastService = PodcastService(
+          visitorData: ytSession.visitorData);
+    } catch (_) {
+      podcastService = PodcastService();
+    }
+    try {
+      podcastSpeed = prefs?.getDouble('podcast_speed') ?? 1.0;
+    } catch (_) {}
     downloads = DownloadStore(
       filesDir,
       publicDir: _deviceMusicDir(),
@@ -190,24 +379,65 @@ class AppState extends ChangeNotifier {
     controller.onAdvanced = () async {
       try {
         jam.onPlayerEvent();
+        unawaited(liveTrackChanged());
         await ensureRadioTail();
       } catch (_) {}
     };
     controller.onQueueChanged = () {
       try {
         jam.onPlayerEvent();
+        unawaited(liveTrackChanged());
         notifyListeners();
       } catch (_) {}
     };
     controller.onTransportChanged = () {
       try {
         jam.onPlayerEvent();
+        unawaited(liveTransport());
         notifyListeners();
       } catch (_) {}
     };
+    // Live Updates (Y2): 10 s ticker reads position/play state.
+    // Piggybacks per-episode resume persistence (30 s cadence,
+    // near-end clears the bookmark so finished episodes restart).
+    try {
+      live.startTicker(() async {
+        try {
+          final cur = controller.engine.current;
+          if (cur == null) return null;
+          final pos = controller.player.position.inSeconds;
+          final playing = controller.player.playing;
+          try {
+            if (episodeIds.contains(cur.id)) {
+              final nowMs =
+                  DateTime.now().millisecondsSinceEpoch;
+              final last = _epSaveAtMs[cur.id] ?? 0;
+              if (nowMs - last > 30000) {
+                _epSaveAtMs[cur.id] = nowMs;
+                int durMs = 0;
+                try {
+                  durMs = controller.player.duration
+                          ?.inMilliseconds ??
+                      0;
+                } catch (_) {}
+                final posMs = pos * 1000;
+                final done =
+                    durMs > 0 && durMs - posMs < 15000;
+                unawaited(podcastStore.saveProgress(
+                    cur.id, done ? 0 : posMs));
+              }
+            }
+          } catch (_) {}
+          return (pos, playing, true);
+        } catch (_) {
+          return null;
+        }
+      });
+    } catch (_) {}
     // JAM create rate-limit client side falls back to the server.
     try {
       jamName = prefs?.getString('jam_name') ?? '';
+      liveEnabled = prefs?.getBool('live_updates') ?? true;
     } catch (_) {}
     // JAM deep links (cresca://jam/CODE): prefill + auto-join (F2).
     try {
@@ -232,7 +462,14 @@ class AppState extends ChangeNotifier {
       await library.load();
       await downloads.load();
       await controller.init();
-      await _restoreSession();
+      // Boot guarantee: session restore resolves the previous queue's
+      // URLs, which can grind for minutes on throttled networks
+      // (retry storms). Bound it — boot must never wait on it; a late
+      // restore still lands the queue when it finishes.
+      try {
+        await _restoreSession()
+            .timeout(const Duration(seconds: 10));
+      } catch (_) {}
       await _restoreUrlCache();
     } catch (e) {
       try {
@@ -256,6 +493,8 @@ class AppState extends ChangeNotifier {
       _debounce?.cancel();
       _jamLinkSub?.cancel();
       jam.dispose();
+      live.stopTicker();
+      unawaited(live.stop());
       downloads.dispose();
       details.dispose();
       controller.dispose();
@@ -265,12 +504,81 @@ class AppState extends ChangeNotifier {
     super.dispose();
   }
 
+  /// Live Updates: (re)start the card for the current track (Y2) +
+  /// one-shot notification permission (Y3). Never throws.
+  Future<void> liveTrackChanged() async {
+    try {
+      if (!liveEnabled) {
+        await live.stop();
+        return;
+      }
+      final cur = controller.engine.current;
+      if (cur == null) {
+        await live.stop();
+        return;
+      }
+      await live.ensurePermissionOnce(prefs);
+      int durSec = 0;
+      try {
+        durSec = controller.player.duration?.inSeconds ?? 0;
+      } catch (_) {}
+      await live.start(
+        trackId: cur.id,
+        title: cur.title,
+        artist: cur.displayArtist(),
+        durationSec: durSec,
+      );
+    } catch (_) {}
+  }
+
+  /// Live Updates: transport flip refresh (Y2). Never throws.
+  /// Passes the now-known duration so the status card's progress
+  /// segment stops freezing at 1 s (R3: duration is null at
+  /// track-change time, known by first transport tick).
+  Future<void> liveTransport() async {
+    try {
+      if (!liveEnabled) return;
+      final cur = controller.engine.current;
+      if (cur == null) return;
+      int pos = 0;
+      bool playing = false;
+      int durSec = 0;
+      try {
+        pos = controller.player.position.inSeconds;
+        playing = controller.player.playing;
+        durSec =
+            controller.player.duration?.inSeconds ?? 0;
+      } catch (_) {}
+      await live.progress(
+          posSec: pos,
+          playing: playing,
+          durationSec: durSec);
+    } catch (_) {}
+  }
+
+  Future<void> setLiveEnabled(bool on) async {
+    try {
+      liveEnabled = on;
+      await prefs?.setBool('live_updates', on);
+      if (on) {
+        await liveTrackChanged();
+      } else {
+        await live.stop();
+      }
+      notifyListeners();
+    } catch (_) {}
+  }
+
   /// Pushes the encrypted session into the repository (login/logout).
   void syncSessionToRepo() {
     try {
       repo.session.cookies = ytSession.cookies;
       repo.session.visitorData = ytSession.visitorData;
       repo.session.poToken = ytSession.poToken;
+      try {
+        podcastService = PodcastService(
+            visitorData: ytSession.visitorData);
+      } catch (_) {}
       notifyListeners();
     } catch (_) {}
   }
@@ -475,7 +783,7 @@ class AppState extends ChangeNotifier {
         );
       } catch (_) {}
       notifyListeners();
-      return 'Cresca ${rel.tag} available';
+      return 'Cresca Music ${rel.tag} available';
     } catch (_) {
       return 'Check failed — try again later';
     } finally {
@@ -688,6 +996,13 @@ class AppState extends ChangeNotifier {
       if (!await f.exists()) return;
       resolver.restoreUrlSnapshot(await f.readAsString());
     } catch (_) {}
+    // Bundle memo restores beside the URL cache (same floor rules live
+    // inside BundleCache; append-only schema, yt_meta.json).
+    try {
+      final f = File('${filesDir.path}/$bundleDiskFile');
+      if (!await f.exists()) return;
+      resolver.restoreBundleSnapshot(await f.readAsString());
+    } catch (_) {}
   }
 
   Future<void> persistUrlCache() async {
@@ -695,6 +1010,11 @@ class AppState extends ChangeNotifier {
       final s = resolver.encodeUrlSnapshot();
       if (s == null) return;
       await atomicWrite(File('${filesDir.path}/$urlDiskFile'), s);
+    } catch (_) {}
+    try {
+      final s = resolver.encodeBundleSnapshot();
+      if (s == null) return;
+      await atomicWrite(File('${filesDir.path}/$bundleDiskFile'), s);
     } catch (_) {}
   }
 
@@ -711,7 +1031,10 @@ class AppState extends ChangeNotifier {
       } else {
         out = await repo.searchMusic(s.query, max: 15);
       }
-      return out;
+      // Songs-only: honest playable tracks; thin lists drop the rail.
+      final clean = songsOnlyTracks(out);
+      if (clean.length < minRailTracks) return [];
+      return clean;
     } catch (e) {
       return [];
     }
@@ -732,10 +1055,14 @@ class AppState extends ChangeNotifier {
       topSeed = HomeFeed.topSeed(refreshCount);
       // Wave 0: instant cached paint.
       try {
-        final cachedTop =
+        final cachedTopRaw =
             await repo.loadSnapshot('home_top', homeCacheTtlMs);
-        if (cachedTop != null && cachedTop.isNotEmpty) {
+        final cachedTop = cachedTopRaw == null
+            ? <YtTrack>[]
+            : songsOnlyTracks(cachedTopRaw);
+        if (cachedTop.isNotEmpty) {
           topPicks = cachedTop;
+          _noteTopPool(cachedTop);
           notifyListeners();
         }
         final cachedRails = <RailData>[];
@@ -743,7 +1070,11 @@ class AppState extends ChangeNotifier {
           try {
             final c = await repo.loadSnapshot(
                 s.cacheKey, HomeFeed.sectionTtlMs);
-            if (c != null && c.isNotEmpty) cachedRails.add(RailData(s, c));
+            final clean =
+                c == null ? <YtTrack>[] : songsOnlyTracks(c);
+            if (clean.length >= minRailTracks) {
+              cachedRails.add(RailData(s, clean));
+            }
           } catch (_) {}
         }
         // Cached server-driven browse rails (YTM titles preserved).
@@ -755,7 +1086,9 @@ class AppState extends ChangeNotifier {
               if (parts.length != 3) continue;
               final c = await repo.loadSnapshot(
                   parts[1], HomeFeed.sectionTtlMs);
-              if (c != null && c.isNotEmpty) {
+              final clean =
+                  c == null ? <YtTrack>[] : songsOnlyTracks(c);
+              if (clean.length >= minRailTracks) {
                 cachedRails.insert(
                     0,
                     RailData(
@@ -764,7 +1097,7 @@ class AppState extends ChangeNotifier {
                             subtitle: 'YouTube Music',
                             query: parts[2],
                             cacheKey: parts[1]),
-                        c));
+                        clean));
               }
             } catch (_) {}
           }
@@ -780,10 +1113,14 @@ class AppState extends ChangeNotifier {
       // Server-driven YTM shelves first (native HomeFeed shape: Quick
       // Picks → new releases → moods/charts): FEmusic_home browse,
       // real YTM titles kept ("Quick picks", "New releases", ...).
+      // Browse POSTs carry the signed-in session cookies (client
+      // headers), so these shelves are already personalized to the
+      // connected YT account when one exists.
       // Playlist-card shelves ("Featured playlists...") are skipped —
       // cards aren't playable tracks (honest rails only, H8).
-      final topFuture = repo
-          .searchMusic(topSeed.query, max: 15)
+      // Top Picks: taste-first (related seeds from YOUR plays) when
+      // taste exists, query fallback for cold starts.
+      final topFuture = _topPicksTaste()
           .timeout(const Duration(seconds: 30))
           .catchError((_) => <YtTrack>[]);
       final browseFuture = repo
@@ -812,10 +1149,13 @@ class AppState extends ChangeNotifier {
           }
           rails = _mergeRails(fresh);
           if (topPicks.isEmpty) {
-            final t = await topFuture;
-            if (t.isNotEmpty) {
-              topPicks = t;
-              unawaited(repo.saveSnapshot('home_top', t));
+            final raw = await topFuture;
+            // Songs-only: honest playable tracks (same gate as rails).
+            final cleanTop = songsOnlyTracks(raw);
+            if (cleanTop.isNotEmpty) {
+              topPicks = cleanTop;
+              _noteTopPool(cleanTop);
+              unawaited(repo.saveSnapshot('home_top', cleanTop));
             }
           }
           homeStatus = HomeStatus.ready;
@@ -824,10 +1164,12 @@ class AppState extends ChangeNotifier {
         } catch (_) {}
       }
       try {
-        final t = await topFuture;
-        if (t.isNotEmpty) {
-          topPicks = t;
-          unawaited(repo.saveSnapshot('home_top', t));
+        final raw = await topFuture;
+        final cleanTop = songsOnlyTracks(raw);
+        if (cleanTop.isNotEmpty) {
+          topPicks = cleanTop;
+          _noteTopPool(cleanTop);
+          unawaited(repo.saveSnapshot('home_top', cleanTop));
         }
       } catch (_) {}
 
@@ -842,7 +1184,10 @@ class AppState extends ChangeNotifier {
           try {
             final title = e.key.trim();
             final low = title.toLowerCase();
-            if (title.isEmpty || e.value.length < 3) continue;
+            // Songs-only: drop playlist/video/podcast cards and other
+            // non-playable rows; thin lists drop the rail.
+            final cleanBrowse = songsOnlyTracks(e.value);
+            if (title.isEmpty || cleanBrowse.length < minRailTracks) continue;
             if (low.contains('playlist') ||
                 low.contains('chart') ||
                 low.contains('video')) {
@@ -858,8 +1203,8 @@ class AppState extends ChangeNotifier {
             if (fresh.any((r) => r.section.cacheKey == sec.cacheKey)) {
               continue;
             }
-            fresh.add(RailData(sec, e.value.take(15).toList()));
-            unawaited(repo.saveSnapshot(sec.cacheKey, e.value));
+            fresh.add(RailData(sec, cleanBrowse.take(15).toList()));
+            unawaited(repo.saveSnapshot(sec.cacheKey, cleanBrowse));
             touched = true;
             if (fresh
                     .where((r) => r.section.query
@@ -878,10 +1223,13 @@ class AppState extends ChangeNotifier {
                   .any((r) => r.section.cacheKey == 'home_pl_$bid')) {
                 continue;
               }
-              final tracks = await repo
+              final rawPl = await repo
                   .playlistTracks(bid, max: 15)
                   .timeout(const Duration(seconds: 25));
-              if (tracks.length < 3) continue;
+              // Songs-only: playlist cards resolve to tracks, but cards
+              // can still surface videos/junk — gate + drop thin rails.
+              final tracks = songsOnlyTracks(rawPl);
+              if (tracks.length < minRailTracks) continue;
               final sec = HomeSection(
                 title: card,
                 subtitle: shelf,
@@ -892,6 +1240,54 @@ class AppState extends ChangeNotifier {
               unawaited(repo.saveSnapshot(sec.cacheKey, tracks));
               touched = true;
             } catch (_) {}
+          }
+        } catch (_) {}
+        // Charts For You: global chart pool re-ranked by YOUR taste
+        // (mood/energy/language/era fit, same-singer penalized) when
+        // taste exists; raw chart order for cold starts. Thin → dropped.
+        try {
+          final chartRaw = await repo
+              .chartTopVideos(max: 25)
+              .timeout(const Duration(seconds: 20));
+          final cleanChart = songsOnlyTracks(chartRaw);
+          if (cleanChart.length >= minRailTracks &&
+              !fresh.any((r) =>
+                  r.section.cacheKey == 'home_charts_for_you')) {
+            var chartTracks = cleanChart;
+            try {
+              if (library.recent.isNotEmpty ||
+                  library.liked.isNotEmpty) {
+                final ranked = rankTopPicks(
+                  List.of(cleanChart),
+                  taste: buildTasteProfile(
+                    recent: library.recent,
+                    liked: library.liked,
+                  ),
+                  recentIds: {
+                    for (final t in library.recent) t.id
+                  },
+                  likedIds: {
+                    for (final t in library.liked) t.id
+                  },
+                  max: cleanChart.length,
+                  rotationSalt: refreshCount,
+                );
+                if (ranked.length >= minRailTracks) {
+                  chartTracks = ranked;
+                }
+              }
+            } catch (_) {}
+            fresh.add(RailData(
+                const HomeSection(
+                  title: 'Charts For You',
+                  subtitle: 'Matched to your taste',
+                  query: '__charts_for_you__',
+                  cacheKey: 'home_charts_for_you',
+                ),
+                chartTracks.take(15).toList()));
+            unawaited(repo.saveSnapshot(
+                'home_charts_for_you', chartTracks));
+            touched = true;
           }
         } catch (_) {}
         if (touched) {
@@ -942,11 +1338,17 @@ class AppState extends ChangeNotifier {
         HomeFeed.released.title,
         ...HomeFeed.core.map((e) => e.title)
       ];
+      final orderSet = order.toSet();
       final byTitle = {for (final r in rest) r.section.title: r};
       return [
         ...browse,
         for (final t in order)
           if (byTitle[t] != null) byTitle[t]!,
+        // Personalized rails (Because-you-played / New-from-artists /
+        // More-like) are not in the fixed catalog order — append them
+        // in arrival order instead of dropping them.
+        for (final r in rest)
+          if (!orderSet.contains(r.section.title)) r,
       ];
     } catch (_) {
       return fresh;
@@ -955,31 +1357,64 @@ class AppState extends ChangeNotifier {
 
   Future<void> _loadPersonalized(List<RailData> fresh) async {
     try {
-      final seeds = library.recent.take(2).toList();
-      for (final s in seeds) {
-        try {
-          final rel = await repo.relatedTracks(s.watchUrl, max: 12);
-          if (rel.length >= 3) {
-            fresh.add(RailData(
-              HomeSection(
-                  title: 'Because you played ${s.displayArtist()}',
-                  subtitle: 'Related mix',
-                  query: '__related__${s.id}',
-                  cacheKey: 'home_because_${s.id}'),
-              rel,
-            ));
-          }
-        } catch (_) {}
-      }
       final likedArtists =
           library.liked.map((e) => e.displayArtist()).toList();
       final recentArtists =
           library.recent.map((e) => e.displayArtist()).toList();
+      // Because-you-played (2 seeds): related graph → songs-only →
+      // vibe-ranked around the seed (defensive: input order on any
+      // scoring failure), thin lists drop the rail.
+      final seeds = songsOnlyTracks(library.recent.take(2).toList());
+      for (final s in seeds) {
+        try {
+          final rel = await repo.relatedTracks(s.watchUrl, max: 12);
+          final clean = songsOnlyTracks(rel);
+          if (clean.length < minRailTracks) continue;
+          final ranked = rankByVibeDefensive(
+            s,
+            clean,
+            relatedIds: rel.map((e) => e.id).toSet(),
+          ).take(12).toList();
+          if (ranked.length < minRailTracks) continue;
+          fresh.add(RailData(
+            HomeSection(
+                title: 'Because you played ${s.displayArtist()}',
+                subtitle: 'Related mix',
+                query: '__related__${s.id}',
+                cacheKey: 'home_because_${s.id}'),
+            ranked,
+          ));
+        } catch (_) {}
+      }
+      // New-from-your-artists: repository scoring (per-artist searches
+      // round-robin interleaved), songs-only, thin lists drop the rail.
+      try {
+        final artistSeeds = HomeFeed.artistSeeds(
+            [...likedArtists, ...recentArtists], 3);
+        if (artistSeeds.isNotEmpty) {
+          final freshHits =
+              await repo.newReleases(artistSeeds, max: 12);
+          final cleanFresh = songsOnlyTracks(freshHits);
+          if (cleanFresh.length >= minRailTracks) {
+            fresh.add(RailData(
+              const HomeSection(
+                  title: 'New From Your Artists',
+                  subtitle: 'Fresh from your rotation',
+                  query: '__new__artists',
+                  cacheKey: 'home_new_artists'),
+              cleanFresh.take(12).toList(),
+            ));
+          }
+        }
+      } catch (_) {}
       for (final sec in HomeFeed.personalized(likedArtists, recentArtists,
           max: 2)) {
         try {
           final hits = await repo.searchMusic(sec.query, max: 12);
-          if (hits.isNotEmpty) fresh.add(RailData(sec, hits));
+          final clean = songsOnlyTracks(hits);
+          if (clean.length >= minRailTracks) {
+            fresh.add(RailData(sec, clean));
+          }
         } catch (_) {}
       }
       rails = _mergeRails(fresh);
@@ -988,29 +1423,145 @@ class AppState extends ChangeNotifier {
   }
 
   /// Endless discovery rails (H4): appended as the user scrolls.
+  /// Prefetch contract: the UI fires ~1.5 screens before the end; this
+  /// stays single-flight via [_discoveryLoading] (no duplicate page
+  /// fetches, no stampedes on fast flings), dedupes by cacheKey, applies
+  /// the same songs-only + min-rail gates as initial rails (inside
+  /// [_fetchSection]), advances [discoveryCycle] on every settled page
+  /// so rotation never repeats shown rails, and surfaces honest
+  /// loading/end/error flags for the bottom slot.
   bool _discoveryLoading = false;
+  bool get discoveryLoading => _discoveryLoading;
+  bool discoveryHasMore = true;
+  String discoveryError = '';
+  int _discoveryMisses = 0;
+  int _discoveryPages = 0;
+  int _discoverySeenLen = -1;
+  static const int _discoveryMaxMisses = 6;
+  static const int _discoveryMaxPages = 42; // 14 pool x 3 cycle suffixes
   Future<void> loadMoreDiscovery() async {
     if (_discoveryLoading) return;
-    _discoveryLoading = true;
+    if (!discoveryHasMore) return;
+    // Fresh load replaced the list (pull-to-refresh / revisit): reopen
+    // paging but keep the cycle advancing so pages stay fresh.
     try {
-      final pos = rails.length;
-      final sec = HomeFeed.discoveryAt(pos, discoveryCycle);
-      if (rails.any((r) => r.section.cacheKey == sec.cacheKey)) {
-        discoveryCycle++;
-        return;
+      if (_discoverySeenLen >= 0 && rails.length < _discoverySeenLen) {
+        discoveryHasMore = true;
+        discoveryError = '';
+        _discoveryMisses = 0;
+        _discoveryPages = 0;
       }
-      final hits = await _fetchSection(sec);
-      if (hits.isNotEmpty) {
+      _discoverySeenLen = rails.length;
+    } catch (_) {}
+    if (rails.isEmpty) return; // initial load owns the empty state
+    _discoveryLoading = true;
+    discoveryError = '';
+    try {
+      notifyListeners(); // paint the bottom skeleton immediately
+    } catch (_) {}
+    try {
+      final shown = {for (final r in rails) r.section.cacheKey};
+      var skippedDupesOnly = true;
+      for (var attempt = 0; attempt < 4; attempt++) {
+        HomeSection sec;
+        try {
+          sec = HomeFeed.discoveryAt(rails.length + attempt, discoveryCycle);
+        } catch (_) {
+          break;
+        }
+        if (shown.contains(sec.cacheKey) ||
+            rails.any((r) => r.section.cacheKey == sec.cacheKey)) {
+          discoveryCycle++;
+          continue;
+        }
+        List<YtTrack> hits;
+        try {
+          hits = await _fetchSection(sec);
+        } catch (_) {
+          hits = <YtTrack>[];
+        }
+        if (hits.isEmpty) {
+          // Thin/offline page: rotate past it, count toward an end.
+          _discoveryMisses++;
+          discoveryCycle++;
+          skippedDupesOnly = false;
+          continue;
+        }
+        // Taste stays live across pages: re-rank the appended page
+        // around current taste; rotationSalt = cycle + length so pages
+        // vary instead of repeating. Membership unchanged, so the
+        // songs-only + min-rail gates from [_fetchSection] still hold.
+        try {
+          if (library.recent.isNotEmpty || library.liked.isNotEmpty) {
+            final ranked = rankTopPicks(
+              List.of(hits),
+              taste: buildTasteProfile(
+                recent: library.recent,
+                liked: library.liked,
+              ),
+              recentIds: {for (final t in library.recent) t.id},
+              likedIds: {for (final t in library.liked) t.id},
+              max: hits.length,
+              rotationSalt: discoveryCycle + rails.length,
+            );
+            if (ranked.length >= minRailTracks) hits = ranked;
+          }
+        } catch (_) {}
+        if (rails.any((r) => r.section.cacheKey == sec.cacheKey)) {
+          discoveryCycle++;
+          continue;
+        }
         rails = [...rails, RailData(sec, hits)];
         unawaited(repo.saveSnapshot(sec.cacheKey, hits));
-        notifyListeners();
-      } else {
+        _discoveryMisses = 0;
+        discoveryError = '';
         discoveryCycle++;
+        _discoveryPages++;
+        if (_discoveryPages >= _discoveryMaxPages) discoveryHasMore = false;
+        _discoverySeenLen = rails.length;
+        notifyListeners();
+        return;
       }
+      // No rail appended this round.
+      if (_discoveryMisses >= _discoveryMaxMisses ||
+          _discoveryPages >= _discoveryMaxPages) {
+        discoveryHasMore = false;
+        discoveryError = '';
+      } else if (!(skippedDupesOnly && _discoveryMisses == 0)) {
+        discoveryError =
+            'Couldn\u2019t load more. Check connection and retry.';
+      } else {
+        discoveryError = '';
+      }
+      _discoverySeenLen = rails.length;
+      notifyListeners();
     } catch (_) {
+      try {
+        discoveryError =
+            'Couldn\u2019t load more. Check connection and retry.';
+        notifyListeners();
+      } catch (_) {}
     } finally {
       _discoveryLoading = false;
+      try {
+        notifyListeners();
+      } catch (_) {}
     }
+  }
+
+  /// Retry after a discovery page failed. True end-of-catalog stays
+  /// ended; anything else reopens paging and fetches one page.
+  Future<void> retryDiscovery() async {
+    try {
+      if (_discoveryLoading) return;
+      if (!discoveryHasMore && _discoveryPages >= _discoveryMaxPages) {
+        return;
+      }
+      discoveryError = '';
+      discoveryHasMore = true;
+      notifyListeners();
+    } catch (_) {}
+    await loadMoreDiscovery();
   }
 
   Future<void> hardRefresh() async {
@@ -1021,6 +1572,35 @@ class AppState extends ChangeNotifier {
       } catch (_) {}
       await loadHome(force: true);
     } catch (_) {}
+  }
+
+  /// Taste-first Top Picks fetch: related seeds from the user's own
+  /// plays (mood/energy/language/era matched, same-singer penalized)
+  /// when taste exists; the seed-query fallback for cold starts.
+  /// Never throws; empty only when both paths miss.
+  Future<List<YtTrack>> _topPicksTaste() async {
+    try {
+      if (library.recent.length + library.liked.length >= 2) {
+        try {
+          final tp = await repo.topPicksFor(
+            library.recent,
+            liked: library.liked,
+            taste: buildTasteProfile(
+              recent: library.recent,
+              liked: library.liked,
+            ),
+            rotationSalt: refreshCount,
+            max: 15,
+          );
+          if (tp.length >= minRailTracks) return tp;
+        } catch (_) {}
+      }
+    } catch (_) {}
+    try {
+      return await repo.searchMusic(topSeed.query, max: 15);
+    } catch (_) {
+      return <YtTrack>[];
+    }
   }
 
   // ---------- trending (R1) ----------
@@ -1078,7 +1658,9 @@ class AppState extends ChangeNotifier {
 
   Future<List<YtTrack>> searchNow(String query, {int max = 15}) async {
     try {
-      final hits = await repo.searchMusic(query, max: max);
+      // Songs-only on the state-side search entry point: callers (top
+      // picks, stations, suggestions) never see cards/junk.
+      final hits = songsOnlyTracks(await repo.searchMusic(query, max: max));
       unawaited(repo.saveSnapshot('search_${query.hashCode}', hits));
       unawaited(_precacheSearchTop(hits));
       return hits;
@@ -1087,8 +1669,16 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  Future<List<YtTrack>?> searchCached(String query) =>
-      repo.loadSnapshot('search_${query.hashCode}', searchCacheTtlMs);
+  Future<List<YtTrack>?> searchCached(String query) async {
+    try {
+      final c =
+          await repo.loadSnapshot('search_${query.hashCode}', searchCacheTtlMs);
+      if (c == null) return null;
+      return songsOnlyTracks(c);
+    } catch (_) {
+      return null;
+    }
+  }
 
   Future<List<String>> suggestions(String input) =>
       repo.suggestions(input);
@@ -1120,7 +1710,8 @@ class AppState extends ChangeNotifier {
     try {
       radioLoading = true;
       notifyListeners();
-      final res = await repo.searchMusic(query, max: 20);
+      final res =
+          songsOnlyTracks(await repo.searchMusic(query, max: 20));
       if (res.isNotEmpty) {
         radioSeed = null;
         radioTracks = [];
@@ -1203,8 +1794,201 @@ class AppState extends ChangeNotifier {
   }
 
   /// Chained autoplay: ≤5 remain → extend from the tail (200 cap).
+  /// True when [id] is a podcast episode played this session (or
+  /// restored). Lyrics fetch and music autoplay refill skip these.
+  bool isEpisodeTrack(String id) {
+    try {
+      return id.isNotEmpty && episodeIds.contains(id);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Play an episode: registers its identity, resolves the resume
+  /// offset, queues the bridged track, seeks, and applies the stored
+  /// playback rate. Returns false when nothing playable happened.
+  Future<bool> playEpisode(PodcastEpisode ep,
+      {int? seekMs}) async {
+    try {
+      if (ep.id.isEmpty) return false;
+      episodeIds.add(ep.id);
+      while (episodeIds.length > 2000) {
+        try {
+          episodeIds.remove(episodeIds.first);
+        } catch (_) {
+          break;
+        }
+      }
+      final resume = seekMs ?? podcastStore.progressFor(ep.id);
+      final track = ep.toYtTrack();
+      if (track.watchUrl.isEmpty) return false;
+      playOrigin = 'Podcasts';
+      await controller.playQueue([track], 0);
+      try {
+        if (resume > 0) {
+          await controller.player
+              .seek(Duration(milliseconds: resume));
+        }
+      } catch (_) {}
+      try {
+        await applyPodcastSpeed(
+            _JustAudioSpeed(controller.player), podcastSpeed);
+      } catch (_) {}
+      notifyListeners();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Playback rate for episodes (persisted). Music playback is left
+  /// alone; the rate applies when an episode plays.
+  Future<void> setPodcastSpeed(double rate) async {
+    try {
+      podcastSpeed = await applyPodcastSpeed(
+          _JustAudioSpeed(controller.player), rate);
+      try {
+        await prefs?.setDouble('podcast_speed', podcastSpeed);
+      } catch (_) {}
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  /// Sleep timer: pauses after [minutes] (0 cancels). Countdown UI
+  /// lives in the podcast screen; this owns the firing.
+  void startEpisodeSleep(int minutes) {
+    try {
+      _episodeSleep?.cancel();
+      if (minutes <= 0) return;
+      _episodeSleep = SleepTimer(onFire: () async {
+        try {
+          await controller.player.pause();
+        } catch (_) {}
+      });
+      _episodeSleep!.startMinutes(minutes);
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  void cancelEpisodeSleep() {
+    try {
+      _episodeSleep?.cancel();
+    } catch (_) {}
+    try {
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  int sleepRemainingMs() {
+    try {
+      return _episodeSleep?.remainingMs() ?? 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /// Persist an episode bookmark now (pause / track change paths).
+  Future<void> saveEpisodeProgress() async {
+    try {
+      final cur = controller.engine.current;
+      if (cur == null || !episodeIds.contains(cur.id)) return;
+      int posMs = 0;
+      int durMs = 0;
+      try {
+        posMs =
+            controller.player.position.inMilliseconds;
+        durMs =
+            controller.player.duration?.inMilliseconds ?? 0;
+      } catch (_) {}
+      if (posMs < resumePersistMinMs) return;
+      final done = durMs > 0 && durMs - posMs < resumeNearEndMs;
+      await podcastStore.saveProgress(cur.id, done ? 0 : posMs);
+    } catch (_) {}
+  }
+
+  /// Download an episode for offline (fresh URL, existing store).
+  /// Returns true when the enqueue landed.
+  Future<bool> downloadEpisode(PodcastEpisode ep) async {
+    try {
+      if (ep.id.isEmpty) return false;
+      final url = await resolver
+          .audioUrl(ep.watchUrl.isEmpty
+              ? 'https://www.youtube.com/watch?v=${ep.id}'
+              : ep.watchUrl)
+          .timeout(const Duration(seconds: 45));
+      if (url == null || url.isEmpty) return false;
+      return await downloads.enqueue(ep.toYtTrack(), url);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  PodcastDownloadState downloadStateFor(PodcastEpisode ep) {
+    try {
+      return PodcastDownloadState(
+        downloaded: downloads.isDownloaded(ep.id),
+        downloading: downloads.isDownloading(ep.id),
+        progress: downloads.progressFor(ep.id),
+      );
+    } catch (_) {
+      return const PodcastDownloadState();
+    }
+  }
+
+  Future<void> subscribeShow(PodcastShow show) async {
+    try {
+      await podcastStore.subscribe(show);
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  Future<void> unsubscribeShow(PodcastShow show) async {
+    try {
+      await podcastStore.unsubscribe(show.id);
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  /// Follow affordance for search-result episodes: synthesizes a
+  /// title-keyed show (episodes carry no browseId) so the subs row
+  /// fills; tapping a sub searches its title.
+  Future<void> followEpisodeShow(PodcastEpisode ep) async {
+    try {
+      final name = ep.showTitle.trim();
+      if (name.isEmpty) return;
+      final slug = name
+          .toLowerCase()
+          .replaceAll(RegExp(r'[^a-z0-9]+'), '-')
+          .replaceAll(RegExp(r'^-+|-+$'), '');
+      if (slug.isEmpty) return;
+      await podcastStore.subscribe(PodcastShow(
+        id: 'title:$slug',
+        title: name,
+        thumbUrl: ep.thumbUrl,
+      ));
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  bool isShowFollowed(PodcastEpisode ep) {
+    try {
+      final name = ep.showTitle.trim();
+      if (name.isEmpty) return false;
+      return podcastStore.subs.values
+          .any((s) => s.title.trim() == name);
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<void> ensureRadioTail() async {
     try {
+      // Episodes never refill music: an episode ending stops the
+      // line instead of pulling songs behind it (MVP).
+      try {
+        final cur = controller.engine.current;
+        if (cur != null && episodeIds.contains(cur.id)) return;
+      } catch (_) {}
       if (radioTracks.isEmpty) {
         // Plain queue: top up from related once (endless fixed-20).
         final cur = controller.engine.current;
@@ -1302,12 +2086,16 @@ class AppState extends ChangeNotifier {
   bool get jamPlaybackBlocked =>
       jam.connected && !jam.isHost && !jam.guestAllowed;
 
-  Future<void> actPlay(List<YtTrack> context, int index) async {
+  Future<void> actPlay(List<YtTrack> context, int index,
+      {String? origin}) async {
     try {
       if (jamPlaybackBlocked) {
         jam.statusLine = 'Only the host controls the JAM';
         notifyListeners();
         return;
+      }
+      if (origin != null && origin.isNotEmpty) {
+        playOrigin = origin;
       }
       await controller.playQueue(context, index);
       if (context.isNotEmpty &&
@@ -1351,6 +2139,9 @@ class AppState extends ChangeNotifier {
     try {
       await library.toggleLike(t);
       notifyListeners();
+      try {
+        await controller.handler.broadcastState();
+      } catch (_) {}
     } catch (_) {}
   }
 
@@ -1389,4 +2180,27 @@ class AppState extends ChangeNotifier {
   }
 
   void unawaited(Future<void> f) {}
+}
+
+/// Structural adapter: just_audio's AudioPlayer satisfies the
+/// podcast [SpeedPlayer] surface (setSpeed + speed getter).
+class _JustAudioSpeed implements SpeedPlayer {
+  final AudioPlayer player;
+  _JustAudioSpeed(this.player);
+
+  @override
+  Future<void> setSpeed(double speed) async {
+    try {
+      await player.setSpeed(speed);
+    } catch (_) {}
+  }
+
+  @override
+  double get speed {
+    try {
+      return player.speed;
+    } catch (_) {
+      return 1.0;
+    }
+  }
 }

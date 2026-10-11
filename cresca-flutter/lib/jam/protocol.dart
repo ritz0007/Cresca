@@ -19,6 +19,62 @@ const int jamStateFloorMs = 800;
 const int jamQueueFloorMs = 1000;
 const int jamSyncFloorMs = 10 * 1000;
 
+// ---- Advance mode (v2): tight host↔guest sync, version-gated ----
+//
+// Wire compat: v1 clients send no `v`/`caps` and ignore unknown fields.
+// v2 clients send `v`+`caps` in create/join; servers echo negotiated
+// `v`+`caps` in joined. All new fields are optional on parse.
+const int jamProtoV = 2;
+const List<String> jamAdvanceCaps = [
+  'clock2', // ping burst + best-sample, reset per connection
+  'ease', // drift chase/ease bands (no rubber-banding)
+  'opid', // idempotent queue/control ops
+  'qgen', // server-authoritative queue/state generation counters
+  'ecodes', // explicit error codes with readable reasons
+  'handoff', // graceful host-handoff + degraded-mode signals
+];
+
+/// Drift bands (ms): |drift| <= ease → hold; <= chase → ease via
+/// speed nudge; beyond → hard chase (seek). No rubber-banding.
+const int jamEaseMs = 350;
+const int jamChaseMs = 2000;
+
+/// Ping cadence: fast burst on (re)connect, then cheap steady keep-warm.
+const int jamPingBurstN = 5;
+const int jamPingBurstMs = 400;
+const int jamPingSteadySec = 10;
+
+/// Reconnect ladder: 1/2/4/8 s ×4 then manual (single-flight).
+const List<int> jamRetryLadderSec = [1, 2, 4, 8];
+const int jamRetryMax = 4;
+
+/// Op-id / generation helpers (idempotent queue ops).
+int _jamOpSeq = 0;
+String jamNewOpId() =>
+    '${DateTime.now().millisecondsSinceEpoch.toRadixString(36)}-${(_jamOpSeq++ & 0xffff).toRadixString(36)}';
+
+/// Drift action for a guest: hold (in band), ease (speed nudge), or
+/// chase (seek). Pure so tests pin the bands without audio.
+String jamDriftAction(int driftMs,
+    {int easeMs = jamEaseMs, int chaseMs = jamChaseMs}) {
+  final d = driftMs.abs();
+  if (d <= easeMs) return 'hold';
+  if (d <= chaseMs) return 'ease';
+  return 'chase';
+}
+
+/// Speed nudge for the ease band: ±6%, sign follows drift (guest behind
+/// → speed up slightly, ahead → slow down). Clamped, never throws.
+double jamEaseSpeed(int driftMs) {
+  try {
+    if (driftMs > 0) return 0.94; // guest ahead → ease back
+    if (driftMs < 0) return 1.06; // guest behind → catch up
+    return 1.0;
+  } catch (_) {
+    return 1.0;
+  }
+}
+
 /// 6-letter room code (no 0/O/1/I in the generator alphabet).
 const String jamCodeAlphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
 const String jamDigitsAlphabet = '23456789';
@@ -116,11 +172,13 @@ class JamControl {
   final String id;
   final int pos;
   final String by;
+  final String opId;
   const JamControl({
     required this.action,
     this.id = '',
     this.pos = 0,
     this.by = '',
+    this.opId = '',
   });
 }
 
@@ -137,6 +195,14 @@ class JamClock {
       : localNow = localNow ?? _real;
 
   static int _real() => DateTime.now().millisecondsSinceEpoch;
+
+  /// Resets the offset estimate for a fresh connection (advance mode:
+  /// a stale offset must never poison the new socket).
+  void reset() {
+    offsetMs = 0;
+    bestRttMs = 1 << 30;
+    pingSentAt = -1;
+  }
 
   int serverNowMs([int? localNowMs]) =>
       (localNowMs ?? localNow()) + offsetMs;
@@ -203,7 +269,10 @@ class JamJoined extends JamEvent {
   final String you;
   final String host;
   final String name;
-  const JamJoined(this.code, this.you, this.host, {this.name = ''});
+  final int v;
+  final List<String> caps;
+  const JamJoined(this.code, this.you, this.host,
+      {this.name = '', this.v = 1, this.caps = const []});
 }
 
 class JamMembers extends JamEvent {
@@ -215,19 +284,22 @@ class JamMembers extends JamEvent {
 class JamState extends JamEvent {
   final JamNow now;
   final bool force;
-  const JamState(this.now, {this.force = false});
+  final int gen;
+  const JamState(this.now, {this.force = false, this.gen = 0});
 }
 
 class JamQueue extends JamEvent {
   final List<JamTrack> tracks;
   final String cur;
-  const JamQueue(this.tracks, this.cur);
+  final int gen;
+  const JamQueue(this.tracks, this.cur, {this.gen = 0});
 }
 
 class JamAdd extends JamEvent {
   final JamTrack track;
   final String by;
-  const JamAdd(this.track, this.by);
+  final String opId;
+  const JamAdd(this.track, this.by, {this.opId = ''});
 }
 
 class JamControlMsg extends JamEvent {
@@ -247,12 +319,20 @@ class JamAllow extends JamEvent {
 
 class JamEnded extends JamEvent {
   final String why;
-  const JamEnded(this.why);
+  final String code;
+  const JamEnded(this.why, {this.code = ''});
 }
 
 class JamErr extends JamEvent {
   final String msg;
-  const JamErr(this.msg);
+  final String code;
+  const JamErr(this.msg, {this.code = ''});
+}
+
+class JamHandoff extends JamEvent {
+  final String host;
+  final bool degraded;
+  const JamHandoff(this.host, {this.degraded = false});
 }
 
 class JamLeftAck extends JamEvent {
@@ -261,15 +341,24 @@ class JamLeftAck extends JamEvent {
 
 class JamProtocol {
   /// Outgoing helper — one send per frame; oversized handled by caller.
-  String create(String name) => jsonEncode({
+  /// v2 clients advertise version + caps (version-gated; v1 servers
+  /// and clients ignore unknown fields).
+  String create(String name, {int v = jamProtoV, List<String>? caps}) =>
+      jsonEncode({
         'type': 'create',
         'name': _cap(name, 24),
+        'v': v,
+        'caps': caps ?? jamAdvanceCaps,
       });
 
-  String join(String code, String name) => jsonEncode({
+  String join(String code, String name,
+          {int v = jamProtoV, List<String>? caps}) =>
+      jsonEncode({
         'type': 'join',
         'code': code.trim().toUpperCase(),
         'name': _cap(name, 24),
+        'v': v,
+        'caps': caps ?? jamAdvanceCaps,
       });
 
   String state({
@@ -277,30 +366,41 @@ class JamProtocol {
     required int pos,
     required bool playing,
     bool force = false,
+    int gen = 0,
+    String opId = '',
   }) =>
       jsonEncode({
         'type': 'state',
         if (force) 'force': true,
+        if (gen > 0) 'gen': gen,
+        if (opId.isNotEmpty) 'op': opId,
         'track': track.toJson(),
         'pos': pos < 0 ? 0 : pos,
         'playing': playing,
       });
 
-  String queue(List<JamTrack> tracks, String curId) => jsonEncode({
+  String queue(List<JamTrack> tracks, String curId, {int gen = 0}) =>
+      jsonEncode({
         'type': 'queue',
         'tracks': [for (final t in tracks.take(jamMaxQueue)) t.toJson()],
         'cur': _cap(curId, 16),
+        if (gen > 0) 'gen': gen,
       });
 
-  String add(JamTrack t) =>
-      jsonEncode({'type': 'add', 'track': t.toJson()});
+  String add(JamTrack t, {String opId = ''}) => jsonEncode({
+        'type': 'add',
+        'track': t.toJson(),
+        if (opId.isNotEmpty) 'op': opId,
+      });
 
-  String control(String action, {String id = '', int pos = 0}) =>
+  String control(String action,
+          {String id = '', int pos = 0, String opId = ''}) =>
       jsonEncode({
         'type': 'control',
         'action': _cap(action, 16),
         'id': _cap(id, 16),
         'pos': pos < 0 ? 0 : pos,
+        if (opId.isNotEmpty) 'op': opId,
       });
 
   String allow(bool on) => jsonEncode({'type': 'allow', 'on': on});
@@ -333,6 +433,10 @@ class JamProtocol {
             (o['you'] ?? '').toString(),
             (o['host'] ?? '').toString(),
             name: (o['name'] ?? '').toString(),
+            v: _int(o['v']) == 0 ? 1 : _int(o['v']),
+            caps: o['caps'] is List
+                ? [for (final c in (o['caps'] as List)) c.toString()]
+                : const [],
           );
         case 'members':
           {
@@ -355,6 +459,13 @@ class JamProtocol {
             return JamMembers(host, out);
           }
         case 'host':
+          // Legacy host notice → handoff event (graceful promotion).
+          // Empty member list variant (old server) still parses as
+          // JamMembers for back-compat; the handoff flag rides below.
+          if (o['handoff'] == true || o['degraded'] == true) {
+            return JamHandoff((o['host'] ?? '').toString(),
+                degraded: o['degraded'] == true);
+          }
           return JamMembers(
             (o['host'] ?? '').toString(),
             const [],
@@ -376,6 +487,7 @@ class JamProtocol {
                 st: _int(s['st']),
               ),
               force: o['force'] == true || s['force'] == true,
+              gen: _int(o['gen'] ?? s['gen']),
             );
           }
         case 'queue':
@@ -394,7 +506,8 @@ class JamProtocol {
             if (out.length > jamMaxQueue) {
               out.removeRange(jamMaxQueue, out.length);
             }
-            return JamQueue(out, (o['cur'] ?? '').toString());
+            return JamQueue(out, (o['cur'] ?? '').toString(),
+                gen: _int(o['gen']));
           }
         case 'add':
           {
@@ -402,7 +515,8 @@ class JamProtocol {
             if (t is! Map) return null;
             final track = JamTrack.fromJson(t.cast<String, dynamic>());
             if (track == null) return null;
-            return JamAdd(track, (o['by'] ?? 'Guest').toString());
+            return JamAdd(track, (o['by'] ?? 'Guest').toString(),
+                opId: (o['op'] ?? o['opId'] ?? '').toString());
           }
         case 'control':
           return JamControlMsg(JamControl(
@@ -410,6 +524,7 @@ class JamProtocol {
             id: (o['id'] ?? '').toString(),
             pos: _int(o['pos']),
             by: (o['by'] ?? 'Guest').toString(),
+            opId: (o['op'] ?? o['opId'] ?? '').toString(),
           ));
         case 'allow':
           return JamAllow(o['on'] == true);
@@ -421,9 +536,11 @@ class JamProtocol {
           return JamEnded(
               (o['why'] ?? '').toString().isEmpty
                   ? 'JAM ended'
-                  : (o['why'] ?? '').toString());
+                  : (o['why'] ?? '').toString(),
+              code: (o['code'] ?? '').toString());
         case 'error':
-          return JamErr((o['msg'] ?? 'Server error').toString());
+          return JamErr((o['msg'] ?? 'Server error').toString(),
+              code: (o['code'] ?? '').toString());
         case 'left':
           return const JamLeftAck();
         default:

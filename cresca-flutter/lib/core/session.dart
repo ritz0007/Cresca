@@ -53,6 +53,59 @@ class SavedSession {
   });
 }
 
+/// Battery-kind 5s ticker policy (P13 position-only saves).
+///
+/// The native ticker rewrites the file every 5s unconditionally; on mobile
+/// that is a disk write + JSON parse every 5s even when paused overnight.
+/// This gate keeps the 5s cadence but skips no-op writes: only when
+/// sounding, the interval elapsed, AND the position actually moved past
+/// [minDeltaMs]. Pure so `dart test` covers it without a filesystem.
+class SessionTickPolicy {
+  /// Minimum position movement worth persisting (seek-bar jitter guard).
+  final int minDeltaMs;
+
+  /// Minimum gap between disk writes.
+  final int intervalMs;
+
+  int _lastSaveMs = -1;
+  int _lastPositionMs = -1;
+
+  SessionTickPolicy({this.minDeltaMs = 1000, this.intervalMs = 5000});
+
+  /// True when the caller should perform the position-only save now.
+  bool shouldSave({
+    required bool playing,
+    required int positionMs,
+    required int nowMs,
+  }) {
+    try {
+      if (!playing) return false;
+      final pos = positionMs < 0 ? 0 : positionMs;
+      if (_lastSaveMs < 0) {
+        _lastSaveMs = nowMs;
+        _lastPositionMs = pos;
+        return true;
+      }
+      if (nowMs - _lastSaveMs < intervalMs) return false;
+      var moved = pos - _lastPositionMs;
+      if (moved < 0) moved = -moved;
+      if (moved < minDeltaMs) return false;
+      _lastSaveMs = nowMs;
+      _lastPositionMs = pos;
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  void reset() {
+    try {
+      _lastSaveMs = -1;
+      _lastPositionMs = -1;
+    } catch (_) {}
+  }
+}
+
 /// Encodes a session. Null when nothing to save (empty/no current).
 /// Mirrors save(): index coerced, position floored, items capped at 200.
 Map<String, dynamic>? encodeSession({

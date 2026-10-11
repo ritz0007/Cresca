@@ -2,7 +2,9 @@
 // removable rows, Suggested from playlist artists. Custom cover picker
 // lands with L6 polish (needs an image-picker dep).
 
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/semantics.dart';
 
 import '../../core/track.dart';
 import '../app.dart';
@@ -44,26 +46,70 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
     if (_suggesting) return;
     setState(() => _suggesting = true);
     try {
-      // Suggested from playlist artists (native: computed at open).
+      // Suggested from playlist artists (native: computed at open),
+      // enriched with the related graph + repository new-release
+      // scoring. Every source is defensive with fallback to plain
+      // artist search; the merged list is songs-only, vibe-ranked
+      // around the playlist seed, and excludes playlist tracks.
       final artists = <String>{};
       for (final t in p.tracks.take(10)) {
         final a = t.displayArtist();
         if (a != 'Unknown Artist') artists.add(a);
         if (artists.length >= 3) break;
       }
-      final out = <YtTrack>[];
+      final pool = <YtTrack>[];
+      final relatedIds = <String>{};
+      // Related graph from the first few playlist tracks.
+      for (final t in p.tracks.take(3)) {
+        try {
+          final rel =
+              await state.repo.relatedTracks(t.watchUrl, max: 6);
+          for (final h in rel) {
+            relatedIds.add(h.id);
+            if (pool.length >= 24) break;
+            if (pool.any((e) => e.id == h.id)) continue;
+            pool.add(h);
+          }
+        } catch (_) {}
+        if (pool.length >= 24) break;
+      }
+      // Repository new-release scoring (round-robin per artist).
+      if (artists.isNotEmpty) {
+        try {
+          final fresh =
+              await state.repo.newReleases(artists.toList(), max: 12);
+          for (final h in fresh) {
+            if (pool.length >= 30) break;
+            if (pool.any((e) => e.id == h.id)) continue;
+            pool.add(h);
+          }
+        } catch (_) {}
+      }
+      // Artist-search fallback (always runs; feeds thin graphs too).
       for (final a in artists) {
         try {
           final hits = await state.repo.searchMusic('$a songs', max: 6);
           for (final h in hits) {
-            if (out.length >= 12) break;
-            if (p.tracks.any((e) => e.id == h.id)) continue;
-            if (out.any((e) => e.id == h.id)) continue;
-            out.add(h);
+            if (pool.length >= 36) break;
+            if (pool.any((e) => e.id == h.id)) continue;
+            pool.add(h);
           }
         } catch (_) {}
       }
-      if (mounted) setState(() => _suggested = out);
+      final inPlaylist = p.tracks.map((e) => e.id).toSet();
+      var clean = songsOnlyTracks(pool)
+          .where((t) => !inPlaylist.contains(t.id))
+          .toList();
+      try {
+        if (p.tracks.isNotEmpty && clean.length > 1) {
+          clean = rankByVibeDefensive(
+            p.tracks.first,
+            clean,
+            relatedIds: relatedIds,
+          );
+        }
+      } catch (_) {}
+      if (mounted) setState(() => _suggested = clean.take(12).toList());
     } catch (_) {}
     if (mounted) setState(() => _suggesting = false);
   }
@@ -72,22 +118,47 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
       BuildContext context, AppState state, UserPlaylist p) async {
     try {
       final c = TextEditingController(text: p.name);
-      final name = await showDialog<String>(
-        context: context,
-        builder: (d) => AlertDialog(
-          title: const Text('Rename playlist'),
-          content: TextField(
-              controller: c, autofocus: true),
-          actions: [
-            TextButton(
-                onPressed: () => Navigator.pop(d),
-                child: const Text('Cancel')),
-            TextButton(
-                onPressed: () => Navigator.pop(d, c.text),
-                child: const Text('Save')),
-          ],
-        ),
-      );
+      // One dialog idiom per platform (Cupertino on iOS, Material
+      // elsewhere). Behavior identical.
+      final String? name;
+      if (_isIOS(context)) {
+        name = await showCupertinoDialog<String>(
+          context: context,
+          builder: (d) => CupertinoAlertDialog(
+            title: const Text('Rename playlist'),
+            content: CupertinoTextField(
+                controller: c,
+                autofocus: true,
+                placeholder: 'Playlist name'),
+            actions: [
+              CupertinoDialogAction(
+                  onPressed: () => Navigator.pop(d),
+                  child: const Text('Cancel')),
+              CupertinoDialogAction(
+                  isDefaultAction: true,
+                  onPressed: () => Navigator.pop(d, c.text),
+                  child: const Text('Save')),
+            ],
+          ),
+        );
+      } else {
+        name = await showDialog<String>(
+          context: context,
+          builder: (d) => AlertDialog(
+            title: const Text('Rename playlist'),
+            content: TextField(
+                controller: c, autofocus: true),
+            actions: [
+              TextButton(
+                  onPressed: () => Navigator.pop(d),
+                  child: const Text('Cancel')),
+              TextButton(
+                  onPressed: () => Navigator.pop(d, c.text),
+                  child: const Text('Save')),
+            ],
+          ),
+        );
+      }
       if (name == null) return;
       await state.library.renamePlaylist(p.id, name);
       if (mounted) setState(() {});
@@ -97,24 +168,52 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
   Future<void> _delete(
       BuildContext context, AppState state, UserPlaylist p) async {
     try {
-      final yes = await showDialog<bool>(
-        context: context,
-        builder: (d) => AlertDialog(
-          title: Text('Delete "${p.name}"?'),
-          actions: [
-            TextButton(
-                onPressed: () => Navigator.pop(d, false),
-                child: const Text('Cancel')),
-            TextButton(
-                onPressed: () => Navigator.pop(d, true),
-                child: const Text('Delete')),
-          ],
-        ),
-      );
+      // One dialog idiom per platform. Behavior identical.
+      final bool? yes;
+      if (_isIOS(context)) {
+        yes = await showCupertinoDialog<bool>(
+          context: context,
+          builder: (d) => CupertinoAlertDialog(
+            title: Text('Delete "${p.name}"?'),
+            actions: [
+              CupertinoDialogAction(
+                  onPressed: () => Navigator.pop(d, false),
+                  child: const Text('Cancel')),
+              CupertinoDialogAction(
+                  isDestructiveAction: true,
+                  onPressed: () => Navigator.pop(d, true),
+                  child: const Text('Delete')),
+            ],
+          ),
+        );
+      } else {
+        yes = await showDialog<bool>(
+          context: context,
+          builder: (d) => AlertDialog(
+            title: Text('Delete "${p.name}"?'),
+            actions: [
+              TextButton(
+                  onPressed: () => Navigator.pop(d, false),
+                  child: const Text('Cancel')),
+              TextButton(
+                  onPressed: () => Navigator.pop(d, true),
+                  child: const Text('Delete')),
+            ],
+          ),
+        );
+      }
       if (yes != true) return;
       await state.library.deletePlaylist(p.id);
       if (mounted) Navigator.pop(context);
     } catch (_) {}
+  }
+
+  bool _isIOS(BuildContext context) {
+    try {
+      return Theme.of(context).platform == TargetPlatform.iOS;
+    } catch (_) {
+      return false;
+    }
   }
 
   @override
@@ -154,18 +253,36 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
             children: [
               Expanded(
                 child: ListView(
+                  // Bottom chrome is app-shell; live measured clearance
+                  // (210 fallback) so tail rows never slide under it.
+                  padding: EdgeInsets.only(
+                      bottom:
+                          BottomChromeScope.clearanceOf(context)),
                   children: [
                     Padding(
                       padding: const EdgeInsets.all(16),
                       child: Row(
                         children: [
-                          SizedBox(
-                            width: 120,
-                            height: 120,
-                            child: ClipRRect(
-                              borderRadius:
-                                  BorderRadius.circular(12),
-                              child: MosaicArt(tracks: p.tracks),
+                          AnimatedSwitcher(
+                            duration: Duration(
+                                milliseconds:
+                                    state.motionMs(220)),
+                            transitionBuilder:
+                                (child, anim) =>
+                                    FadeTransition(
+                                        opacity: anim,
+                                        child: child),
+                            child: SizedBox(
+                              key: ValueKey(
+                                  'pl-art-${p.tracks.length}-${p.tracks.isEmpty ? 'empty' : p.tracks.first.id}'),
+                              width: 120,
+                              height: 120,
+                              child: ClipRRect(
+                                borderRadius:
+                                    BorderRadius.circular(12),
+                                child:
+                                    MosaicArt(tracks: p.tracks),
+                              ),
                             ),
                           ),
                           const SizedBox(width: 16),
@@ -181,7 +298,11 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
                                 Text('${p.tracks.length} songs',
                                     style: Theme.of(context)
                                         .textTheme
-                                        .bodySmall),
+                                        .bodySmall
+                                        ?.copyWith(
+                                            color: Theme.of(context)
+                                                .colorScheme
+                                                .onSurfaceVariant)),
                                 const SizedBox(height: 8),
                                 Row(
                                   children: [
@@ -237,15 +358,64 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
                             child: const Icon(
                                 Icons.delete_outline)),
                         onDismissed: (_) async {
+                          // Capture for Undo before mutating.
+                          final removed = p.tracks[i];
+                          final at = i;
                           try {
                             await state.library.removeFromPlaylist(
-                                p.id, p.tracks[i].id);
+                                p.id, removed.id);
                           } catch (_) {}
+                          if (!context.mounted) return;
+                          try {
+                            SemanticsService.sendAnnouncement(
+                                View.of(context),
+                                'Removed ${removed.title}. Undo available.',
+                                TextDirection.ltr);
+                          } catch (_) {}
+                          if (!context.mounted) return;
+                          ScaffoldMessenger.of(context)
+                              .showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                  'Removed ${removed.title}'),
+                              action: SnackBarAction(
+                                label: 'Undo',
+                                onPressed: () async {
+                                  try {
+                                    // Re-add through the library so the
+                                    // restore is persisted, then move it
+                                    // back to its old slot in-memory for
+                                    // identical order (a later library
+                                    // write persists the order too).
+                                    await state.library
+                                        .addToPlaylist(
+                                            p.id, removed);
+                                    try {
+                                      p.tracks.removeWhere((e) =>
+                                          e.id ==
+                                          removed.id);
+                                      p.tracks.insert(
+                                          at.clamp(0,
+                                              p.tracks.length),
+                                          removed);
+                                    } catch (_) {}
+                                  } catch (_) {}
+                                  if (mounted) {
+                                    setState(() {});
+                                  }
+                                },
+                              ),
+                            ),
+                          );
                         },
-                        child: TrackRow(
-                          track: p.tracks[i],
-                          contextQueue: p.tracks,
+                        child: StaggerEntrance(
                           index: i,
+                          child: TrackRow(
+                            track: p.tracks[i],
+                            contextQueue: p.tracks,
+                            index: i,
+                            origin: 'Playlist',
+                          ),
                         ),
                       ),
                     if (_suggesting)
@@ -259,18 +429,24 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
                       Padding(
                         padding: const EdgeInsets.fromLTRB(
                             16, 8, 16, 4),
-                        child: Text('Suggested',
-                            style: Theme.of(context)
-                                .textTheme
-                                .titleMedium),
+                        child: StaggerEntrance(
+                          child: Text('Suggested',
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .titleMedium),
+                        ),
                       ),
                       for (var i = 0;
                           i < _suggested.length;
                           i++)
-                        TrackRow(
-                          track: _suggested[i],
-                          contextQueue: _suggested,
+                        StaggerEntrance(
                           index: i,
+                          child: TrackRow(
+                            track: _suggested[i],
+                            contextQueue: _suggested,
+                            index: i,
+                            origin: 'Playlist',
+                          ),
                         ),
                     ],
                   ],

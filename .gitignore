@@ -19,9 +19,15 @@ Thumbs.db
 # Release APKs live on GitHub Releases, not in git
 *.apk
 
+# Release signing lives OUTSIDE the repo — never commit keys
+cresca-flutter/android/key.properties
+*.jks
+*.keystore
+
 # AI context files stay local, never pushed
 AGENTS.md
 AGENTS_readable.md
 AGENTS_utf8.md
+.opencode/
 filelist.txt
 full_listing.txt

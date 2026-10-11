@@ -110,3 +110,27 @@ String? parseJamLink(String link) {
     return null;
   }
 }
+
+// ---- Advance-mode mirrors (kept in sync with lib/jam/protocol.dart) ----
+// Pure helpers duplicated here so core-only importers (no jam/ import)
+// can share the drift/gen math without a dependency cycle.
+
+/// Advance protocol version + caps (version-gated; see jam/protocol.dart).
+const int jamCoreProtoV = 2;
+
+/// Drift bands (ms): hold ≤350, ease ≤2000, else chase (hard seek).
+const int jamCoreEaseMs = 350;
+const int jamCoreChaseMs = 2000;
+
+/// Drift action: hold (in band), ease (speed nudge), chase (seek).
+String jamCoreDriftAction(int driftMs,
+    {int easeMs = jamCoreEaseMs, int chaseMs = jamCoreChaseMs}) {
+  final d = driftMs.abs();
+  if (d <= easeMs) return 'hold';
+  if (d <= chaseMs) return 'ease';
+  return 'chase';
+}
+
+/// True when an incoming generation counter is stale (drop it).
+bool jamCoreIsStaleGen(int incoming, int current) =>
+    incoming > 0 && incoming < current;

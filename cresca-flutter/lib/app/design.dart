@@ -26,6 +26,8 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'dart:math' as math;
 
+import '../core/motion.dart' as motion;
+
 /// Cresca red — brand moments only (splash/logo). Product actions speak
 /// Spotify green (user direction: everything Spotify except the player,
 /// which keeps its Apple-Music treatment).
@@ -115,10 +117,18 @@ ThemeData crescaTheme(Brightness brightness) {
   return ThemeData(
     useMaterial3: true,
     colorScheme: scheme,
-    textTheme:
-        crescaTextTheme(brightness == Brightness.light
+    // Explicit text colors on EVERY style: GoogleFonts text themes
+    // carry null colors (inheritance), and an inherited white from
+    // any dark ancestor renders section headers invisible on light
+    // surfaces. .apply() pins onSurface everywhere (verified by probe:
+    // titleLarge.color was null before this).
+    textTheme: crescaTextTheme(brightness == Brightness.light
             ? Typography.englishLike2018
-            : Typography.englishLike2018),
+            : Typography.englishLike2018)
+        .apply(
+      displayColor: scheme.onSurface,
+      bodyColor: scheme.onSurface,
+    ),
     // [D2] iOS push/pop on every platform.
     pageTransitionsTheme: const PageTransitionsTheme(builders: {
       TargetPlatform.android:
@@ -212,11 +222,16 @@ class Glass extends StatelessWidget {
       ),
       child: child,
     );
+    // RepaintBoundary confines the backdrop-blur repaint to this
+    // element's band; inner content must not add its own blur pass
+    // (no stacked blurs — the one static sigma here is the layer).
     return ClipRect(
-      child: BackdropFilter(
-        filter: ImageFilter.blur(
-            sigmaX: blur, sigmaY: blur),
-        child: child2,
+      child: RepaintBoundary(
+        child: BackdropFilter(
+          filter: ImageFilter.blur(
+              sigmaX: blur, sigmaY: blur),
+          child: child2,
+        ),
       ),
     );
   }
@@ -245,6 +260,7 @@ class GlassBar extends StatelessWidget implements PreferredSizeWidget {
         fontSize: 17,
         fontWeight: FontWeight.w700);
     return ClipRect(
+      child: RepaintBoundary(
       child: BackdropFilter(
         filter: ImageFilter.blur(sigmaX: 26, sigmaY: 26),
         child: Container(
@@ -296,6 +312,7 @@ class GlassBar extends StatelessWidget implements PreferredSizeWidget {
           ),
         ),
       ),
+      ),
     );
   }
 }
@@ -304,34 +321,45 @@ class GlassBar extends StatelessWidget implements PreferredSizeWidget {
 /// that grows opaque toward its base so list rows stay legible
 /// (Axiom: sheets adopt glass automatically; content above stays
 /// bold/bright). Wrap a sheet's root widget with this.
+///
+/// Legibility note: the base stops are deliberately deep (near-opaque)
+/// because secondary (onSurfaceVariant) text over mid translucency
+/// failed AA. The top stays translucent so the Regular-glass
+/// character (content ghosting through) is kept — never a solid fill.
 class GlassSheetSurface extends StatelessWidget {
   final Widget child;
-  const GlassSheetSurface({super.key, required this.child});
+
+  /// Motion kill-switch (AppState.motionOn). Entrance is opacity +
+  /// offset only — blur sigma is static, never animated per-frame.
+  final bool motionOn;
+  const GlassSheetSurface(
+      {super.key, required this.child, this.motionOn = true});
 
   @override
   Widget build(BuildContext context) {
     final dark = Theme.of(context).brightness == Brightness.dark;
-    return ClipRect(
-      child: BackdropFilter(
-        filter: ImageFilter.blur(sigmaX: 30, sigmaY: 30),
-        child: Container(
-          decoration: BoxDecoration(
-            gradient: LinearGradient(
-              begin: Alignment.topCenter,
-              end: Alignment.bottomCenter,
-              stops: const [0.0, 0.42, 1.0],
-              colors: dark
-                  ? [
-                      Colors.white.withValues(alpha: 0.10),
-                      Colors.white.withValues(alpha: 0.05),
-                      const Color(0xF11A1A1A),
-                    ]
-                  : [
-                      Colors.white.withValues(alpha: 0.80),
-                      Colors.white.withValues(alpha: 0.86),
-                      const Color(0xF7FAFAFA),
-                    ],
-            ),
+    final surface = ClipRect(
+      child: RepaintBoundary(
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 30, sigmaY: 30),
+          child: Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                stops: const [0.0, 0.42, 1.0],
+                colors: dark
+                    ? [
+                        Colors.white.withValues(alpha: 0.16),
+                        Colors.white.withValues(alpha: 0.12),
+                        const Color(0xFA1A1A1A),
+                      ]
+                    : [
+                        Colors.white.withValues(alpha: 0.88),
+                        Colors.white.withValues(alpha: 0.92),
+                        const Color(0xFCFAFAFA),
+                      ],
+              ),
             borderRadius: const BorderRadius.only(
               topLeft: Radius.circular(28),
               topRight: Radius.circular(28),
@@ -346,9 +374,13 @@ class GlassSheetSurface extends StatelessWidget {
             ),
           ),
           child: child,
+          ),
         ),
       ),
     );
+    // Show-only entrance: slide-up + fade (transform/opacity). The
+    // BackdropFilter above keeps a static sigma — never animated.
+    return SheetEntrance(motionOn: motionOn, child: surface);
   }
 }
 
@@ -428,8 +460,15 @@ class IosSpinner extends StatelessWidget {
 /// fixed anchors drifting slowly, heavy blur, dark scrim for legibility.
 /// Colors ride the theme seed (artwork-palette tinting lands with the
 /// palette_generator hookup); blobs rest after each track change.
+///
+/// Smooth-scroll rule: the drift is ONE-SHOT per palette/mount (a
+/// single ~1.2s glide that rests at the end) — never a perpetual
+/// repeat, so idle frames cost zero CustomPaint repaints.
 class MeshBackdrop extends StatefulWidget {
-  const MeshBackdrop({super.key});
+  /// Motion kill-switch (AppState.motionOn). Off = static wash, no
+  /// drift ticks; palette still swaps instantly (1 ms fade).
+  final bool motionOn;
+  const MeshBackdrop({super.key, this.motionOn = true});
 
   @override
   State<MeshBackdrop> createState() => _MeshBackdropState();
@@ -438,13 +477,38 @@ class MeshBackdrop extends StatefulWidget {
 class _MeshBackdropState extends State<MeshBackdrop>
     with SingleTickerProviderStateMixin {
   late final AnimationController _drift;
+  List<Color>? _prev;
+  List<Color>? _shown;
+  int _paletteKey = 0;
 
   @override
   void initState() {
     super.initState();
+    // One-shot glide (not repeat): settles and rests so idle frames
+    // never repaint the wash. Duration via the sheet-enter spec.
     _drift = AnimationController(
-        vsync: this, duration: const Duration(seconds: 8))
-      ..repeat();
+        vsync: this,
+        duration: Duration(milliseconds: motion.sheetEnterMs * 4));
+    if (widget.motionOn) {
+      _drift.forward(from: 0);
+    } else {
+      _drift.value = 1;
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant MeshBackdrop old) {
+    super.didUpdateWidget(old);
+    // Gate drift on the kill-switch: no per-frame ticks when off.
+    // Palette swaps re-glide once from rest, then settle again.
+    if (widget.motionOn != old.motionOn) {
+      if (widget.motionOn) {
+        _drift.forward(from: 0);
+      } else {
+        _drift.stop();
+        _drift.value = 1;
+      }
+    }
   }
 
   @override
@@ -453,48 +517,112 @@ class _MeshBackdropState extends State<MeshBackdrop>
     super.dispose();
   }
 
+  static bool _paletteEq(List<Color> a, List<Color> b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final dark =
         Theme.of(context).brightness == Brightness.dark;
-    return AnimatedBuilder(
-      animation: _drift,
-      builder: (_, _) => Stack(
-        fit: StackFit.expand,
-        children: [
-          Container(color: scheme.surface),
-          CustomPaint(
-            painter: _MeshPainter(
-              colors: [
-                scheme.primary,
-                scheme.secondary,
-                scheme.tertiary,
-                scheme.primaryContainer,
-              ],
-              drift: _drift.value,
-            ),
-          ),
-          // Heavy blur melts the blobs into a wash. The mesh painter
-          // already renders soft radial gradients directly, so the
-          // extra BackdropFilter pass (compositor-unsafe on SwiftShader
-          // emulators: filtered layers stamp over content) is dropped.
-          // Scrim for legibility (10% → 38% top-to-bottom).
-          Container(
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                colors: [
-                  Colors.black.withValues(
-                      alpha: dark ? 0.10 : 0.04),
-                  Colors.black.withValues(alpha: 0.38),
-                ],
-              ),
-            ),
-          ),
-        ],
+    final colors = [
+      scheme.primary,
+      scheme.secondary,
+      scheme.tertiary,
+      scheme.primaryContainer,
+    ];
+    // Palette crossfade on track/theme change: keep the previous wash
+    // underneath and fade the new one in over 600 ms (opacity only).
+    // The drift re-glides once per palette swap, then rests.
+    if (_shown == null) {
+      _shown = colors;
+    } else if (!_paletteEq(_shown!, colors)) {
+      _prev = _shown;
+      _shown = colors;
+      _paletteKey++;
+      if (widget.motionOn) {
+        // Post-frame: build must stay side-effect free for the value,
+        // but restarting the (already-mounted) controller is safe.
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _drift.forward(from: 0);
+        });
+      }
+    }
+    final on = widget.motionOn;
+    final fadeMs = motion.motionMs(on, 600);
+    // 120Hz polish: the legibility scrim is static — it sits OUTSIDE
+    // the drift AnimatedBuilder so the gradient box isn't rebuilt every
+    // frame. Only the wash repaints on drift ticks.
+    final scrim = Container(
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [
+            Colors.black.withValues(
+                alpha: dark ? 0.10 : 0.04),
+            Colors.black.withValues(alpha: 0.38),
+          ],
+        ),
       ),
+    );
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        Container(color: scheme.surface),
+        AnimatedBuilder(
+      animation: _drift,
+      builder: (_, _) {
+        Widget wash(List<Color> cs, double drift) {
+          // RepaintBoundary confines the soft-gradient paint to the
+          // backdrop bounds so drifting blobs never repaint content
+          // above. Single paint layer here by design — callers must
+          // not stack another filter over this wash, and the falloff
+          // is static (drift moves blob centers only, no per-frame
+          // MaskFilter blur pass).
+          return RepaintBoundary(
+            child: CustomPaint(
+              painter:
+                  _MeshPainter(colors: cs, drift: drift),
+            ),
+          );
+        }
+        final drift = on ? _drift.value : 0.0;
+        if (_prev != null) {
+          return Stack(
+            fit: StackFit.expand,
+            children: [
+              wash(_prev!, on ? drift : 0.0),
+              TweenAnimationBuilder<double>(
+                key: ValueKey(_paletteKey),
+                tween: Tween(begin: 0, end: 1),
+                duration: Duration(milliseconds: fadeMs),
+                curve: Curves.easeOut,
+                onEnd: () {
+                  if (mounted) setState(() => _prev = null);
+                },
+                builder: (_, v, child) => Opacity(
+                  opacity: v,
+                  child: wash(_shown!, drift),
+                ),
+              ),
+            ],
+          );
+        }
+        return wash(_shown!, drift);
+      },
+    ),
+        scrim,
+        // Heavy blur melts the blobs into a wash. The mesh painter
+        // already renders soft radial gradients directly, so the
+        // extra BackdropFilter pass (compositor-unsafe on SwiftShader
+        // emulators: filtered layers stamp over content) is dropped.
+      ],
     );
   }
 }
@@ -522,10 +650,20 @@ class _MeshPainter extends CustomPainter {
       final a = anchors[i] +
           Offset(18 * math.sin(wobble + i * 1.7),
               18 * math.cos(wobble * 0.8 + i));
+      // Soft falloff WITHOUT a per-frame MaskFilter blur (120Hz
+      // polish): a radial shader melts each blob into the wash on the
+      // GPU with identical anchors/alpha, but no software blur pass
+      // ticking at 120 Hz.
+      final radius = r / 3.2;
+      final base = colors[i % colors.length];
       final paint = Paint()
-        ..color = colors[i % colors.length].withValues(alpha: 0.85)
-        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 8);
-      canvas.drawCircle(a, r / 3.2, paint);
+        ..shader = RadialGradient(
+          colors: [
+            base.withValues(alpha: 0.85),
+            base.withValues(alpha: 0.0),
+          ],
+        ).createShader(Rect.fromCircle(center: a, radius: radius));
+      canvas.drawCircle(a, radius, paint);
     }
   }
 
@@ -542,6 +680,10 @@ class FloatingTabBar extends StatelessWidget {
   final int current;
   final ValueChanged<int> onTap;
 
+  /// Motion kill-switch (AppState.motionOn). Off = instant selection
+  /// swaps, no press scaling.
+  final bool motionOn;
+
   /// System navigation-bar inset (measured ABOVE any SafeArea so the
   /// material can paint over the full nav-bar zone — SafeArea consumes
   /// the inset for its children, which left raw content visible in the
@@ -552,6 +694,7 @@ class FloatingTabBar extends StatelessWidget {
     required this.current,
     required this.onTap,
     this.bottomInset = 24,
+    this.motionOn = true,
   });
 
   static const _items = [
@@ -585,14 +728,33 @@ class FloatingTabBar extends StatelessWidget {
     // is safe; screens were verified pixel-perfect after each step.
     final selected = dark ? Colors.white : Colors.black;
     final bottomInsetV = bottomInset;
-    // Full-bleed Apple-glass tab bar: measured live on jam16 — a solo
-    // BackdropFilter samples the WHOLE screen (not its own bounds) on
-    // SwiftShader, blurring every card behind it. Axiom-faithful fallback:
-    // the Regular material's adaptive tint is layered translucently and
-    // dissolves content behind the bar (scroll-under + darker scrim at
-    // the bottom = the "dissolve into glass" edge effect without a
-    // compositor filter). See .opencode/skill/liquid-glass for rules.
-    final Widget material = Container(
+    // Label style rides the Theme (labelSmall 11 SB) so text scaling
+    // and font-choice stay centralized; selection only recolors.
+    final labelBase =
+        Theme.of(context).textTheme.labelSmall ??
+            const TextStyle(
+                fontSize: 11, fontWeight: FontWeight.w600);
+    // Selection motion: 180 ms tint crossfade (no pill — iOS
+    // tint-only rule stays). Transform/opacity only, 60 fps.
+    // NOTE (120Hz polish): label fontSize stays fixed (was 10.5↔11 —
+    // animating fontSize relaid out every frame); selection reads via
+    // color + dot alone. Icon scale derives from the same tint tween
+    // (no nested AnimatedScale double-tick).
+    final selMs = motion.motionMs(motionOn, motion.tabExitMs);
+    final selDur = Duration(milliseconds: selMs);
+    // Unselected tabs use full onSurfaceVariant (no dimming alpha):
+    // 0.65 alpha measured ~3:1 over the glass and failed AA.
+    // The bar's own glass gradient doubles as the scrim behind them.
+    final unselected = scheme.onSurfaceVariant;
+    // Full-bleed Apple-glass tab bar: the Regular material's adaptive
+    // tint is layered translucently and dissolves content behind the
+    // bar (scroll-under + darker scrim at the bottom = the "dissolve
+    // into glass" edge effect). Bounded blur (same Glass pattern:
+    // ClipRect bounds → BackdropFilter, NEVER ClipRRect over the
+    // filter) melts scrolled content into the material; the linear
+    // clip keeps the blur band on this element alone. Tint + hairline
+    // + no-pill rule unchanged. See .opencode/skill/liquid-glass.
+    final Widget glass = Container(
       decoration: BoxDecoration(
         // Regular-glass adaptive tint: translucent top sheen into a
         // deeper base. Never a solid fill (Axiom: solid fills break the
@@ -607,9 +769,9 @@ class FloatingTabBar extends StatelessWidget {
                   Colors.black.withValues(alpha: 0.72),
                 ]
               : [
+                  Colors.white.withValues(alpha: 0.96),
                   Colors.white.withValues(alpha: 0.88),
-                  Colors.white.withValues(alpha: 0.70),
-                  Colors.white.withValues(alpha: 0.94),
+                  Colors.white.withValues(alpha: 0.98),
                 ],
         ),
         // Hairline top edge; sides/bottom end to end (full-bleed).
@@ -632,35 +794,88 @@ class FloatingTabBar extends StatelessWidget {
               children: [
                 for (var i = 0; i < _items.length; i++)
                   Expanded(
-                    child: GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onTap: () => onTap(i),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            i == current
-                                ? _items[i].$2
-                                : _items[i].$1,
-                            size: 25,
-                            color: i == current
-                                ? selected
-                                : scheme.onSurfaceVariant.withValues(
-                                    alpha: 0.65),
-                          ),
-                          const SizedBox(height: 2),
-                          Text(_items[i].$3,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w600,
+                    // Semantics expose selection to screen readers;
+                    // InkWell gives focus/hover affordance (tap itself
+                    // handled here — no outer GestureDetector so the
+                    // cell isn't a bare tap target). Tint-only rule
+                    // stays: no pill indicator, selection animation
+                    // below is untouched.
+                    child: Semantics(
+                      selected: i == current,
+                      button: true,
+                      label: _items[i].$3,
+                      child: InkWell(
+                        borderRadius:
+                            BorderRadius.circular(12),
+                        onTap: () => onTap(i),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            // Selection tint: 0→1 tween lerped per-frame
+                            // (transform/opacity-class color lerp). A
+                            // ColorTween(begin: unselected) snapped on
+                            // deselect (begin is fixed); the 0/1 double
+                            // tween retargets from the live value both
+                            // ways, so select + deselect both glide.
+                            TweenAnimationBuilder<double>(
+                              tween: Tween(
+                                begin: 0,
+                                end: i == current
+                                    ? 1.0
+                                    : 0.0,
+                              ),
+                              duration: selDur,
+                              curve: Curves.easeOut,
+                              builder: (_, t, child) =>
+                                  Transform.scale(
+                                scale: 0.92 + 0.08 * t,
+                                child: Icon(
+                                  i == current
+                                      ? _items[i].$2
+                                      : _items[i].$1,
+                                  size: 25,
+                                  color: Color.lerp(
+                                      unselected,
+                                      selected,
+                                      t),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            AnimatedDefaultTextStyle(
+                              duration: selDur,
+                              curve: Curves.easeOut,
+                              style: labelBase.copyWith(
                                   color: i == current
                                       ? selected
-                                      : scheme.onSurfaceVariant
-                                          .withValues(
-                                              alpha: 0.65))),
-                        ],
+                                      : unselected),
+                              child: Text(_items[i].$3,
+                                  maxLines: 1,
+                                  overflow:
+                                      TextOverflow.ellipsis),
+                            ),
+                            // Subtle selection dot (tint-only rule:
+                            // no pill indicator).
+                            AnimatedOpacity(
+                              opacity:
+                                  i == current ? 1.0 : 0.0,
+                              duration: selDur,
+                              curve: Curves.easeOut,
+                              child: Container(
+                                margin:
+                                    const EdgeInsets.only(
+                                        top: 3),
+                                width: 4,
+                                height: 4,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: selected.withValues(
+                                      alpha: 0.8),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
                     ),
                   ),
@@ -672,11 +887,463 @@ class FloatingTabBar extends StatelessWidget {
         ],
       ),
     );
-    // Glass, not blur (user direction): the material is the
-    // translucent adaptive tint + hairline top edge alone — no
-    // BackdropFilter. Blur sampled the whole screen on SwiftShader
-    // and read muddy; the tinted glass reads Apple-clean and is
-    // compositor-safe everywhere.
-    return material;
+    // Bounded-blur glass (mini-player Glass pattern): ClipRect bounds
+    // the BackdropFilter to the bar band; the sigma is static, never
+    // animated. Tint + hairline live on the container under the filter.
+    //
+    // Material wrapper: this bar rides in the app-shell overlay
+    // (Stack outside any Scaffold), so raw Text widgets below would
+    // otherwise inherit the red/yellow missing-Material error style
+    // (yellow underlines under every label).
+    return Material(
+      type: MaterialType.transparency,
+      child: ClipRect(
+        child: RepaintBoundary(
+          child: BackdropFilter(
+            filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
+            child: glass,
+          ),
+        ),
+      ),
+    );
   }
 }
+
+/// Shared press feedback: tap-down to 0.94 over 120 ms, spring back on
+/// release (transform only). Off = plain tap (no scaling).
+class PressScale extends StatefulWidget {
+  final Widget child;
+  final VoidCallback? onTap;
+  final bool motionOn;
+  final double pressedScale;
+  const PressScale({
+    super.key,
+    required this.child,
+    this.onTap,
+    this.motionOn = true,
+    this.pressedScale = 0.94,
+  });
+
+  @override
+  State<PressScale> createState() => _PressScaleState();
+}
+
+class _PressScaleState extends State<PressScale> {
+  bool _down = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final ms = motion.motionMs(widget.motionOn, motion.pressMs);
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTapDown: (_) {
+        if (widget.motionOn && mounted) setState(() => _down = true);
+      },
+      onTapUp: (_) {
+        if (mounted) setState(() => _down = false);
+        widget.onTap?.call();
+      },
+      onTapCancel: () {
+        if (mounted) setState(() => _down = false);
+      },
+      child: AnimatedScale(
+        scale: _down
+            ? widget.pressedScale
+            : motion.motionDouble(widget.motionOn, 1, 1),
+        duration: Duration(milliseconds: ms),
+        curve: _down ? Curves.easeOut : Curves.easeOutBack,
+        child: widget.child,
+      ),
+    );
+  }
+}
+
+/// One-shot fade + 12 px slide entrance (transform/opacity only).
+/// [delay] staggers siblings; [offsetY] defaults to 12 px down → rest.
+class FadeSlide extends StatefulWidget {
+  final Widget child;
+  final bool motionOn;
+  final Duration? duration;
+  final Duration delay;
+  final double offsetY;
+  const FadeSlide({
+    super.key,
+    required this.child,
+    this.motionOn = true,
+    this.duration,
+    this.delay = Duration.zero,
+    this.offsetY = 12,
+  });
+
+  @override
+  State<FadeSlide> createState() => _FadeSlideState();
+}
+
+class _FadeSlideState extends State<FadeSlide> {
+  bool _shown = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final ms = motion.motionMs(widget.motionOn, 1);
+    Future<void>.delayed(
+      Duration(milliseconds: ms) + widget.delay,
+      () {
+        if (mounted) setState(() => _shown = true);
+      },
+    );
+    if (!widget.motionOn) _shown = true;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ms = motion.motionMs(
+        widget.motionOn, widget.duration?.inMilliseconds ?? motion.sheetEnterMs);
+    if (!widget.motionOn) return widget.child;
+    return AnimatedOpacity(
+      opacity: _shown ? 1 : 0,
+      duration: Duration(milliseconds: ms),
+      curve: Curves.easeOutCubic,
+      child: AnimatedContainer(
+        duration: Duration(milliseconds: ms),
+        curve: Curves.easeOutCubic,
+        transform: Matrix4.translationValues(
+            0, _shown ? 0 : widget.offsetY, 0),
+        // RepaintBoundary: the entrance repaints at 120 Hz for one
+        // shot — keep it off the sheet's blur layer.
+        child: RepaintBoundary(child: widget.child),
+      ),
+    );
+  }
+}
+
+/// Cheap stagger helper: wraps each child in a [FadeSlide] delayed by
+/// `index * staggerMs` (default 40 ms). One-shot, transform/opacity.
+class StaggerColumn extends StatelessWidget {
+  final List<Widget> children;
+  final bool motionOn;
+  final int staggerMs;
+  final double offsetY;
+  final CrossAxisAlignment crossAxisAlignment;
+  const StaggerColumn({
+    super.key,
+    required this.children,
+    this.motionOn = true,
+    this.staggerMs = 40,
+    this.offsetY = 12,
+    this.crossAxisAlignment = CrossAxisAlignment.start,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: crossAxisAlignment,
+      children: [
+        for (var i = 0; i < children.length; i++)
+          FadeSlide(
+            motionOn: motionOn,
+            delay: Duration(
+                milliseconds:
+                    motion.motionMs(motionOn, staggerMs * i)),
+            offsetY: offsetY,
+            child: children[i],
+          ),
+      ],
+    );
+  }
+}
+
+/// Bottom-sheet entrance: slide-up + fade over 320 ms easeOutCubic
+/// (exit is the route's 220 ms fade). One-shot on first mount;
+/// transform/opacity only, blur untouched.
+class SheetEntrance extends StatefulWidget {
+  final Widget child;
+  final bool motionOn;
+  const SheetEntrance(
+      {super.key, required this.child, this.motionOn = true});
+
+  @override
+  State<SheetEntrance> createState() => _SheetEntranceState();
+}
+
+class _SheetEntranceState extends State<SheetEntrance> {
+  bool _shown = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) setState(() => _shown = true);
+    });
+    if (!widget.motionOn) _shown = true;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!widget.motionOn) return widget.child;
+    final ms = motion.motionMs(widget.motionOn, motion.sheetEnterMs);
+    final d = Duration(milliseconds: ms);
+    return AnimatedOpacity(
+      opacity: _shown ? 1 : 0,
+      duration: d,
+      curve: Curves.easeOutCubic,
+      child: AnimatedContainer(
+        duration: d,
+        curve: Curves.easeOutCubic,
+        transform:
+            Matrix4.translationValues(0, _shown ? 0 : 28, 0),
+        // RepaintBoundary: one-shot entrance stays off the static
+        // BackdropFilter layer behind it.
+        child: RepaintBoundary(child: widget.child),
+      ),
+    );
+  }
+}
+
+/// Opacity-only pulse for in-progress surfaces (download/update
+/// shimmer): alpha oscillates, never position/blur. Off = static child.
+class PulseOpacity extends StatefulWidget {  final Widget child;
+  final bool motionOn;
+  final bool pulsing;
+  const PulseOpacity({
+    super.key,
+    required this.child,
+    this.motionOn = true,
+    this.pulsing = true,
+  });
+
+  @override
+  State<PulseOpacity> createState() => _PulseOpacityState();
+}
+
+class _PulseOpacityState extends State<PulseOpacity>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c;
+  late final Animation<double> _pulse;
+
+  @override
+  void initState() {
+    super.initState();
+    _c = AnimationController(
+      vsync: this,
+      duration:
+          Duration(milliseconds: motion.shimmerMs),
+    );
+    // Hoisted curve: allocating a CurvedAnimation per-frame inside the
+    // builder churned at 120 Hz; one instance reuses the same mapping.
+    _pulse = CurvedAnimation(parent: _c, curve: Curves.easeInOut);
+    if (widget.motionOn && widget.pulsing) _c.repeat(reverse: true);
+  }
+
+  @override
+  void didUpdateWidget(covariant PulseOpacity old) {
+    super.didUpdateWidget(old);
+    if (widget.motionOn && widget.pulsing) {
+      if (!_c.isAnimating) _c.repeat(reverse: true);
+    } else {
+      _c.stop();
+    }
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!widget.motionOn || !widget.pulsing) return widget.child;
+    return AnimatedBuilder(
+      animation: _c,
+      builder: (_, child) => Opacity(
+        opacity: 0.55 + 0.45 * _pulse.value,
+        child: widget.child,
+      ),
+    );
+  }
+}
+
+// ── Adaptive text foundation ──────────────────────────────────────
+// User direction: every text adapts its color to its background for
+// guaranteed contrast. All helpers below are pure/static (no
+// animation, no BackdropFilter) and compositor-safe.
+
+/// WCAG relative luminance of [c] (sRGB linearized per WCAG 2.x).
+double _luminance(Color c) {
+  double lin(double v) {
+    v /= 255.0;
+    return v <= 0.03928 ? v / 12.92 : math.pow((v + 0.055) / 1.055, 2.4).toDouble();
+  }
+
+  return 0.2126 * lin(c.r * 255.0) +
+      0.7152 * lin(c.g * 255.0) +
+      0.0722 * lin(c.b * 255.0);
+}
+
+/// WCAG contrast ratio of foreground [fg] over background [bg]:
+/// (L1 + 0.05) / (L2 + 0.05). Translucent [fg] is alpha-composited
+/// onto [bg] first, so muted colors (black87/white70) measure at
+/// their on-screen luminance, not their opaque equivalent.
+double _contrast(Color fg, Color bg) {
+  final a = fg.a;
+  double comp(double f, double b) => a * f + (1 - a) * b;
+  final eff = Color.fromARGB(
+    255,
+    (comp(fg.r, bg.r) * 255).round(),
+    (comp(fg.g, bg.g) * 255).round(),
+    (comp(fg.b, bg.b) * 255).round(),
+  );
+  final la = _luminance(eff);
+  final lb = _luminance(bg);
+  final hi = la > lb ? la : lb;
+  final lo = la > lb ? lb : la;
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+/// Primary text color on [bg]: returns [Colors.black] or [Colors.white],
+/// whichever gives the HIGHER WCAG contrast ratio against [bg].
+///
+/// Contrast guarantee: the winner always scores ≥ ~4.5:1 on opaque
+/// backgrounds (the black/white pair brackets every luminance, so the
+/// max of the two ratios is at least 4.5:1 for fully-opaque [bg]).
+/// Translucent [bg] blends with content behind it, so callers over
+/// artwork/photos should layer [TextScrim] underneath instead of
+/// relying on the raw surface color.
+Color textOn(Color bg) {
+  final blackC = _contrast(Colors.black, bg);
+  final whiteC = _contrast(Colors.white, bg);
+  return blackC >= whiteC ? Colors.black : Colors.white;
+}
+
+/// Secondary text color on [bg]: the higher-contrast of black87 /
+/// white70 against [bg].
+///
+/// Contrast guarantee with fallback: muted colors intentionally trade
+/// ratio for hierarchy, so if NEITHER candidate reaches 4.5:1 the
+/// result falls back to [textOn](bg) (full-contrast primary) to stay
+/// legible. Either way the returned color is the most legible of the
+/// secondary pair, and never worse than primary text.
+Color subtextOn(Color bg) {
+  const black87 = Color(0xDD000000);
+  const white70 = Color(0xB3FFFFFF);
+  final blackC = _contrast(black87, bg);
+  final whiteC = _contrast(white70, bg);
+  if (blackC < 4.5 && whiteC < 4.5) return textOn(bg);
+  return blackC >= whiteC ? black87 : white70;
+}
+
+/// Text that adapts its color to [background] for guaranteed contrast.
+///
+/// Merges with the ambient [DefaultTextStyle] (size/weight preserved —
+/// only the color is overridden), so it respects the Montserrat scale
+/// and text-scaling. Pass [secondary] for hierarchy text (falls back
+/// to primary contrast when muted colors can't reach 4.5:1).
+class AdaptiveText extends StatelessWidget {
+  final String data;
+  final Color background;
+  final TextStyle? style;
+  final bool secondary;
+  final TextAlign? align;
+  final int? maxLines;
+  final TextOverflow? overflow;
+  const AdaptiveText({
+    super.key,
+    required this.data,
+    required this.background,
+    this.style,
+    this.secondary = false,
+    this.align,
+    this.maxLines,
+    this.overflow,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final base = style ?? DefaultTextStyle.of(context).style;
+    return Text(
+      data,
+      style: base.copyWith(
+        color: secondary ? subtextOn(background) : textOn(background),
+      ),
+      textAlign: align,
+      maxLines: maxLines,
+      overflow: overflow,
+    );
+  }
+}
+
+/// Static gradient scrim behind text over artwork/photos where the
+/// background color is unknown (album art, mesh washes, thumbnails).
+///
+/// Compositor-safe: plain [DecoratedBox] gradient only — no
+/// BackdropFilter, no per-frame work. [radius] rounds the gradient via
+/// the decoration itself (no clip node needed unless the child can
+/// overflow, in which case callers wrap with [ClipRect]).
+class TextScrim extends StatelessWidget {
+  final Widget child;
+  final List<Color> scrim;
+  final List<double>? stops;
+  final AlignmentGeometry begin;
+  final AlignmentGeometry end;
+  final BorderRadius? radius;
+  final EdgeInsetsGeometry padding;
+  const TextScrim({
+    super.key,
+    required this.child,
+    // Light bottom-weighted wash: the text zone (bottom ~35%) gets a
+    // soft lift over ANY artwork, bright concert lights included.
+    // Stops pin a SHORT dark zone instead of washing the whole card —
+    // legibility rides the text shadow + AdaptiveText, not a black
+    // wash. Light placeholders stay dark green (track_row fallback),
+    // so white titles never sit on white.
+    this.scrim = const [
+      Color(0x99000000),
+      Color(0x52000000),
+      Colors.transparent
+    ],
+    this.stops = const [0.0, 0.35, 0.75],
+    this.begin = Alignment.bottomCenter,
+    this.end = Alignment.topCenter,
+    this.radius,
+    this.padding = EdgeInsets.zero,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: begin,
+          end: end,
+          colors: scrim,
+          stops: stops,
+        ),
+        borderRadius: radius,
+      ),
+      child: Padding(
+        padding: padding,
+        child: child,
+      ),
+    );
+  }
+}
+
+/// Primary text color on [Glass]/[GlassSheetSurface] material.
+/// Derived from the theme's [ColorScheme.onSurface] (never hardcoded),
+/// which is the AA-verified foreground for translucent surfaces:
+/// white in dark mode, black in light mode.
+Color glassText(bool dark) =>
+    crescaTheme(dark ? Brightness.dark : Brightness.light)
+        .colorScheme
+        .onSurface;
+
+/// Secondary text color on [Glass]/[GlassSheetSurface] material.
+/// Derived from the theme's [ColorScheme.onSurfaceVariant] (never
+/// hardcoded): spotifySubtext grey in dark mode, system grey in light
+/// mode — both AA-verified against the sheet's near-opaque base stops.
+Color glassSubtext(bool dark) =>
+    crescaTheme(dark ? Brightness.dark : Brightness.light)
+        .colorScheme
+        .onSurfaceVariant;

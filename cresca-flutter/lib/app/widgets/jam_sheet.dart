@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:share_plus/share_plus.dart';
 
+import '../../core/motion.dart' show motionMs;
 import '../../jam/protocol.dart';
 import '../app.dart';
 import '../design.dart';
@@ -36,17 +37,46 @@ class JamSheet extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final state = AppScope.of(context);
+    // Pinned header needs an opaque backing: the sheet glass is
+    // translucent at the top, so scrolled rows would ghost through
+    // the title. surfaceContainer at 0.94 reads as the same
+    // material fading to opaque (no solid-fill chrome elsewhere).
+    final headerBg = Theme.of(context)
+        .colorScheme
+        .surfaceContainer
+        .withValues(alpha: 0.94);
+    final dark =
+        Theme.of(context).brightness == Brightness.dark;
     return AnimatedBuilder(
       animation: state.jam,
       builder: (_, _) => GlassSheetSurface(
+        motionOn: state.motionOn,
         child: CustomScrollView(
           controller: scroll,
           slivers: [
+            SliverToBoxAdapter(
+              child: Center(
+                child: Container(
+                  margin: const EdgeInsets.only(top: 8),
+                  width: 40,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: Theme.of(context)
+                        .colorScheme
+                        .onSurfaceVariant
+                        .withValues(alpha: 0.5),
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+            ),
             SliverAppBar(
               pinned: true,
-              backgroundColor: Colors.transparent,
+              backgroundColor: headerBg,
               automaticallyImplyLeading: false,
-              title: const Text('JAM — listen together'),
+              title: Text('Listen together',
+                  style:
+                      TextStyle(color: glassText(dark))),
             ),
             SliverToBoxAdapter(
               child: Padding(
@@ -70,14 +100,38 @@ class _Body extends StatelessWidget {
   Widget build(BuildContext context) {
     final jam = state.jam;
     final connected = jam.connected;
-    if (!connected) return _JoinForm(state: state);
-    return _RoomCard(state: state, scroll: scroll);
+    // Section switch: join ⇄ room crossfades + slides (180 ms,
+    // transform/opacity only).
+    final ms = state.motionMs(180);
+    final d = Duration(milliseconds: ms);
+    return AnimatedSwitcher(
+      duration: d,
+      switchInCurve: Curves.easeOut,
+      switchOutCurve: Curves.easeOut,
+      transitionBuilder: (child, anim) => FadeTransition(
+        opacity: anim,
+        child: SlideTransition(
+          position: Tween(
+            begin: const Offset(0, 0.06),
+            end: Offset.zero,
+          ).animate(anim),
+          child: child,
+        ),
+      ),
+      child: connected
+          ? _RoomCard(
+              key: const ValueKey('room'),
+              state: state,
+              scroll: scroll)
+          : _JoinForm(
+              key: const ValueKey('join'), state: state),
+    );
   }
 }
 
 class _JoinForm extends StatefulWidget {
   final AppState state;
-  const _JoinForm({required this.state});
+  const _JoinForm({super.key, required this.state});
 
   @override
   State<_JoinForm> createState() => _JoinFormState();
@@ -87,6 +141,7 @@ class _JoinFormState extends State<_JoinForm> {
   late final TextEditingController _name;
   late final TextEditingController _code;
   bool _busy = false;
+  bool _showJoin = false;
 
   @override
   void initState() {
@@ -124,46 +179,114 @@ class _JoinFormState extends State<_JoinForm> {
   @override
   Widget build(BuildContext context) {
     final jam = widget.state.jam;
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final canCreate =
+        !_busy && _name.text.trim().isNotEmpty;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        const SizedBox(height: 8),
+        // Reference header: centered title + subtitle. Title carries an
+        // explicit glassText color (never an ambient const style) so it
+        // stays legible on the translucent sheet in both modes.
+        Text('Start a party',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+                color: glassText(dark),
+                fontSize: 28,
+                fontWeight: FontWeight.w800)),
+        const SizedBox(height: 8),
+        Text(
+            'Because music sounds better together. Invite friends to listen and add songs in real time, wherever they are.',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+                color: Theme.of(context)
+                    .colorScheme
+                    .onSurfaceVariant,
+                fontSize: 14,
+                height: 1.4)),
+        const SizedBox(height: 20),
         TextField(
           controller: _name,
           maxLength: 24,
+          onChanged: (_) {
+            try {
+              setState(() {});
+            } catch (_) {}
+          },
           decoration: const InputDecoration(
-              labelText: 'Your name', border: OutlineInputBorder()),
-        ),
-        const SizedBox(height: 12),
-        TextField(
-          controller: _code,
-          maxLength: 6,
-          textCapitalization: TextCapitalization.characters,
-          decoration: InputDecoration(
-            labelText: 'JAM code',
-            hintText: hostRoomFormatHint,
-            border: const OutlineInputBorder(),
-            suffixIcon: const Icon(Icons.dialpad_outlined),
-            errorText: _code.text.isNotEmpty &&
-                    !jamValidCode(_code.text)
-                ? '6 letters, no 0/O/1/I'
-                : null,
-          ),
-        ),
-        const SizedBox(height: 16),
-        FilledButton.icon(
-          style: spotifyPlayStyle(),
-          icon: const Icon(Icons.graphic_eq),
-          label: const Text('Start a JAM room'),
-          onPressed:
-              _busy ? null : () => _go(host: true),
+              labelText: 'Your name',
+              border: OutlineInputBorder()),
         ),
         const SizedBox(height: 8),
-        OutlinedButton.icon(
-          icon: const Icon(Icons.join_inner_outlined),
-          label: const Text('Join with code'),
+        FilledButton(
+          style: spotifyPlayStyle(),
           onPressed:
-              _busy ? null : () => _go(host: false),
+              canCreate ? () => _go(host: true) : null,
+          child: _busy
+              ? const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _DelayedSpinner(size: 20, strokeWidth: 2),
+                    SizedBox(width: 10),
+                    Text('Creating…',
+                        style: TextStyle(
+                            fontWeight: FontWeight.w700)),
+                  ],
+                )
+              : const Text('Create a party',
+                  style: TextStyle(
+                      fontWeight: FontWeight.w700)),
         ),
+        TextButton(
+          onPressed: _busy
+              ? null
+              : () => setState(
+                  () => _showJoin = !_showJoin),
+          child: const Text('Join existing'),
+        ),
+        if (_showJoin)
+          FadeSlide(
+            key: const ValueKey('join-fields'),
+            motionOn: widget.state.motionOn,
+            child: Column(
+              crossAxisAlignment:
+                  CrossAxisAlignment.stretch,
+              children: [
+                const SizedBox(height: 4),
+                TextField(
+                  controller: _code,
+                  maxLength: 6,
+                  textCapitalization:
+                      TextCapitalization.characters,
+                  decoration: InputDecoration(
+                    labelText: 'JAM code',
+                    hintText: hostRoomFormatHint,
+                    border:
+                        const OutlineInputBorder(),
+                    suffixIcon: const Icon(
+                        Icons.dialpad_outlined),
+                    errorText:
+                        _code.text.isNotEmpty &&
+                                !jamValidCode(
+                                    _code.text)
+                            ? '6 letters, no 0/O/1/I'
+                            : null,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  icon: const Icon(
+                      Icons.join_inner_outlined),
+                  label:
+                      const Text('Join with code'),
+                  onPressed: _busy
+                      ? null
+                      : () => _go(host: false),
+                ),
+              ],
+            ),
+          ),
         const SizedBox(height: 8),
         if (jam.pendingCode.isNotEmpty && !_busy)
           Padding(
@@ -188,12 +311,29 @@ const String hostRoomFormatHint = '6 letters';
 class _RoomCard extends StatelessWidget {
   final AppState state;
   final ScrollController scroll;
-  const _RoomCard({required this.state, required this.scroll});
+  const _RoomCard(
+      {super.key, required this.state, required this.scroll});
 
   @override
   Widget build(BuildContext context) {
     final jam = state.jam;
     final dark = Theme.of(context).brightness == Brightness.dark;
+    // Room card stays neutral glass: green is reserved for actions
+    // (Create/Join buttons), so the card uses the adaptive surface
+    // ramp with matching legible text in both modes.
+    final cardTop =
+        dark ? const Color(0xFF333336) : Colors.white;
+    final cardBottom = dark
+        ? const Color(0xFF1C1C1E)
+        : const Color(0xFFE9E9EC);
+    // Room text verified against the card's mid-gradient tone: textOn
+    // picks the higher-contrast black/white, subtextOn the legible
+    // secondary (falling back to primary below 4.5:1) — no hardcoded
+    // white70/black54 that would wash out in either mode.
+    final cardBg =
+        Color.lerp(cardTop, cardBottom, 0.5) ?? cardTop;
+    final onCard = textOn(cardBg);
+    final subCard = subtextOn(cardBg);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -201,10 +341,16 @@ class _RoomCard extends StatelessWidget {
           padding: const EdgeInsets.all(16),
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(20),
-            gradient: const LinearGradient(colors: [
-              Color(0xFF1DB954),
-              Color(0xFF0D5C2B)
+            gradient: LinearGradient(colors: [
+              cardTop,
+              cardBottom,
             ]),
+            border: Border.all(
+              color: dark
+                  ? Colors.white.withValues(alpha: 0.14)
+                  : Colors.black.withValues(alpha: 0.10),
+              width: 1,
+            ),
           ),
           child: Row(
             children: [
@@ -228,12 +374,12 @@ class _RoomCard extends StatelessWidget {
                   children: [
                     Text(jam.isHost ? 'You are the host'
                         : 'Guest of the room',
-                        style: const TextStyle(
-                            color: Colors.white70,
+                        style: TextStyle(
+                            color: subCard,
                             fontSize: 12)),
                     Text(jam.code,
-                        style: const TextStyle(
-                            color: Colors.white,
+                        style: TextStyle(
+                            color: onCard,
                             fontSize: 30,
                             fontWeight: FontWeight.w800,
                             letterSpacing: 3)),
@@ -241,50 +387,97 @@ class _RoomCard extends StatelessWidget {
                         '${jam.membersCount} member'
                         '${jam.membersCount == 1 ? '' : 's'}'
                         ' • ${_stateLine(state)}',
-                        style: const TextStyle(
-                            color: Colors.white70)),
+                        style: TextStyle(
+                            color: subCard)),
                   ],
                 ),
               ),
               Column(children: [
                 IconButton(
                   tooltip: 'Share',
-                  icon: const Icon(Icons.share_outlined,
-                      color: Colors.white),
+                  icon: Icon(Icons.share_outlined,
+                      color: onCard),
                   onPressed: () => _share(context, jam.code),
                 ),
                 const SizedBox(height: 4),
-                Switch(
-                  value: jam.guestAllowed,
-                  activeThumbColor: Colors.black,
-                  onChanged: jam.isHost
-                      ? (v) =>
-                          state.jamSetGuestAllowed(v)
-                      : null,
+                // Toggle track tints smoothly (AnimatedContainer,
+                // transform/opacity-class property animation).
+                AnimatedContainer(
+                  duration: Duration(
+                      milliseconds:
+                          state.motionMs(180)),
+                  curve: Curves.easeOut,
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 6),
+                  decoration: BoxDecoration(
+                    color: jam.guestAllowed
+                        ? Theme.of(context)
+                            .colorScheme
+                            .primary
+                            .withValues(alpha: 0.30)
+                        : Colors.black
+                            .withValues(alpha: 0.25),
+                    borderRadius:
+                        BorderRadius.circular(16),
+                  ),
+                  child: Switch(
+                    value: jam.guestAllowed,
+                    activeThumbColor: dark
+                        ? Colors.white
+                        : Colors.black,
+                    onChanged: jam.isHost
+                        ? (v) =>
+                            state.jamSetGuestAllowed(v)
+                        : null,
+                  ),
                 ),
-                const Text('Guests control',
+                Text('Guests control',
                     style: TextStyle(
-                        color: Colors.white70,
+                        color: subCard,
                         fontSize: 10)),
               ]),
             ],
           ),
         ),
         const SizedBox(height: 10),
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: [
-            for (final m in jam.members)
-              Chip(
-                avatar: Icon(m.host
-                    ? Icons.star
-                    : Icons.person_outline,
-                    size: 18,
-                    color: dark ? Colors.white : Colors.black),
-                label: Text(m.name + (m.host ? ' (host)' : '')),
-              ),
-          ],
+        // Members empty ⇄ chips crossfade (180 ms, motion-gated) so
+        // the first join never pops the layout.
+        AnimatedSwitcher(
+          duration: Duration(
+              milliseconds: motionMs(state.motionOn, 180)),
+          switchInCurve: Curves.easeOut,
+          switchOutCurve: Curves.easeOut,
+          child: jam.members.isEmpty
+              ? Padding(
+                  key: const ValueKey('jam-no-members'),
+                  padding:
+                      const EdgeInsets.symmetric(vertical: 4),
+                  child: Text(
+                      'No members yet — share the code to invite.',
+                      style: Theme.of(context)
+                          .textTheme
+                          .bodySmall),
+                )
+              : Wrap(
+                  key: const ValueKey('jam-members'),
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final m in jam.members)
+                      RepaintBoundary(
+                        child: Chip(
+                          avatar: Icon(
+                              m.host
+                                  ? Icons.star
+                                  : Icons.person_outline,
+                              size: 18,
+                              color: glassText(dark)),
+                          label: Text(m.name +
+                              (m.host ? ' (host)' : '')),
+                        ),
+                      ),
+                  ],
+                ),
         ),
         if (jam.statusLine.isNotEmpty)
           Padding(
@@ -295,15 +488,53 @@ class _RoomCard extends StatelessWidget {
         const SizedBox(height: 8),
         Text('Queue',
             style: Theme.of(context).textTheme.titleSmall),
-        for (final t in state.jamQueueView())
-          ListTile(
-            dense: true,
-            title: Text(t.title, maxLines: 1,
-                overflow: TextOverflow.ellipsis),
-            subtitle: Text(t.displayArtist(), maxLines: 1,
-                overflow: TextOverflow.ellipsis),
-            leading: const Icon(Icons.music_note_outlined),
-          ),
+        Builder(builder: (context) {
+          final q = state.jamQueueView();
+          // Queue empty ⇄ rows crossfade (180 ms, motion-gated).
+          return AnimatedSwitcher(
+            duration: Duration(
+                milliseconds:
+                    motionMs(state.motionOn, 180)),
+            switchInCurve: Curves.easeOut,
+            switchOutCurve: Curves.easeOut,
+            child: q.isEmpty
+                ? Padding(
+                    key: const ValueKey('jam-q-empty'),
+                    padding:
+                        const EdgeInsets.symmetric(
+                            vertical: 8),
+                    child: Text(
+                        'Queue is empty — guests can add songs.',
+                        style: Theme.of(context)
+                            .textTheme
+                            .bodySmall),
+                  )
+                : Column(
+                    key: const ValueKey('jam-q-list'),
+                    children: [
+                      for (final t in q)
+                        RepaintBoundary(
+                          child: ListTile(
+                            dense: true,
+                            contentPadding:
+                                EdgeInsets.zero,
+                            title: Text(t.title,
+                                maxLines: 1,
+                                overflow:
+                                    TextOverflow.ellipsis),
+                            subtitle: Text(
+                                t.displayArtist(),
+                                maxLines: 1,
+                                overflow:
+                                    TextOverflow.ellipsis),
+                            leading: const Icon(Icons
+                                .music_note_outlined),
+                          ),
+                        ),
+                    ],
+                  ),
+          );
+        }),
         const SizedBox(height: 16),
         Row(children: [
           Expanded(
@@ -344,5 +575,65 @@ class _RoomCard extends StatelessWidget {
             'cresca://jam/$code',
       ));
     } catch (_) {}
+  }
+}
+
+/// Spinner that reserves its slot from frame one (no size jump) and
+/// fades in only after 300 ms (no flicker on fast loads). Motion-off
+/// shows it immediately (1 ms via [motionMs]).
+class _DelayedSpinner extends StatefulWidget {
+  final double size;
+  final double strokeWidth;
+  const _DelayedSpinner({this.size = 20, this.strokeWidth = 2});
+
+  @override
+  State<_DelayedSpinner> createState() => _DelayedSpinnerState();
+}
+
+class _DelayedSpinnerState extends State<_DelayedSpinner> {
+  bool _show = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // Motion flag reads post-frame: dependOnInheritedWidget is illegal
+    // in initState, so the delay starts once the scope is readable.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      bool on = true;
+      try {
+        on = AppScope.of(context).motionOn;
+      } catch (_) {}
+      if (!on) {
+        setState(() => _show = true);
+        return;
+      }
+      Future<void>.delayed(
+          const Duration(milliseconds: 300), () {
+        if (mounted) setState(() => _show = true);
+      });
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    bool on = true;
+    try {
+      on = AppScope.of(context).motionOn;
+    } catch (_) {}
+    return SizedBox(
+      width: widget.size,
+      height: widget.size,
+      child: AnimatedOpacity(
+        opacity: _show ? 1.0 : 0.0,
+        duration:
+            Duration(milliseconds: motionMs(on, 180)),
+        curve: Curves.easeOut,
+        child: _show
+            ? CircularProgressIndicator(
+                strokeWidth: widget.strokeWidth)
+            : null,
+      ),
+    );
   }
 }

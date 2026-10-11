@@ -14,9 +14,10 @@ import 'dart:convert';
 import 'package:crypto/crypto.dart';
 
 import '../core/track.dart';
+import '../podcasts/models.dart';
 
 /// On-device client specs (InnerTune/Metrolist pattern). Versions pinned
-/// from InnerTune; bump only when YouTube 403/400s across clients.
+/// from InnerTune/yt-dlp; bump only when YouTube 403/400s across clients.
 class TubeClient {
   final String name;
   final String version;
@@ -25,6 +26,9 @@ class TubeClient {
   final String? referer;
   final int androidSdkVersion;
   final String osName;
+  final String osVersion;
+  final String deviceMake;
+  final String deviceModel;
   const TubeClient({
     required this.name,
     required this.version,
@@ -33,6 +37,9 @@ class TubeClient {
     this.referer,
     this.androidSdkVersion = 34,
     this.osName = '',
+    this.osVersion = '',
+    this.deviceMake = '',
+    this.deviceModel = '',
   });
 
   static const uaWeb =
@@ -43,7 +50,7 @@ class TubeClient {
   /// music.youtube.com search/browse — shelves, stable.
   static const webRemix = TubeClient(
     name: 'WEB_REMIX',
-    version: '1.20260218.01.00',
+    version: '1.20260707.12.00',
     apiKey: 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30',
     userAgent: uaWeb,
     referer: 'https://music.youtube.com/',
@@ -58,32 +65,80 @@ class TubeClient {
   );
 
   /// Oculus — direct signed URLs, no cipher (~200ms fast path).
+  /// 2026 note: still answers OK with direct URLs, but YouTube
+  /// selectively 403s them at fetch on flagged IPs (GVS poToken
+  /// rollout) — visionos is the reliable leg now.
   static const androidVr = TubeClient(
     name: 'ANDROID_VR',
-    version: '1.57.21',
+    version: '1.65.10',
     apiKey: 'AIzaSyAOghZGza2MQSZkY_zfZ370N-PUdXEo8AI',
-    userAgent: uaAndroid,
+    userAgent:
+        'com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+    androidSdkVersion: 32,
+    osName: 'Android',
+    osVersion: '12L',
+    deviceMake: 'Oculus',
+    deviceModel: 'Quest 3',
+  );
+
+  /// iOS — direct signed URLs, no cipher, NO GVS poToken gate.
+  /// yt-dlp's primary default player client since 2025.11 (their
+  /// BASE_CLIENTS = tv,web,mweb,android,ios). REQUIRE_JS_PLAYER=False
+  /// so no n-signature decipher needed. The Apple device fields +
+  /// iOS UA travel together or the player 400s. Verified live
+  /// 2026-10: OK + probe 206 across videos.
+  static const ios = TubeClient(
+    name: 'IOS',
+    version: '21.26.4',
+    apiKey: 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8',
+    userAgent:
+        'com.google.ios.youtube/21.26.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
+    osName: 'iPhone',
+    osVersion: '18.3.2.22D82',
+    deviceMake: 'Apple',
+    deviceModel: 'iPhone16,2',
+  );
+
+  /// Vision Pro — direct signed URLs, no cipher, NO GVS poToken gate.
+  /// yt-dlp's primary default client since 2026 (their policy table is
+  /// the only client with no poToken requirement + JS-less). Needs the
+  /// Apple device fields + desktop-Safari UA exactly as pinned or the
+  /// player 400s. Verified live 2026-10: OK + probe 206 across videos,
+  /// works via the music.youtube.com host with the session visitor
+  /// riding context + X-Goog-Visitor-Id (bot-gate parity).
+  static const visionos = TubeClient(
+    name: 'VISIONOS',
+    version: '1.02',
+    apiKey: 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8',
+    userAgent:
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15',
+    osName: 'visionOS',
+    osVersion: '26.5.23O471',
+    deviceMake: 'Apple',
+    deviceModel: 'RealityDevice17,1',
   );
 
   /// Fallback for browse/next when music clients fail.
   static const web = TubeClient(
     name: 'WEB',
-    version: '2.20260218.01.00',
+    version: '2.20260708.00.00',
     apiKey: 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30',
     userAgent: uaWeb,
   );
 
   /// Phone client for the NewPipe-equivalent resolve leg: needs a fresh
   /// signatureTimestamp (see fetchSignatureTimestamp) or the player
-  /// answers UNPLAYABLE/LOGIN_REQUIRED like the music clients.
+  /// answers UNPLAYABLE/LOGIN_REQUIRED like the music clients. Version
+  /// pinned to yt-dlp's maintained ANDROID spec (2026).
   static const androidPhone = TubeClient(
     name: 'ANDROID',
-    version: '20.10.38',
+    version: '21.26.364',
     apiKey: 'AIzaSyAOghZGza2MQSZkY_zfZ370N-PUdXEo8AI',
     userAgent:
-        'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip',
+        'com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip',
     androidSdkVersion: 30,
     osName: 'Android',
+    osVersion: '11',
   );
 }
 
@@ -103,17 +158,31 @@ Map<String, dynamic> contextMap(TubeClient client, String visitorData) {
     c['androidSdkVersion'] = client.androidSdkVersion;
   }
   if (client.osName.isNotEmpty) c['osName'] = client.osName;
+  if (client.osVersion.isNotEmpty) c['osVersion'] = client.osVersion;
+  if (client.deviceMake.isNotEmpty) c['deviceMake'] = client.deviceMake;
+  if (client.deviceModel.isNotEmpty) {
+    c['deviceModel'] = client.deviceModel;
+  }
   return {
     'client': c,
     'user': {'lockedSafetyMode': false},
   };
 }
 
-Map<String, dynamic> searchBody(
-        String query, String visitorData) =>
+/// YTM "Songs" chip filter (ytmusicapi parity): the server returns the
+/// Songs shelf only — album/artist/playlist/podcast cards never arrive,
+/// so there is less payload to download and nothing non-song to parse.
+/// Verified live 2026-10: 200 + song rows + zero two-row cards on song
+/// queries. No-match queries fall back to the extractor leg in the
+/// repository, so a filtered-empty never strands the user.
+const String searchSongsParams = 'EgWKAQIIAWoQEAMQBBAJEAoQEBAQFQ';
+
+Map<String, dynamic> searchBody(String query, String visitorData,
+        {bool songsOnly = true}) =>
     {
       'context': contextMap(TubeClient.webRemix, visitorData),
       'query': query,
+      if (songsOnly) 'params': searchSongsParams,
     };
 
 Map<String, dynamic> suggestionBody(
@@ -322,7 +391,56 @@ String _artistSeg(List<String> segs) {
   return segs.isEmpty ? '' : segs.first;
 }
 
-YtTrack? parseMusicItem(Map<String, dynamic> r) {
+/// Non-song type badges: when the FIRST subtitle segment is one of these,
+/// the row is an album/playlist/artist/podcast card — never a song.
+/// Song/video/single badges (or a leading artist name) are playable
+/// song rows and are kept. The middle segments are free-form (album
+/// names like "Album" in "Arijit Singh • Album • 4:22" stay untouched).
+const _nonSongBadges = {
+  'album',
+  'albums',
+  'playlist',
+  'playlists',
+  'artist',
+  'artists',
+  'podcast',
+  'podcasts',
+  'episode',
+  'episodes',
+  'ep',
+  'eps',
+  'movie',
+  'movies',
+  'film',
+  'show',
+  'shows',
+  'trailer',
+  'trailers',
+  'audiobook',
+  'audiobooks',
+};
+
+/// True when subtitle segments open with a non-song content-type badge.
+bool _isNonSongRow(List<String> segs) {
+  try {
+    if (segs.isEmpty) return false;
+    final first = segs.first.toLowerCase();
+    if (first == 'song' ||
+        first == 'songs' ||
+        first == 'single' ||
+        first == 'singles' ||
+        first == 'video' ||
+        first == 'videos') {
+      return false;
+    }
+    return _nonSongBadges.contains(first);
+  } catch (_) {
+    return false;
+  }
+}
+
+YtTrack? parseMusicItem(Map<String, dynamic> r,
+    {bool requireDuration = false}) {
   try {
     if (_isReelNav(r)) return null;
     String? videoId;
@@ -366,6 +484,9 @@ YtTrack? parseMusicItem(Map<String, dynamic> r) {
               .map((e) => e.trim())
               .where((e) => e.isNotEmpty)
               .toList();
+          // Songs-only: album/playlist/artist/podcast cards open with a
+          // type badge ("Album • Best of • 2024") — dropped at parse time.
+          if (_isNonSongRow(segs)) return null;
           final who = _artistSeg(segs);
           if (who.isNotEmpty) {
             artist = who;
@@ -379,6 +500,13 @@ YtTrack? parseMusicItem(Map<String, dynamic> r) {
     if (title.isEmpty) return null;
     // Lives have no usable duration segment; badges say LIVE.
     if (durationSec < 0 && hasLiveBadge(r)) return null;
+    // Search is songs-only: song rows always carry a trailing M:SS, so
+    // album/playlist/artist/podcast cards without one die here. Shelves
+    // and playlist items keep the default (durations optional there).
+    if (requireDuration &&
+        (durationSec < 30 || durationSec > 600)) {
+      return null;
+    }
     // Known duration must be a song: 30s-10min.
     if (durationSec >= 0 &&
         (durationSec < 30 || durationSec > 600)) {
@@ -411,14 +539,15 @@ YtTrack? parseVideoItem(Map<String, dynamic> r) {
     if (videoId.length != 11) return null;
     if (hasLiveBadge(r)) return null;
     if (_isReelNav(r)) return null;
-    // lengthText "12:34": songs only, 30s-10min.
+    // Search backfill is songs-only: a video row without a known 30s–
+    // 10min length is a stream/podcast/gibberish upload, never a song.
     try {
       final len = _runsText(r['lengthText']) ?? '';
-      if (len.isNotEmpty) {
-        final s = parseLengthSec(len);
-        if (s != null && (s < 30 || s > 600)) return null;
-      }
-    } catch (_) {}
+      final s = len.isEmpty ? null : parseLengthSec(len);
+      if (s == null || s < 30 || s > 600) return null;
+    } catch (_) {
+      return null;
+    }
     final title = _runsText(r['title']) ?? '';
     if (title.isEmpty) return null;
     String artist = 'YouTube';
@@ -495,25 +624,75 @@ void collectMaps(dynamic node, String key, List<Map<String, dynamic>> acc) {
   } catch (_) {}
 }
 
-/// Search parse: music items first, plain videoRenderer fallback.
-/// Dedupes ids, caps at max.
+/// Single-pass bounded collector for the two playable renderer kinds:
+/// one DFS pre-order walk (top results first) banking music rows and
+/// plain video rows together, stopping descent once both banks are
+/// full. Keeps search parse proportional to the rows actually shown
+/// instead of the whole page. Playlist/album/artist/podcast/channel
+/// cards are never collected — skipped at parse time, not filtered
+/// after the fact.
+void _collectSongRenderers(
+  dynamic node,
+  List<Map<String, dynamic>> music,
+  List<Map<String, dynamic>> videos,
+  int musicLimit,
+  int videoLimit,
+) {
+  try {
+    if (music.length >= musicLimit && videos.length >= videoLimit) return;
+    if (node is Map) {
+      final m = node.cast<String, dynamic>();
+      if (m.containsKey('musicResponsiveListItemRenderer')) {
+        final hit = _map(m['musicResponsiveListItemRenderer']);
+        if (hit != null && music.length < musicLimit) music.add(hit);
+      } else if (m.containsKey('videoRenderer')) {
+        final hit = _map(m['videoRenderer']);
+        if (hit != null && videos.length < videoLimit) videos.add(hit);
+      }
+      if (music.length >= musicLimit && videos.length >= videoLimit) {
+        return;
+      }
+      for (final v in m.values) {
+        _collectSongRenderers(v, music, videos, musicLimit, videoLimit);
+        if (music.length >= musicLimit && videos.length >= videoLimit) {
+          return;
+        }
+      }
+    } else if (node is List) {
+      for (final e in node) {
+        _collectSongRenderers(e, music, videos, musicLimit, videoLimit);
+        if (music.length >= musicLimit && videos.length >= videoLimit) {
+          return;
+        }
+      }
+    }
+  } catch (_) {}
+}
+
+/// Search parse: SONGS ONLY. Music song rows first (duration REQUIRED:
+/// song rows always carry a trailing M:SS; album/playlist/artist/podcast
+/// cards without one die at parse time); plain videoRenderer hits only
+/// as a duration-gated backfill (music videos live there).
+/// Playlist/album/artist/podcast/channel renderers are never collected —
+/// they are skipped at parse time, not filtered after the fact.
+/// Single bounded walk with early exit; dedupes ids, caps at max.
 List<YtTrack> parseSearch(Map<String, dynamic> root, int max) {
   final out = <YtTrack>[];
   try {
-    final found = <Map<String, dynamic>>[];
-    collectMaps(root, 'musicResponsiveListItemRenderer', found);
+    if (max <= 0) return out;
     final seen = <String>{};
+    final found = <Map<String, dynamic>>[];
+    final vids = <Map<String, dynamic>>[];
+    _collectSongRenderers(root, found, vids, max + 4, max + 4);
     for (final r in found) {
       try {
-        final t = parseMusicItem(r);
+        final t = parseMusicItem(r, requireDuration: true);
         if (t == null) continue;
         if (seen.add(t.id)) out.add(t);
         if (out.length >= max) break;
       } catch (_) {}
     }
     if (out.length < max) {
-      final vids = <Map<String, dynamic>>[];
-      collectMaps(root, 'videoRenderer', vids);
       for (final r in vids) {
         try {
           final t = parseVideoItem(r);
@@ -744,6 +923,398 @@ Map<String, List<YtTrack>> parseShelves(
               }
               if (t == null) continue;
               if (seen.add(t.id)) items.add(t);
+              if (items.length >= perShelf) break;
+            } catch (_) {}
+          }
+        }
+        if (items.isNotEmpty) {
+          out[title] = items;
+          if (out.length >= maxShelves) break;
+        }
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return out;
+}
+
+// ---------- podcasts (ADDITIVE MVP slice) ----------
+// Episode/show fetch rides the same youtubei host with podcast-shaped
+// bodies + parallel parsers. The shared songs-only gates
+// (_nonSongBadges, _isNonSongRow, 30–600 s duration checks,
+// isMusicJunk) are NEVER widened or called here: episode rows branch on
+// their own kind-local rules below.
+//
+// Live-probe notes (research P0): the Podcasts kiosk browseId and the
+// Episodes/Shows search-filter params below are UNVERIFIED against this
+// codebase's traffic. Search therefore posts UNFILTERED (no params,
+// same as the video leg) and selects episode-shaped rows at parse time;
+// show pages post the caller-supplied browseId verbatim.
+
+/// Hypothesized YTM Podcasts kiosk browseId (analogy with FEmusic_home).
+/// UNVERIFIED live — callers must tolerate empty shelves (service falls
+/// back gracefully) until a probe confirms it.
+const String podcastKioskBrowseId = 'FEmusic_podcasts';
+
+/// Episode duration window: 60 s – 5 h. Rows outside a KNOWN duration in
+/// this window are clips/junk; rows with NO duration segment are kept
+/// (-1 = unknown) since some episode rows carry none.
+const int podcastMinSec = 60;
+const int podcastMaxSec = 5 * 3600;
+
+/// Unfiltered search body for podcast queries: deliberately NO
+/// searchSongsParams (that chip returns the Songs shelf only). Episode
+/// selection happens in parsePodcastSearch, never by widening the
+/// songs-only path.
+Map<String, dynamic> podcastSearchBody(
+        String query, String visitorData) =>
+    {
+      'context': contextMap(TubeClient.webRemix, visitorData),
+      'query': query,
+    };
+
+/// Browse body for a podcast show page (MPREb_*-style id supplied by
+/// the caller — never hardcoded from memory). Same envelope as
+/// browseBody under a podcast-named wrapper for call-site clarity.
+Map<String, dynamic> podcastShowBody(
+        String browseId, String visitorData) =>
+    {
+      'context': contextMap(TubeClient.webRemix, visitorData),
+      'browseId': browseId,
+    };
+
+/// Leading content-type badges skipped when resolving the SHOW name
+/// from subtitle segments ("Podcast • My Show • 45:12" → "My Show").
+/// Local to podcast parsing — the shared _nonSongBadges set is
+/// untouched.
+const _podcastBadgeSegs = {
+  'podcast',
+  'podcasts',
+  'episode',
+  'episodes',
+  'ep',
+  'eps',
+  'show',
+  'shows',
+  'audiobook',
+  'audiobooks',
+};
+
+String _podShowTitle(List<String> segs) {
+  try {
+    for (final s in segs) {
+      if (s.isEmpty) continue;
+      if (_podcastBadgeSegs.contains(s.toLowerCase())) continue;
+      // Trailing duration segments are never the show.
+      if (parseLengthSec(s) != null) continue;
+      // Date-ish segments are never the show.
+      if (_looksLikeDateSeg(s)) continue;
+      return s;
+    }
+    return '';
+  } catch (_) {
+    return '';
+  }
+}
+
+bool _looksLikeDateSeg(String s) {
+  try {
+    final low = s.toLowerCase();
+    if (RegExp(r'\b(19|20)\d{2}\b').hasMatch(s)) return true;
+    const months = [
+      'jan',
+      'feb',
+      'mar',
+      'apr',
+      'may',
+      'jun',
+      'jul',
+      'aug',
+      'sep',
+      'oct',
+      'nov',
+      'dec'
+    ];
+    for (final m in months) {
+      if (low.contains(m)) return true;
+    }
+    if (RegExp(
+            r'\d+\s+(second|minute|hour|day|week|month|year)s?\s+ago')
+        .hasMatch(low)) {
+      return true;
+    }
+    return false;
+  } catch (_) {
+    return false;
+  }
+}
+
+/// First date-ish subtitle segment ("Mar 4, 2026", "3 days ago"),
+/// else ''. Never throws.
+String podPublishLabel(List<String> segs) {
+  try {
+    for (final s in segs) {
+      if (s.isNotEmpty && _looksLikeDateSeg(s)) return s;
+    }
+    return '';
+  } catch (_) {
+    return '';
+  }
+}
+
+List<String> _podSubtitleSegs(Map<String, dynamic> r) {
+  try {
+    final flex = r['flexColumns'];
+    if (flex is List && flex.length > 1) {
+      final c1 = _map(
+          _map(flex[1])?['musicResponsiveListItemFlexColumnRenderer']);
+      final sub = _runsText(c1?['text']) ?? '';
+      return sub
+          .split('•')
+          .map((e) => e.trim())
+          .where((e) => e.isNotEmpty)
+          .toList();
+    }
+    final sub = _runsText(r['subtitle']) ?? '';
+    return sub
+        .split('•')
+        .map((e) => e.trim())
+        .where((e) => e.isNotEmpty)
+        .toList();
+  } catch (_) {
+    return const [];
+  }
+}
+
+String _podThumb(Map<String, dynamic> r) {
+  try {
+    final thumbs = _dig(r, [
+      'thumbnail',
+      'musicThumbnailRenderer',
+      'thumbnail'
+    ])?['thumbnails'];
+    if (thumbs is List && thumbs.isNotEmpty) {
+      return ((_map(thumbs.last))?['url'] ?? '').toString();
+    }
+    final arr = _map(r['thumbnail'])?['thumbnails'];
+    if (arr is List && arr.isNotEmpty) {
+      return ((_map(arr.last))?['url'] ?? '').toString();
+    }
+  } catch (_) {}
+  return '';
+}
+
+String? _podVideoId(Map<String, dynamic> r) {
+  try {
+    var videoId = _map(r['playlistItemData'])?['videoId']?.toString();
+    if (videoId == null || videoId.isEmpty) {
+      videoId = _dig(r, [
+        'overlay',
+        'musicItemThumbnailOverlayRenderer',
+        'content',
+        'musicPlayButtonRenderer',
+        'playNavigationEndpoint',
+        'watchEndpoint',
+      ])?['videoId']
+          ?.toString();
+    }
+    if (videoId == null || videoId.isEmpty) {
+      videoId = _watchId(_map(r['navigationEndpoint']));
+    }
+    if (videoId == null || videoId.length != 11) return null;
+    return videoId;
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Music-channel gate for episode rows: auto-generated Topic
+/// channels and VEVO carry songs/music videos, never podcast
+/// episodes. Local to podcast parsing — shared gates untouched.
+bool _podIsMusicChannel(String s) {
+  try {
+    final t = s.trim();
+    if (t.isEmpty) return false;
+    final low = t.toLowerCase();
+    if (low.endsWith('- topic') ||
+        low.endsWith('\u2013 topic') ||
+        low.endsWith('– topic')) {
+      return true;
+    }
+    if (low == 'vevo' ||
+        low.endsWith('vevo') ||
+        RegExp(r'\bvevo\b').hasMatch(low)) {
+      return true;
+    }
+    return false;
+  } catch (_) {
+    return false;
+  }
+}
+
+/// Episode-row parser (musicResponsiveListItemRenderer shape). Branch-on-
+/// kind: does NOT call _isNonSongRow / isMusicJunk / song duration
+/// gates. Drops only reels, lives, empty titles, and known sub-60 s
+/// clips / over-5 h outliers. Unknown durations kept (-1).
+PodcastEpisode? parsePodcastEpisodeItem(Map<String, dynamic> r) {
+  try {
+    if (_isReelNav(r)) return null;
+    if (hasLiveBadge(r)) return null;
+    final videoId = _podVideoId(r);
+    if (videoId == null) return null;
+    String title = '';
+    try {
+      final flex = r['flexColumns'];
+      if (flex is List && flex.isNotEmpty) {
+        final c0 = _map(
+            _map(flex[0])?['musicResponsiveListItemFlexColumnRenderer']);
+        title = _runsText(c0?['text']) ?? '';
+      }
+      title = title.trim();
+    } catch (_) {}
+    if (title.isEmpty) return null;
+    final segs = _podSubtitleSegs(r);
+    int durationSec = -1;
+    if (segs.isNotEmpty) {
+      durationSec = parseLengthSec(segs.last) ?? -1;
+    }
+    if (durationSec >= 0 &&
+        (durationSec < podcastMinSec ||
+            durationSec > podcastMaxSec)) {
+      return null;
+    }
+    final show = _podShowTitle(segs);
+    if (_podIsMusicChannel(show)) return null;
+    final thumb = _podThumb(r);
+    return PodcastEpisode(
+      id: videoId,
+      title: title,
+      showTitle: show,
+      durationSec: durationSec,
+      publishDate: podPublishLabel(segs),
+      thumbUrl: sharpThumb(thumb),
+      watchUrl: 'https://www.youtube.com/watch?v=$videoId',
+    );
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Episode-row parser (musicTwoRowItemRenderer carousel shape):
+/// title + navigationEndpoint watch id + subtitle segs. Same kind-local
+/// gates as parsePodcastEpisodeItem. Thumb best-effort ('').
+PodcastEpisode? parsePodcastTwoRowEpisode(Map<String, dynamic> r) {
+  try {
+    if (_isReelNav(r)) return null;
+    if (hasLiveBadge(r)) return null;
+    final videoId = _watchId(_map(r['navigationEndpoint']));
+    if (videoId == null) return null;
+    final title = (_runsText(r['title']) ?? '').trim();
+    if (title.isEmpty) return null;
+    final segs = _podSubtitleSegs(r);
+    int durationSec = -1;
+    for (final s in segs) {
+      final secs = parseLengthSec(s);
+      if (secs != null) {
+        durationSec = secs;
+        break;
+      }
+    }
+    if (durationSec >= 0 &&
+        (durationSec < podcastMinSec ||
+            durationSec > podcastMaxSec)) {
+      return null;
+    }
+    final twoRowShow = _podShowTitle(segs);
+    if (_podIsMusicChannel(twoRowShow)) return null;
+    return PodcastEpisode(
+      id: videoId,
+      title: title,
+      showTitle: _podShowTitle(segs),
+      durationSec: durationSec,
+      publishDate: podPublishLabel(segs),
+      watchUrl: 'https://www.youtube.com/watch?v=$videoId',
+    );
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Podcast search parse: every musicResponsiveListItemRenderer row is
+/// tried as an EPISODE row (parsePodcastEpisodeItem), plus two-row
+/// carousel hits. Dedupes ids, caps at max. Never throws.
+List<PodcastEpisode> parsePodcastSearch(
+    Map<String, dynamic> root, int max) {
+  final out = <PodcastEpisode>[];
+  try {
+    if (max <= 0) return out;
+    final seen = <String>{};
+    final items = <Map<String, dynamic>>[];
+    collectMaps(root, 'musicResponsiveListItemRenderer', items);
+    for (final r in items) {
+      try {
+        final ep = parsePodcastEpisodeItem(r);
+        if (ep == null) continue;
+        if (seen.add(ep.id)) out.add(ep);
+        if (out.length >= max) return out;
+      } catch (_) {}
+    }
+    final twos = <Map<String, dynamic>>[];
+    collectMaps(root, 'musicTwoRowItemRenderer', twos);
+    for (final r in twos) {
+      try {
+        final ep = parsePodcastTwoRowEpisode(r);
+        if (ep == null) continue;
+        if (seen.add(ep.id)) out.add(ep);
+        if (out.length >= max) break;
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return out;
+}
+
+/// Podcast shelf parse: title → episode rows (first title wins),
+/// per-shelf cap, shelf cap. Parallel to parseShelves; supports list,
+/// two-row, and bare shapes. Never throws.
+Map<String, List<PodcastEpisode>> parsePodcastShelves(
+    Map<String, dynamic> root, int maxShelves, int perShelf) {
+  final out = <String, List<PodcastEpisode>>{};
+  try {
+    final shelves = <Map<String, dynamic>>[];
+    collectMaps(root, 'musicCarouselShelfRenderer', shelves);
+    collectMaps(root, 'musicShelfRenderer', shelves);
+    for (final s in shelves) {
+      try {
+        final title = _shelfTitle(s);
+        if (title == null || title.isEmpty || out.containsKey(title)) {
+          continue;
+        }
+        final items = <PodcastEpisode>[];
+        final seen = <String>{};
+        dynamic contents =
+            _map(s['contents'])?['contents'] ?? s['contents'];
+        if (contents is List) {
+          for (final w in contents) {
+            try {
+              if (w is! Map) continue;
+              final wm = w.cast<String, dynamic>();
+              PodcastEpisode? ep;
+              if (wm.containsKey(
+                  'musicResponsiveListItemRenderer')) {
+                ep = parsePodcastEpisodeItem(
+                    _map(wm['musicResponsiveListItemRenderer']) ??
+                        {});
+              } else if (wm
+                  .containsKey('musicTwoRowItemRenderer')) {
+                ep = parsePodcastTwoRowEpisode(
+                    _map(wm['musicTwoRowItemRenderer']) ?? {});
+              } else if (wm.containsKey('flexColumns')) {
+                ep = parsePodcastEpisodeItem(wm);
+              } else if (wm.containsKey('title') &&
+                  wm.containsKey('navigationEndpoint')) {
+                ep = parsePodcastTwoRowEpisode(wm);
+              }
+              if (ep == null) continue;
+              if (seen.add(ep.id)) items.add(ep);
               if (items.length >= perShelf) break;
             } catch (_) {}
           }

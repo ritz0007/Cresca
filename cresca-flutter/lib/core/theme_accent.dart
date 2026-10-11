@@ -6,6 +6,15 @@
 //
 // Colors are 0xAARRGGBB ints so this file has zero Flutter imports and
 // stays runnable under plain `dart test`.
+//
+// The functions above are byte-for-byte native parity — do not change
+// their math. The legibility helpers below are ADDITIVE (no existing
+// caller changes): use them when the accent tints foreground glyphs
+// (icons, rings, selected labels) on the app background. Filled-button
+// usage keeps the raw accent + [onColorFor] (text-on-accent contrast,
+// already native-guarded).
+
+import 'dart:math' as math;
 
 const int crescaRed = 0xFFFA243C;
 const int crescaRedDark = 0xFFFC5C6E;
@@ -106,3 +115,68 @@ const bodyLarge = CrescaTypeScale(17, 'regular');
 const bodyMedium = CrescaTypeScale(15, 'regular');
 const bodySmall = CrescaTypeScale(13, 'regular');
 const labelSmall = CrescaTypeScale(11, 'semiBold');
+
+double _lin(double c) =>
+    c <= 0.03928 ? c / 12.92 : math.pow((c + 0.055) / 1.055, 2.4).toDouble();
+
+/// WCAG 2.x relative luminance (linearized), 0..1. Unlike
+/// [luminanceOf] (gamma-space, native parity) this is the correct
+/// input for contrast math.
+double relativeLuminance(int color) =>
+    0.2126 * _lin(_r(color)) +
+    0.7152 * _lin(_g(color)) +
+    0.0722 * _lin(_b(color));
+
+/// WCAG contrast ratio of two colors, 1..21.
+double contrastRatio(int a, int b) {
+  try {
+    final l1 = relativeLuminance(a);
+    final l2 = relativeLuminance(b);
+    final hi = l1 > l2 ? l1 : l2;
+    final lo = l1 > l2 ? l2 : l1;
+    return (hi + 0.05) / (lo + 0.05);
+  } catch (_) {
+    return 1.0;
+  }
+}
+
+int _mix(int a, int b, double t) {
+  int ch(int c, int s) => (c >> s) & 0xFF;
+  int mix1(int x, int y) =>
+      (x + ((y - x) * t)).round().clamp(0, 255);
+  return (0xFF << 24) |
+      (mix1(ch(a, 16), ch(b, 16)) << 16) |
+      (mix1(ch(a, 8), ch(b, 8)) << 8) |
+      mix1(ch(a, 0), ch(b, 0));
+}
+
+/// True when [accent] as a foreground tint on the mode background
+/// meets [minRatio] (default 3.0, WCAG non-text/graphical objects:
+/// icons, rings, selected labels). Filled buttons are NOT this case —
+/// their contrast is text-on-accent, guarded by [onColorFor].
+bool legibleOn(int accent, bool darkMode, {double minRatio = 3.0}) {
+  try {
+    final bg = darkMode ? darkBackground : lightBackground;
+    return contrastRatio(accent, bg) >= minRatio;
+  } catch (_) {
+    return true;
+  }
+}
+
+/// Returns [accent] unchanged when [legibleOn] passes; otherwise mixes
+/// it toward white (dark mode) or dark ink (light mode) until the
+/// ratio passes. Bounded (10 steps) and pure; sane mid-luminance song
+/// accents pass through untouched, only near-invisible extremes shift.
+int ensureLegible(int accent, bool darkMode, {double minRatio = 3.0}) {
+  try {
+    if (legibleOn(accent, darkMode, minRatio: minRatio)) return accent;
+    final target = darkMode ? 0xFFFFFFFF : 0xFF1A1A1E;
+    for (var i = 1; i <= 10; i++) {
+      final c = _mix(accent, target, i / 10.0);
+      if (legibleOn(c, darkMode, minRatio: minRatio)) return c;
+    }
+    return target;
+  } catch (_) {
+    return accent;
+  }
+}

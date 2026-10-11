@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Brand launch background (dark): black surround matches the
+     dark-mode logo mark (@drawable-night/cresca_logo) and the Flutter
+     boot bridge, so cold start has no flash. -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <color android:color="#FF000000" />
+    </item>
+
+    <item>
+        <bitmap
+            android:gravity="center"
+            android:src="@drawable/cresca_logo" />
+    </item>
+</layer-list>

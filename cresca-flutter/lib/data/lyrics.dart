@@ -1,6 +1,8 @@
-// Lyrics: fetch (captions → lrclib → kugou → ovh) + scoring + parsers.
+// Lyrics: fetch (captions → lrclib → qq → netease → kugou →
+// musixmatch → genius → ovh) + scoring + parsers.
 // Provider order mirrors BitChord's repository (word-synced Apple-Music
-// sources need native TTML; line-synced LRCLIB/KuGou carry the weight).
+// sources need native TTML; line-synced LRCLIB/QQ/NetEase/KuGou carry
+// the weight, Musixmatch/Genius cover the Western long tail).
 // Native refs: LyricsRepository.kt (pipeline, scoring, LRC/VTT/SRT/
 // timedtext parsers, 128-entry memo), InnerTubeApi captionTracks/
 // fetchCaptionText (track parse, rank, fmt=vtt).
@@ -12,6 +14,13 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import 'lyrics/genius.dart' as genius;
+import 'lyrics/memo.dart' as lyric_memo;
+import 'lyrics/musixmatch.dart' as mxm;
+import 'lyrics/netease.dart' as ne;
+import 'lyrics/qq.dart' as qq;
+import 'lyrics/scoring.dart' as scoring;
+
 /// Unified lyric line (captions + LRCLIB normalize here).
 class LyricLine {
   final int startMs;
@@ -19,13 +28,27 @@ class LyricLine {
   const LyricLine(this.startMs, this.text);
 }
 
-enum LyricSource { youtubeCaptions, lrclib, kugou, ovh, none }
+enum LyricSource {
+  youtubeCaptions,
+  lrclib,
+  qq,
+  netease,
+  kugou,
+  musixmatch,
+  genius,
+  ovh,
+  none
+}
 
 /// Human attribution per source (player "Lyrics by X" row, BitChord parity).
 String lyricSourceName(LyricSource s) => switch (s) {
       LyricSource.youtubeCaptions => 'YouTube',
       LyricSource.lrclib => 'LRCLIB',
+      LyricSource.qq => 'QQ Music',
+      LyricSource.netease => 'NetEase',
       LyricSource.kugou => 'KuGou',
+      LyricSource.musixmatch => 'Musixmatch',
+      LyricSource.genius => 'Genius',
       LyricSource.ovh => 'lyrics.ovh',
       LyricSource.none => '',
     };
@@ -605,12 +628,38 @@ String captionVttUrl(String baseUrl) {
 
 const Duration _lyricTimeout = Duration(seconds: 12);
 
-Future<String?> _get(http.Client http, String url) async {
+/// 128-entry LRU memo for lyric results (BitChord LyricsRepository
+/// memo parity): repeat plays never re-hit the network. Successes
+/// only — misses stay uncached so the "Change" retry can try the
+/// next provider.
+final _lyricsMemo = lyric_memo.LruMemo<String, LyricsState>(128);
+
+/// Memo size probe (tests / diagnostics).
+int lyricsMemoLength() {
+  try {
+    return _lyricsMemo.length;
+  } catch (_) {
+    return 0;
+  }
+}
+
+/// Clears the lyrics memo (tests / account switch).
+void clearLyricsMemo() {
+  try {
+    _lyricsMemo.clear();
+  } catch (_) {}
+}
+
+Future<String?> _get(http.Client http, String url,
+    [Map<String, String>? headers]) async {
   try {
     final res = await http
-        .get(Uri.parse(url), headers: const {
-          'User-Agent': 'Cresca/0.1',
-        })
+        .get(
+            Uri.parse(url),
+            headers: headers ??
+                const {
+                  'User-Agent': 'Cresca/0.1',
+                })
         .timeout(_lyricTimeout);
     if (res.statusCode < 200 || res.statusCode >= 300) return null;
     return res.body;
@@ -619,7 +668,15 @@ Future<String?> _get(http.Client http, String url) async {
   }
 }
 
-/// LRCLIB leg: exact → fuzzy queries → plain. Best score wins (floor 4).
+/// Multi-provider leg (LRCLIB is weak alone, so it is only the
+/// first of several): exact → fuzzy queries → QQ → NetEase → KuGou →
+/// Musixmatch → Genius → ovh. Synced wins over plain across providers
+/// (first plain is stashed while later synced legs still run), best
+/// score wins inside search providers (title gate + artist + duration
+/// ±3 s). Every leg: timeout + fallback + silent catch. Successes are
+/// memoized (128-entry LRU).
+/// Kept under the historical [fetchLrclib] name: callers (lyrics
+/// panel) race captions first and fall back here.
 Future<LyricsState> fetchLrclib(
   http.Client http, {
   required String artist,
@@ -630,10 +687,36 @@ Future<LyricsState> fetchLrclib(
     final a = cleanArtist(artist);
     final t = cleanTitle(title);
     if (t.length < 2) return const LyricsNotFound();
+    final key = lyric_memo.lyricsMemoKey(a.isNotEmpty ? a : artist,
+        t.isNotEmpty ? t : title, durationMs);
+    try {
+      final hit = _lyricsMemo.get(key);
+      if (hit != null) return hit;
+    } catch (_) {}
+    void memoize(LyricsState s) {
+      try {
+        if (s is LyricsSynced || s is LyricsPlain) {
+          _lyricsMemo.put(key, s);
+        }
+      } catch (_) {}
+    }
+
+    LyricsState? plainFallback;
+    LyricsState? take(LyricsState? s) {
+      if (s == null) return null;
+      if (s is LyricsSynced) {
+        memoize(s);
+        return s;
+      }
+      if (s is LyricsPlain && plainFallback == null) plainFallback = s;
+      return null;
+    }
+
     if (a.isNotEmpty) {
       try {
         final exact = await _fetchLrclibExact(http, a, t, durationMs);
-        if (exact != null) return exact;
+        final hit = take(exact);
+        if (hit != null) return hit;
       } catch (_) {}
     }
     final queries = <String>[
@@ -642,17 +725,44 @@ Future<LyricsState> fetchLrclib(
     ];
     for (final q in queries) {
       try {
-        final hit = await _searchLrclib(http, q, durationMs);
+        final hit = take(await _searchLrclib(http, q, durationMs));
         if (hit != null) return hit;
       } catch (_) {}
+      // LRCLIB plain is only a fallback: keep looking for synced.
+      if (plainFallback != null) break;
     }
+    try {
+      final hit = take(await fetchQq(http,
+          artist: a, title: t, durationMs: durationMs));
+      if (hit != null) return hit;
+    } catch (_) {}
+    try {
+      final hit = take(await fetchNetease(http,
+          artist: a, title: t, durationMs: durationMs));
+      if (hit != null) return hit;
+    } catch (_) {}
     // KuGou leg (BitChord parity): keyword search → hash → lyric
     // candidates → LRC download. Carries much the others lack.
     try {
       final kg = await fetchKugou(http,
           artist: a, title: t, durationMs: durationMs);
-      if (kg != null) return kg;
+      final hit = take(kg);
+      if (hit != null) return hit;
     } catch (_) {}
+    try {
+      final hit = take(await fetchMusixmatch(http,
+          artist: a, title: t));
+      if (hit != null) return hit;
+    } catch (_) {}
+    try {
+      final hit = take(await fetchGenius(http,
+          artist: a, title: t));
+      if (hit != null) return hit;
+    } catch (_) {}
+    if (plainFallback != null) {
+      memoize(plainFallback!);
+      return plainFallback!;
+    }
     try {
       final who = a.isNotEmpty ? a : t;
       final body = await _get(http, ovhUrl(who, t));
@@ -660,7 +770,9 @@ Future<LyricsState> fetchLrclib(
         final txt =
             ((jsonDecode(body) as Map)['lyrics'] ?? '').toString().trim();
         if (txt.isNotEmpty) {
-          return LyricsPlain(txt, LyricSource.ovh);
+          final s = LyricsPlain(txt, LyricSource.ovh);
+          memoize(s);
+          return s;
         }
       }
     } catch (_) {}
@@ -736,6 +848,235 @@ Future<LyricsState?> fetchKugou(
         final lines = parseLrc(lrc);
         if (lines.length >= 3) {
           return LyricsSynced(lines, LyricSource.kugou);
+        }
+      } catch (_) {}
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/// QQ Music leg (no key): client search → top-scored songmid →
+/// lyric query. Synced LRC when ≥3 lines parse, else the decoded
+/// payload as plain. Null on any miss.
+Future<LyricsState?> fetchQq(
+  http.Client http, {
+  required String artist,
+  required String title,
+  int durationMs = 0,
+}) async {
+  try {
+    final q = [title, artist]
+        .where((e) => e.trim().isNotEmpty)
+        .join(' ')
+        .trim();
+    if (q.length < 2) return null;
+    final searchBody =
+        await _get(http, qq.qqSearchUrl(q), qq.qqHeaders());
+    if (searchBody == null) return null;
+    final songs = qq.parseQqSearch(searchBody);
+    if (songs.isEmpty) return null;
+    final ranked = songs.toList()
+      ..sort((x, y) {
+        final sx = scoring.scoreLyricCandidate(
+              query: q,
+              trackName: x.name,
+              artistName: x.artist,
+              hasSynced: true,
+              hasPlain: true,
+              durSec: x.durationMs > 0
+                  ? x.durationMs / 1000.0
+                  : double.nan,
+              durationMs: durationMs,
+            ) ??
+            -1000;
+        final sy = scoring.scoreLyricCandidate(
+              query: q,
+              trackName: y.name,
+              artistName: y.artist,
+              hasSynced: true,
+              hasPlain: true,
+              durSec: y.durationMs > 0
+                  ? y.durationMs / 1000.0
+                  : double.nan,
+              durationMs: durationMs,
+            ) ??
+            -1000;
+        return sy.compareTo(sx);
+      });
+    LyricsState? plain;
+    for (final s in ranked.take(3)) {
+      try {
+        final body = await _get(
+            http, qq.qqLyricUrl(s.mid), qq.qqHeaders());
+        if (body == null) continue;
+        final raw = qq.decodeQqLyric(body);
+        if (raw.isEmpty) continue;
+        final lines = parseLrc(raw);
+        if (lines.length >= 3) {
+          return LyricsSynced(lines, LyricSource.qq);
+        }
+        if (plain == null && raw.trim().length >= 30) {
+          plain = LyricsPlain(raw.trim(), LyricSource.qq);
+        }
+      } catch (_) {}
+    }
+    return plain;
+  } catch (_) {
+    return null;
+  }
+}
+
+/// NetEase Cloud Music leg (no key): web search → top-scored song →
+/// lyric API (timestamped LRC first, word-synced YRC converted).
+/// Synced LRC when ≥3 lines parse. Null on any miss (plain NetEase
+/// payloads are rare; plain falls through to later providers).
+Future<LyricsState?> fetchNetease(
+  http.Client http, {
+  required String artist,
+  required String title,
+  int durationMs = 0,
+}) async {
+  try {
+    final q = [title, artist]
+        .where((e) => e.trim().isNotEmpty)
+        .join(' ')
+        .trim();
+    if (q.length < 2) return null;
+    final searchBody = await _get(
+        http, ne.neteaseSearchUrl(q), ne.neteaseHeaders());
+    if (searchBody == null) return null;
+    final songs = ne.parseNeteaseSearch(searchBody);
+    if (songs.isEmpty) return null;
+    final ranked = songs.toList()
+      ..sort((x, y) {
+        final sx = scoring.scoreLyricCandidate(
+              query: q,
+              trackName: x.name,
+              artistName: x.artist,
+              hasSynced: true,
+              hasPlain: false,
+              durSec: x.durationMs > 0
+                  ? x.durationMs / 1000.0
+                  : double.nan,
+              durationMs: durationMs,
+            ) ??
+            -1000;
+        final sy = scoring.scoreLyricCandidate(
+              query: q,
+              trackName: y.name,
+              artistName: y.artist,
+              hasSynced: true,
+              hasPlain: false,
+              durSec: y.durationMs > 0
+                  ? y.durationMs / 1000.0
+                  : double.nan,
+              durationMs: durationMs,
+            ) ??
+            -1000;
+        return sy.compareTo(sx);
+      });
+    for (final s in ranked.take(3)) {
+      try {
+        final body = await _get(
+            http, ne.neteaseLyricUrl(s.id), ne.neteaseHeaders());
+        if (body == null) continue;
+        final raw = ne.parseNeteaseLyric(body);
+        if (raw.isEmpty) continue;
+        final lines = parseLrc(raw);
+        if (lines.length >= 3) {
+          return LyricsSynced(lines, LyricSource.netease);
+        }
+      } catch (_) {}
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Musixmatch leg (no key, tokenless scrape): search page → track
+/// pages → `subtitle_body` (synced: raw LRC or JSON cues) else
+/// `lyrics_body` (plain). Search rank is the relevance signal (no
+/// structured titles to score). Null on any miss.
+Future<LyricsState?> fetchMusixmatch(
+  http.Client http, {
+  required String artist,
+  required String title,
+}) async {
+  try {
+    final q = [title, artist]
+        .where((e) => e.trim().isNotEmpty)
+        .join(' ')
+        .trim();
+    if (q.length < 2) return null;
+    final searchBody = await _get(
+        http, mxm.musixmatchSearchUrl(q), mxm.musixmatchHeaders());
+    if (searchBody == null) return null;
+    final tracks = mxm.parseMusixmatchSearch(searchBody);
+    if (tracks.isEmpty) return null;
+    LyricsState? plain;
+    for (final url in tracks.take(3)) {
+      try {
+        final page =
+            await _get(http, url, mxm.musixmatchHeaders());
+        if (page == null) continue;
+        final sub = mxm.parseMusixmatchSubtitle(page);
+        if (sub.isNotEmpty) {
+          var lrc = sub;
+          if (!lrc.contains('[') || !lrc.contains(']')) {
+            lrc = mxm.musixmatchSubtitleToLrc(sub);
+          } else if (lrc.trim().startsWith('[') &&
+              !RegExp(r'\[\d+:').hasMatch(lrc)) {
+            final conv = mxm.musixmatchSubtitleToLrc(sub);
+            if (conv.isNotEmpty) lrc = conv;
+          }
+          final lines = parseLrc(lrc);
+          if (lines.length >= 3) {
+            return LyricsSynced(lines, LyricSource.musixmatch);
+          }
+        }
+        if (plain == null) {
+          final body = mxm.parseMusixmatchPlain(page);
+          if (body.trim().length >= 30) {
+            plain = LyricsPlain(body, LyricSource.musixmatch);
+          }
+        }
+      } catch (_) {}
+    }
+    return plain;
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Genius leg (no key, plain-only scrape): search page → song pages →
+/// lyric containers. First page with ≥30 chars of text wins.
+Future<LyricsState?> fetchGenius(
+  http.Client http, {
+  required String artist,
+  required String title,
+}) async {
+  try {
+    final q = [title, artist]
+        .where((e) => e.trim().isNotEmpty)
+        .join(' ')
+        .trim();
+    if (q.length < 2) return null;
+    final searchBody = await _get(
+        http, genius.geniusSearchUrl(q), genius.geniusHeaders());
+    if (searchBody == null) return null;
+    final songs = genius.parseGeniusSearch(searchBody);
+    if (songs.isEmpty) return null;
+    for (final url in songs.take(3)) {
+      try {
+        final page =
+            await _get(http, url, genius.geniusHeaders());
+        if (page == null) continue;
+        final text = genius.parseGeniusLyrics(page);
+        if (text.trim().length >= 30) {
+          return LyricsPlain(text.trim(), LyricSource.genius);
         }
       } catch (_) {}
     }

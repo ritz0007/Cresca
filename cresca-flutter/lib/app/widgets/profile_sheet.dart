@@ -12,15 +12,21 @@ import 'session_sheet.dart';
 
 Future<void> openProfileSheet(BuildContext context) async {
   try {
+    bool motionOn = true;
+    try {
+      motionOn = AppScope.of(context).motionOn;
+    } catch (_) {}
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
+      backgroundColor: Colors.transparent,
       builder: (_) => DraggableScrollableSheet(
         expand: false,
         initialChildSize: 0.85,
         minChildSize: 0.5,
         maxChildSize: 0.95,
         builder: (_, scroll) => GlassSheetSurface(
+          motionOn: motionOn,
           child: ProfileSheet(scroll: scroll),
         ),
       ),
@@ -37,22 +43,10 @@ class ProfileSheet extends StatefulWidget {
 }
 
 class _ProfileSheetState extends State<ProfileSheet> {
-  final TextEditingController _clientId = TextEditingController();
   bool _busySpotify = false;
 
   @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      try {
-        _clientId.text = AppScope.of(context).spotify.clientId;
-      } catch (_) {}
-    });
-  }
-
-  @override
   void dispose() {
-    _clientId.dispose();
     super.dispose();
   }
 
@@ -64,12 +58,42 @@ class _ProfileSheetState extends State<ProfileSheet> {
       builder: (_, _) {
         final loggedIn = state.ytSession.isLoggedIn;
         final sp = state.spotify;
+        // Pinned header needs an opaque backing: the sheet glass is
+        // translucent at the top, so scrolled rows would ghost through
+        // the title. surfaceContainer at 0.94 reads as the same
+        // material fading to opaque.
+        final headerBg = Theme.of(context)
+            .colorScheme
+            .surfaceContainer
+            .withValues(alpha: 0.94);
+        final dark =
+            Theme.of(context).brightness == Brightness.dark;
         return CustomScrollView(
           controller: widget.scroll,
           slivers: [
+            SliverToBoxAdapter(
+              child: Center(
+                child: Container(
+                  margin: const EdgeInsets.only(top: 8),
+                  width: 40,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: Theme.of(context)
+                        .colorScheme
+                        .onSurfaceVariant
+                        .withValues(alpha: 0.5),
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+            ),
             SliverAppBar(
               pinned: true,
-              title: const Text('Profile & settings'),
+              backgroundColor: headerBg,
+              automaticallyImplyLeading: false,
+              title: Text('Profile & settings',
+                  style:
+                      TextStyle(color: glassText(dark))),
             ),
             SliverToBoxAdapter(
               child: Padding(
@@ -92,21 +116,6 @@ class _ProfileSheetState extends State<ProfileSheet> {
                       onTap: () => openSessionSheet(context),
                     ),
                     _H('Spotify'),
-                    Padding(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 16),
-                      child: TextField(
-                        controller: _clientId,
-                        decoration: const InputDecoration(
-                          labelText: 'Client ID',
-                          hintText:
-                              'From developer.spotify.com dashboard',
-                          border: OutlineInputBorder(),
-                        ),
-                        onSubmitted: (v) =>
-                            sp.setClientId(v),
-                      ),
-                    ),
                     ListTile(
                       leading: const Icon(
                           Icons.music_note_outlined),
@@ -116,11 +125,9 @@ class _ProfileSheetState extends State<ProfileSheet> {
                       subtitle:
                           const Text('Import + sync lands next'),
                       trailing: _busySpotify
-                          ? const SizedBox(
-                              width: 20,
-                              height: 20,
-                              child: CircularProgressIndicator(
-                                  strokeWidth: 2))
+                          // Delayed fade-in (300 ms): no flicker on
+                          // fast connects; slot pre-sized, no jump.
+                          ? const _DelayedSpinner()
                           : TextButton(
                               onPressed: () =>
                                   _spotifyTap(state),
@@ -151,10 +158,36 @@ class _ProfileSheetState extends State<ProfileSheet> {
                             'light',
                             'dark'
                           ])
-                            RadioListTile<String>(
-                              title: Text(m[0].toUpperCase() +
-                                  m.substring(1)),
-                              value: m,
+                            // Selected appearance row tints smoothly
+                            // (AnimatedContainer, 180 ms).
+                            AnimatedContainer(
+                              duration: Duration(
+                                  milliseconds:
+                                      state.motionMs(
+                                          180)),
+                              curve: Curves.easeOut,
+                              decoration: BoxDecoration(
+                                color: state.appearance ==
+                                        m
+                                    ? Theme.of(context)
+                                        .colorScheme
+                                        .primary
+                                        .withValues(
+                                            alpha:
+                                                0.12)
+                                    : Colors
+                                        .transparent,
+                                borderRadius:
+                                    BorderRadius
+                                        .circular(12),
+                              ),
+                              child:
+                                  RadioListTile<String>(
+                                title: Text(m[0]
+                                        .toUpperCase() +
+                                    m.substring(1)),
+                                value: m,
+                              ),
                             ),
                         ],
                       ),
@@ -165,6 +198,30 @@ class _ProfileSheetState extends State<ProfileSheet> {
                           'Tab drift, art slides, shimmer. Off = instant.'),
                       value: state.motionOn,
                       onChanged: (v) => state.setMotion(v),
+                    ),
+                    SwitchListTile(
+                      title: const Text('Live Updates'),
+                      subtitle: const Text(
+                          'Progress chip on Android 16+. Needs notification permission.'),
+                      value: state.liveEnabled,
+                      onChanged: (v) =>
+                          state.setLiveEnabled(v),
+                    ),
+                    ListTile(
+                      leading: const Icon(
+                          Icons.notifications_outlined),
+                      title:
+                          const Text('Notification settings'),
+                      subtitle: const Text(
+                          'Enable notifications + Live Updates here.'),
+                      trailing:
+                          const Icon(Icons.chevron_right),
+                      onTap: () async {
+                        try {
+                          await state.live
+                              .openNotificationSettings();
+                        } catch (_) {}
+                      },
                     ),
                     _H('Downloads'),
                     ListTile(
@@ -241,7 +298,7 @@ class _ProfileSheetState extends State<ProfileSheet> {
                                   ? 'Downloading ${u.tag}… ${prog.round()}%'
                                   : downloaded
                                       ? '${u.tag} downloaded — ready to install.'
-                                      : 'Cresca ${u.tag} available.';
+                                      : 'Cresca Music ${u.tag} available.';
                       return Column(
                         children: [
                           ListTile(
@@ -249,26 +306,72 @@ class _ProfileSheetState extends State<ProfileSheet> {
                                 Icons.system_update_outlined),
                             title: Text(u == null
                                 ? 'Check for updates'
-                                : 'Cresca ${u.tag} available'),
+                                : 'Cresca Music ${u.tag} available'),
                             subtitle: prog >= 0
                                 ? Column(
                                     crossAxisAlignment:
                                         CrossAxisAlignment.start,
                                     children: [
-                                      Text(subtitle),
+                                      // Status line crossfades on
+                                      // state flips (150 ms,
+                                      // motion-gated).
+                                      AnimatedSwitcher(
+                                        duration: Duration(
+                                            milliseconds:
+                                                state.motionMs(
+                                                    150)),
+                                        switchInCurve:
+                                            Curves.easeOut,
+                                        switchOutCurve:
+                                            Curves.easeOut,
+                                        child: Text(
+                                          subtitle,
+                                          key: ValueKey(
+                                              subtitle),
+                                        ),
+                                      ),
                                       const SizedBox(height: 6),
-                                      LinearProgressIndicator(
-                                          value: prog / 100),
+                                      // Download bar sweeps smoothly
+                                      // toward each value (tween, no
+                                      // jump) with an opacity-only
+                                      // shimmer while active.
+                                      PulseOpacity(
+                                        motionOn:
+                                            state.motionOn,
+                                        child:
+                                            RepaintBoundary(
+                                          child:
+                                              _UpdateProgress(
+                                            value:
+                                                prog / 100,
+                                            ms: state.motionMs(
+                                                180),
+                                          ),
+                                        ),
+                                      ),
                                     ],
                                   )
-                                : Text(subtitle),
+                                // Status line crossfades on state flips
+                                // (150 ms, motion-gated).
+                                : AnimatedSwitcher(
+                                    duration: Duration(
+                                        milliseconds:
+                                            state.motionMs(
+                                                150)),
+                                    switchInCurve:
+                                        Curves.easeOut,
+                                    switchOutCurve:
+                                        Curves.easeOut,
+                                    child: Text(
+                                      subtitle,
+                                      key:
+                                          ValueKey(subtitle),
+                                    ),
+                                  ),
                             trailing: checking
-                                ? const SizedBox(
-                                    width: 20,
-                                    height: 20,
-                                    child:
-                                        CircularProgressIndicator(
-                                            strokeWidth: 2))
+                                // Delayed fade-in (300 ms); slot
+                                // pre-sized, no jump.
+                                ? const _DelayedSpinner()
                                 : IconButton(
                                     icon: const Icon(
                                         Icons.refresh_outlined),
@@ -307,11 +410,32 @@ class _ProfileSheetState extends State<ProfileSheet> {
                                               .install_mobile_outlined
                                           : Icons
                                               .download_outlined),
-                                      label: Text(downloaded
-                                          ? 'Install'
-                                          : prog >= 0
-                                              ? 'Downloading…'
-                                              : 'Download'),
+                                      // Action label crossfades on
+                                      // state flips (180 ms).
+                                      label: AnimatedSwitcher(
+                                        duration: Duration(
+                                            milliseconds:
+                                                state.motionMs(
+                                                    180)),
+                                        switchInCurve:
+                                            Curves.easeOut,
+                                        switchOutCurve:
+                                            Curves.easeOut,
+                                        child: Text(
+                                          key: ValueKey(
+                                              downloaded
+                                                  ? 'install'
+                                                  : prog >=
+                                                          0
+                                                      ? 'busy'
+                                                      : 'dl'),
+                                          downloaded
+                                              ? 'Install'
+                                              : prog >= 0
+                                                  ? 'Downloading…'
+                                                  : 'Download',
+                                        ),
+                                      ),
                                       onPressed: prog >= 0
                                           ? null
                                           : () async {
@@ -350,7 +474,7 @@ class _ProfileSheetState extends State<ProfileSheet> {
                     }),
                     _H('About'),
                     const ListTile(
-                      title: Text('Cresca 1.5.0 (Flutter)'),
+                      title: Text('Cresca Music 2.0.0 (Flutter)'),
                       subtitle: Text(
                           'Your music, uninterrupted.'),
                     ),
@@ -373,23 +497,23 @@ class _ProfileSheetState extends State<ProfileSheet> {
         if (mounted) setState(() {});
         return;
       }
-      final id = _clientId.text.trim();
-      if (id.isEmpty) {
+      // No Client ID field: the ID is bundled at build time
+      // (--dart-define=SPOTIFY_CLIENT_ID) and must never ship in git.
+      if (!state.spotify.hasClientId) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
               const SnackBar(
                   content: Text(
-                      'Enter your Spotify Client ID first')));
+                      'Spotify is not configured in this build')));
         }
         return;
       }
-      await state.spotify.setClientId(id);
       final ok = await state.spotify.connect();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
             content: Text(ok
                 ? 'Spotify connected'
-                : 'Spotify connect failed — check the Client ID')));
+                : 'Spotify connect failed — try again')));
         setState(() {});
       }
     } catch (_) {
@@ -420,6 +544,97 @@ class _H extends StatelessWidget {
                   color: Theme.of(context)
                       .colorScheme
                       .primary)),
+    );
+  }
+}
+
+/// Update download bar: tweens toward each new value (retargeted
+/// begin, no sweep-from-zero), opacity shimmer applied by the caller.
+class _UpdateProgress extends StatefulWidget {
+  final double value;
+  final int ms;
+  const _UpdateProgress(
+      {required this.value, required this.ms});
+
+  @override
+  State<_UpdateProgress> createState() =>
+      _UpdateProgressState();
+}
+
+class _UpdateProgressState extends State<_UpdateProgress> {
+  double _prev = 0;
+
+  @override
+  void didUpdateWidget(covariant _UpdateProgress old) {
+    super.didUpdateWidget(old);
+    _prev = old.value;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: _prev, end: widget.value),
+      duration: Duration(milliseconds: widget.ms),
+      curve: Curves.easeOut,
+      builder: (_, v, child) => LinearProgressIndicator(
+        value: v.clamp(0.0, 1.0),
+      ),
+    );
+  }
+}
+
+/// Pre-sized spinner slot (20dp) that fades in only after 300 ms —
+/// no flicker on fast loads, no size jump. Motion-off shows instantly.
+class _DelayedSpinner extends StatefulWidget {
+  const _DelayedSpinner();
+
+  @override
+  State<_DelayedSpinner> createState() => _DelayedSpinnerState();
+}
+
+class _DelayedSpinnerState extends State<_DelayedSpinner> {
+  bool _show = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      bool on = true;
+      try {
+        on = AppScope.of(context).motionOn;
+      } catch (_) {}
+      if (!on) {
+        setState(() => _show = true);
+        return;
+      }
+      Future<void>.delayed(const Duration(milliseconds: 300), () {
+        if (mounted) setState(() => _show = true);
+      });
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    bool on = true;
+    try {
+      on = AppScope.of(context).motionOn;
+    } catch (_) {}
+    int ms = 180;
+    try {
+      ms = AppScope.of(context).motionMs(180);
+    } catch (_) {}
+    return SizedBox(
+      width: 20,
+      height: 20,
+      child: AnimatedOpacity(
+        opacity: _show ? 1.0 : 0.0,
+        duration: Duration(milliseconds: on ? ms : 1),
+        curve: Curves.easeOut,
+        child: _show
+            ? const CircularProgressIndicator(strokeWidth: 2)
+            : null,
+      ),
     );
   }
 }

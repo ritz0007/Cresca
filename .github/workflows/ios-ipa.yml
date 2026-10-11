@@ -1,0 +1,53 @@
+# Cresca iOS — unsigned .ipa built on free CI, self-signed by you
+#
+# Pushed .ipa files are UNSIGNED (Apple forbids installing unsigned apps).
+# Sign in 2 minutes with Sideloadly/AltStore + your free Apple ID (7-day
+# cert, Wi-Fi refresh), or TrollStore where your iOS version allows it.
+
+name: ios-ipa
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ios-sideload
+        run: xcodegen generate
+
+      - name: Archive (unsigned)
+        working-directory: ios-sideload
+        run: >
+          xcodebuild -project Cresca.xcodeproj -scheme Cresca
+          -sdk iphoneos -configuration Release
+          -archivePath build/Cresca.xcarchive archive
+          CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+
+      - name: Package unsigned IPA
+        working-directory: ios-sideload
+        run: |
+          APP_PATH=$(echo build/Cresca.xcarchive/Products/Applications/*.app)
+          rm -rf Payload && mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          rm -f Cresca-iOS-unsigned.ipa
+          zip -r -y Cresca-iOS-unsigned.ipa Payload
+
+      - name: Attach to release
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          if [ -z "$TAG" ]; then TAG="$(git describe --tags --abbrev=0)"; fi
+          gh release upload "$TAG" ios-sideload/Cresca-iOS-unsigned.ipa --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

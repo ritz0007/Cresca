@@ -489,9 +489,48 @@ void main() {
 
     test('phone client spec matches maintained values', () {
       expect(TubeClient.androidPhone.name, 'ANDROID');
-      expect(TubeClient.androidPhone.version, '20.10.38');
+      expect(TubeClient.androidPhone.version, '21.26.364');
       expect(TubeClient.androidPhone.androidSdkVersion, 30);
       expect(TubeClient.androidPhone.osName, 'Android');
+    });
+
+    test('visionos client spec matches maintained values', () {
+      expect(TubeClient.visionos.name, 'VISIONOS');
+      expect(TubeClient.visionos.version, '1.02');
+      expect(TubeClient.visionos.osName, 'visionOS');
+      expect(TubeClient.visionos.deviceMake, 'Apple');
+      expect(TubeClient.visionos.deviceModel, 'RealityDevice17,1');
+      final b = playerBody(TubeClient.visionos, 'dQw4w9WgXcQ', '');
+      final c = ((b['context'] as Map)['client'] as Map);
+      expect(c['clientName'], 'VISIONOS');
+      expect(c['osVersion'], '26.5.23O471');
+      expect(c['deviceModel'], 'RealityDevice17,1');
+      expect(c.containsKey('androidSdkVersion'), isFalse);
+    });
+
+    test('ios client spec matches yt-dlp maintained values', () {
+      expect(TubeClient.ios.name, 'IOS');
+      expect(TubeClient.ios.version, '21.26.4');
+      expect(TubeClient.ios.osName, 'iPhone');
+      expect(TubeClient.ios.osVersion, '18.3.2.22D82');
+      expect(TubeClient.ios.deviceMake, 'Apple');
+      expect(TubeClient.ios.deviceModel, 'iPhone16,2');
+      final b = playerBody(TubeClient.ios, 'dQw4w9WgXcQ', '');
+      final c = ((b['context'] as Map)['client'] as Map);
+      expect(c['clientName'], 'IOS');
+      expect(c['clientVersion'], '21.26.4');
+      expect(c['osName'], 'iPhone');
+      expect(c['osVersion'], '18.3.2.22D82');
+      expect(c['deviceModel'], 'iPhone16,2');
+      expect(c.containsKey('androidSdkVersion'), isFalse);
+    });
+
+    test('android_vr client spec matches yt-dlp maintained values', () {
+      expect(TubeClient.androidVr.name, 'ANDROID_VR');
+      expect(TubeClient.androidVr.version, '1.65.10');
+      expect(TubeClient.androidVr.deviceMake, 'Oculus');
+      expect(TubeClient.androidVr.deviceModel, 'Quest 3');
+      expect(TubeClient.androidVr.osVersion, '12L');
     });
 
     test('player body context follows the calling client', () {
@@ -555,9 +594,8 @@ void main() {
       const w = 'https://www.youtube.com/watch?v=AAAAAAAAAAA';
       final results = await Future.wait([r.audioUrl(w), r.audioUrl(w)]);
       expect(results, ['https://a/1', 'https://a/1']);
-      // One race shared by both callers: music + vr POSTs only
-      // (native parity order — music wins, stragglers ignored; phone
-      // sts GET + remix never run).
+      // One resolve shared by both callers: visionos + vr POSTs only
+      // (visionos-first order — it wins, music/remix/phone never run).
       expect(posts, 2);
     });
 
@@ -576,6 +614,48 @@ void main() {
       r.dropCachedUrl(w);
       expect(await r.audioUrl(w), 'https://m/1');
       expect(posts, greaterThan(2)); // refetched after drop
+    });
+
+    test('extraAudioUrls harvests losing legs in leg-priority order',
+        () async {
+      String clientOf(http.BaseRequest req) {
+        try {
+          final body = (req as http.Request).body;
+          return (((jsonDecode(body)['context'] as Map)['client']
+                      as Map)['clientName'] ??
+                  '')
+              .toString();
+        } catch (_) {
+          return '';
+        }
+      }
+
+      final mock = MockClient((req) async {
+        final c = clientOf(req);
+        if (c == 'VISIONOS') {
+          // Slower than VR so VR wins the race; still carries audio.
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+          return _playerResponse(_playerJson([
+            _fmt('audio/mp4', 'https://v/2', 128000),
+          ]));
+        }
+        if (c == 'ANDROID_VR') {
+          return _playerResponse(_playerJson([
+            _fmt('audio/mp4', 'https://v/1', 128000),
+          ]));
+        }
+        return _playerResponse(_playerJson([]));
+      });
+      final r = StreamResolver(httpClient: mock);
+      final b = await r.bundleFor('CCCCCCCCCCC');
+      expect(b, isNotNull);
+      expect(b!.audioUrls.first, 'https://v/1'); // VR won the race
+      expect(await r.extraAudioUrls('CCCCCCCCCCC', exclude: b.audioUrls),
+          ['https://v/2']);
+      // Consumed on read; unknown id resolves empty. Never throws.
+      expect(await r.extraAudioUrls('CCCCCCCCCCC'), isEmpty);
+      expect(await r.extraAudioUrls('ZZZZZZZZZZZ'), isEmpty);
+      r.dispose();
     });
 
     test('snapshot round-trips through resolver', () {

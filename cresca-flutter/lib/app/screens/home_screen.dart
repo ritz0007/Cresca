@@ -9,11 +9,14 @@ import '../../core/home_feed.dart';
 import '../../core/track.dart';
 import '../app.dart';
 import '../design.dart';
-import '../library.dart' show UserPlaylist;
-import '../radio_store.dart' show SavedRadio;
 import '../state.dart';
+import '../updates.dart'
+    show UpdateBannerMotion, UpdateProgressShimmer;
+import '../widgets/cresca_logo.dart';
 import '../widgets/profile_sheet.dart';
+import '../widgets/session_sheet.dart';
 import '../widgets/track_row.dart';
+import 'podcast_screen.dart';
 import 'see_all.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -25,9 +28,7 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   final ScrollController _scroll = ScrollController();
-  double _pull = 0;
-  bool _armed = false;
-  String _filter = 'All';
+  String _filter = 'Music';
 
   @override
   void initState() {
@@ -39,18 +40,41 @@ class _HomeScreenState extends State<HomeScreen> {
         final state = AppScope.of(context);
         if (state.topPicks.isEmpty && state.rails.isEmpty) {
           state.loadHome();
+        } else {
+          _maybePrefetch(state);
         }
       } catch (_) {}
     });
-    _scroll.addListener(() {
-      try {
-        final max = _scroll.position.maxScrollExtent;
-        if (max > 0 &&
-            _scroll.position.pixels > max - 400) {
-          AppScope.of(context).loadMoreDiscovery();
-        }
-      } catch (_) {}
-    });
+    _scroll.addListener(_onScroll);
+  }
+
+  void _onScroll() {
+    try {
+      _maybePrefetch(AppScope.of(context));
+    } catch (_) {}
+  }
+
+  /// Early prefetch: fires when ~1.5 viewports of content remain (not at
+  /// the absolute end). Single-flight lives in state (loadMoreDiscovery
+  /// no-ops while a page is in flight); this only decides *when* to ask.
+  void _maybePrefetch(AppState state) {
+    try {
+      if (!_scroll.hasClients) return;
+      final pos = _scroll.position;
+      if (!pos.hasContentDimensions || !pos.hasPixels) return;
+      final max = pos.maxScrollExtent;
+      if (max <= 0) {
+        // Short list: fill the viewport.
+        state.loadMoreDiscovery();
+        return;
+      }
+      final viewport = pos.viewportDimension;
+      if (viewport <= 0) return;
+      final remaining = max - pos.pixels;
+      if (remaining < viewport * 1.5) {
+        state.loadMoreDiscovery();
+      }
+    } catch (_) {}
   }
 
   @override
@@ -59,54 +83,42 @@ class _HomeScreenState extends State<HomeScreen> {
     super.dispose();
   }
 
-  bool _onScroll(ScrollNotification n, AppState state) {
-    try {
-      // Custom hard-pull: >200px overscroll at the pinned top arms a
-      // refresh on release (H2, 3-state indicator).
-      if (n is OverscrollNotification && n.overscroll < 0) {
-        if (_scroll.position.pixels <=
-            _scroll.position.minScrollExtent + 1) {
-          setState(() {
-            _pull = (-n.overscroll).clamp(0.0, 260.0);
-            _armed = _pull > 200;
-          });
-        }
-      } else if (n is ScrollEndNotification) {
-        if (_armed) {
-          setState(() {
-            _armed = false;
-            _pull = 0;
-          });
-          state.hardRefresh();
-        } else if (_pull > 0) {
-          setState(() => _pull = 0);
-        }
-      }
-    } catch (_) {}
-    return false;
-  }
-
   @override
   Widget build(BuildContext context) {
     final state = AppScope.of(context);
+    // Refresh dissolve: native spinner stays in the app bar; the rails
+    // below fade behind glass while reloading (220ms, transform-free
+    // opacity only).
+    final refreshing = state.homeStatus == HomeStatus.loading &&
+        (state.topPicks.isNotEmpty || state.rails.isNotEmpty);
+    final dissolve = refreshing ? 0.35 : 1.0;
+    final dissolveMs = state.motionMs(220);
     return AnimatedBuilder(
       animation: state,
       builder: (_, _) => Scaffold(
-        body: NotificationListener<ScrollNotification>(
-          onNotification: (n) => _onScroll(n, state),
+        body: RefreshIndicator(
+          // Standard pull-to-refresh (the old 200px hard-pull was
+          // undiscoverable): normal pull distance, native spinner,
+          // taste-rotating force reload.
+          onRefresh: () => state.hardRefresh(),
           child: CustomScrollView(
             controller: _scroll,
             physics: const AlwaysScrollableScrollPhysics(),
             slivers: [
               SliverAppBar(
                 pinned: true,
-                // Spotify parity: settings live top-left on home.
-                leading: IconButton(
-                  icon: const Icon(Icons.settings_outlined),
-                  tooltip: 'Settings',
-                  onPressed: () => openProfileSheet(context),
+                // Reference chrome: brand mark left,
+                // "Listen Now" title.
+                leading: const Padding(
+                  padding: EdgeInsets.only(left: 12),
+                  child: Center(
+                    child: CrescaLogo(size: 32),
+                  ),
                 ),
-                title: Text(_greeting()),
+                title: const Text('Listen Now',
+                    style: TextStyle(
+                        fontSize: 28,
+                        fontWeight: FontWeight.w800)),
                 actions: [
                   if (state.homeStatus == HomeStatus.loading)
                     const Padding(
@@ -117,6 +129,13 @@ class _HomeScreenState extends State<HomeScreen> {
                           child: CircularProgressIndicator(
                               strokeWidth: 2)),
                     ),
+                  IconButton(
+                    icon: const Icon(
+                        Icons.person_outline),
+                    tooltip: 'Profile',
+                    onPressed: () =>
+                        openProfileSheet(context),
+                  ),
                 ],
               ),
               SliverToBoxAdapter(
@@ -131,22 +150,55 @@ class _HomeScreenState extends State<HomeScreen> {
                   padding:
                       const EdgeInsets.symmetric(horizontal: 16),
                   child: Text(
-                    _armed
-                        ? 'Release to refresh'
-                        : _pull > 0
-                            ? 'Pull down hard to refresh'
-                            : state.homeStatus ==
-                                    HomeStatus.loading
-                                ? 'Loading…'
-                                : 'Pull down hard to refresh',
+                    state.homeStatus ==
+                            HomeStatus.loading
+                        ? 'Loading…'
+                        : 'Pull to refresh',
                     style:
                         Theme.of(context).textTheme.labelSmall,
                   ),
                 ),
               ),
               if (_filter == 'Podcasts')
-                const SliverToBoxAdapter(
-                    child: _PodcastsEmpty()),
+                SliverToBoxAdapter(
+                  child: StaggerEntrance(
+                    key: const ValueKey('filter-podcasts'),
+                    child: PodcastScreen(
+                      motionOn: state.motionOn,
+                      embedded: true,
+                      subscribed:
+                          state.podcastStore.subsList(),
+                      progressById: Map<String, int>.from(
+                          state.podcastStore.progress),
+                      currentSpeed: state.podcastSpeed,
+                      onSearch: (q) => state
+                          .podcastService
+                          .searchEpisodes(q),
+                      onPlay: (ep, seekMs) =>
+                          state.playEpisode(ep,
+                              seekMs: seekMs),
+                      onDownload: (ep) =>
+                          state.downloadEpisode(ep),
+                      downloadState: (ep) =>
+                          state.downloadStateFor(ep),
+                      onUnsubscribe: (show) =>
+                          state.unsubscribeShow(show),
+                      onFollowShow: (ep) =>
+                          state.followEpisodeShow(ep),
+                      isShowFollowed: (ep) =>
+                          state.isShowFollowed(ep),
+                      onSetSpeed: (r) =>
+                          state.setPodcastSpeed(r),
+                      onPause: () async {
+                        try {
+                          await state.saveEpisodeProgress();
+                          await state.controller.player
+                              .pause();
+                        } catch (_) {}
+                      },
+                    ),
+                  ),
+                ),
               if (_filter != 'Podcasts') ...[
                 if (state.homeStatus ==
                         HomeStatus.loading &&
@@ -163,48 +215,86 @@ class _HomeScreenState extends State<HomeScreen> {
                           state.loadHome(force: true),
                     ),
                   ),
-                if (state.pendingUpdate != null)
-                  SliverToBoxAdapter(
-                      child:
-                          _UpdateBanner(state: state)),
+                // Always mounted so UpdateBannerMotion can animate the
+                // dismiss (it collapses to zero-size when hidden).
+                const SliverToBoxAdapter(
+                    child: _UpdateBannerSlot()),
                 SliverToBoxAdapter(
-                    child: _RecentsGrid(state: state)),
+                    child:
+                        _SignInCard(state: state)),
                 SliverToBoxAdapter(
-                    child: _JumpBackIn(state: state)),
-                if (state.topPicks.isNotEmpty) ...[
+                  child: _Dissolve(
+                    opacity: dissolve,
+                    ms: dissolveMs,
+                    child: StaggerEntrance(
+                      key: ValueKey('home-recents-$_filter'),
+                      child: _RecentsGrid(state: state),
+                    ),
+                  ),
+                ),
+                // "Jump back in" removed per user direction (rails
+                // flow straight from recents into Top Picks).
+                // Top Picks is a 2x2 song grid (no wide banner: the old
+                // hero Play/Shuffle card was deleted — rails flow up).
+                if (state.topPicks.isNotEmpty)
                   SliverToBoxAdapter(
-                      child: _TopPicks(
-                          tracks: state.topPicks)),
-                  SliverToBoxAdapter(
-                      child: _HeroCard(
-                          tracks: state.topPicks)),
-                ],
+                    child: _Dissolve(
+                      opacity: dissolve,
+                      ms: dissolveMs,
+                      child: StaggerEntrance(
+                        key: ValueKey('home-top-$_filter'),
+                        child: _TopPicks(
+                            tracks: state.topPicks),
+                      ),
+                    ),
+                  ),
                 SliverToBoxAdapter(
-                    child: _Moods(state: state)),
-                for (final rail in state.rails)
+                  child: _Dissolve(
+                    opacity: dissolve,
+                    ms: dissolveMs,
+                    child: StaggerEntrance(
+                      key: ValueKey('home-moods-$_filter'),
+                      child: _Moods(state: state),
+                    ),
+                  ),
+                ),
+                for (var ri = 0;
+                    ri < state.rails.length;
+                    ri++)
                   SliverToBoxAdapter(
-                      child: _Rail(
-                          rail: rail, state: state)),
+                    child: _Dissolve(
+                      opacity: dissolve,
+                      ms: dissolveMs,
+                      child: StaggerEntrance(
+                        key: ValueKey(
+                            'rail-$_filter-${state.rails[ri].section.cacheKey}'),
+                        index: ri,
+                        child: _Rail(
+                            rail: state.rails[ri],
+                            state: state),
+                      ),
+                    ),
+                  ),
+                // Endless tail: fixed-height skeleton holds layout while
+                // the next rails load (no jump on arrival); honest
+                // error-with-retry and end states.
+                SliverToBoxAdapter(
+                  child: _DiscoveryTail(state: state),
+                ),
               ],
               // Bottom chrome (mini player + pill) is app-shell; the
-              // list scrolls under the glass (Spotify parity).
-              const SliverPadding(padding: EdgeInsets.only(bottom: 210)),
+              // list scrolls under the glass (Spotify parity). Live
+              // clearance from the measured chrome (falls back to 210
+              // pre-measurement so unmigrated frames stay safe).
+              SliverPadding(
+                  padding: EdgeInsets.only(
+                      bottom:
+                          BottomChromeScope.clearanceOf(context))),
             ],
           ),
         ),
       ),
     );
-  }
-}
-
-String _greeting() {
-  try {
-    final h = DateTime.now().hour;
-    if (h < 12) return 'Good morning';
-    if (h < 18) return 'Good afternoon';
-    return 'Good evening';
-  } catch (_) {
-    return 'Listen Now';
   }
 }
 
@@ -229,21 +319,33 @@ class _FilterChips extends StatelessWidget {
               child: GestureDetector(
                 behavior: HitTestBehavior.opaque,
                 onTap: () => onPick(f),
-                child: Container(
+                // Segment-switch blend: pill color eases over 180ms.
+                // Visual stays compact (8px vertical padding) but the
+                // pill is at least 48px tall for the tap target.
+                child: AnimatedContainer(
+                  duration: Duration(
+                      milliseconds:
+                          AppScope.of(context).motionMs(180)),
+                  curve: Curves.easeOut,
+                  constraints: const BoxConstraints(
+                      minHeight: 48, minWidth: 48),
+                  alignment: Alignment.center,
                   padding: const EdgeInsets.symmetric(
                       horizontal: 16, vertical: 8),
                   decoration: BoxDecoration(
                     color: filter == f
                         ? spotifyGreen
                         : scheme.surfaceContainerHighest,
-                    borderRadius: BorderRadius.circular(20),
+                    borderRadius: BorderRadius.circular(24),
                   ),
                   child: Text(f,
                       style: TextStyle(
                         fontSize: 13,
                         fontWeight: FontWeight.w700,
+                        // Selected pill sits on spotifyGreen: derive
+                        // the label from the actual pill bg.
                         color: filter == f
-                            ? Colors.black
+                            ? textOn(spotifyGreen)
                             : scheme.onSurface,
                       )),
                 ),
@@ -255,299 +357,209 @@ class _FilterChips extends StatelessWidget {
   }
 }
 
-/// Honest empty state for the Podcasts filter (music-only app).
-class _PodcastsEmpty extends StatelessWidget {
-  const _PodcastsEmpty();
+/// Sign-in nudge (reference): dark card with "Sign in to
+/// YouTube Music / Get personalized recommendations" + white
+/// Sign in pill. Hidden once logged in.
+class _SignInCard extends StatelessWidget {
+  final AppState state;
+  const _SignInCard({required this.state});
 
   @override
   Widget build(BuildContext context) {
-    return const Padding(
-      padding: EdgeInsets.fromLTRB(16, 24, 16, 48),
-      child: Column(
-        children: [
-          Icon(Icons.podcasts_outlined, size: 48),
-          SizedBox(height: 12),
-          Text('No podcasts here',
-              style:
-                  TextStyle(fontWeight: FontWeight.w700, fontSize: 17)),
-          SizedBox(height: 6),
-          Text('Cresca is music-only — your songs live under All.',
-              textAlign: TextAlign.center),
-        ],
+    if (state.ytSession.isLoggedIn) {
+      return const SizedBox.shrink();
+    }
+    final scheme = Theme.of(context).colorScheme;
+    final cardBg = scheme.surfaceContainerHighest;
+    // White pill: derive the label from the actual pill bg.
+    const pillBg = Colors.white;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(16, 14, 10, 14),
+        decoration: BoxDecoration(
+          color: cardBg,
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment:
+                    CrossAxisAlignment.start,
+                children: [
+                  AdaptiveText(
+                      data: 'Sign in to YouTube Music',
+                      background: cardBg,
+                      style: const TextStyle(
+                          fontSize: 15,
+                          fontWeight:
+                              FontWeight.w700)),
+                  const SizedBox(height: 2),
+                  AdaptiveText(
+                      data:
+                          'Get personalized recommendations.',
+                      background: cardBg,
+                      secondary: true,
+                      maxLines: 1,
+                      overflow:
+                          TextOverflow.ellipsis,
+                      style: const TextStyle(
+                          fontSize: 13)),
+                ],
+              ),
+            ),
+            FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: pillBg,
+                foregroundColor: textOn(pillBg),
+              ),
+              onPressed: () =>
+                  openSessionSheet(context),
+              child: const Text('Sign in',
+                  style: TextStyle(
+                      fontWeight: FontWeight.w700)),
+            ),
+          ],
+        ),
       ),
     );
   }
 }
 
-/// Spotify recents grid: 2-col × up-to-4 rows of 56dp-art cells —
-/// recent PLAYLISTS + RADIOS (never songs), Liked Songs tile first.
+/// Recently played: 2-col grid of INDIVIDUAL SONG cells (art +
+/// title + artist, tappable to play). Collection tiles (playlists /
+/// radios) never render here — songs only, graceful empty fallback.
 class _RecentsGrid extends StatelessWidget {
   final AppState state;
   const _RecentsGrid({required this.state});
 
   @override
   Widget build(BuildContext context) {
-    final cells = <_Cell>[];
-    if (state.library.liked.isNotEmpty) {
-      cells.add(const _Cell.liked());
+    // Per-song pool: recent plays first, liked fills thin history.
+    // Songs-only gate + dedupe, order-kept, max 6 (2-col x 3 rows).
+    final pool =
+        songsOnlyTracks([...state.library.recent, ...state.library.liked]);
+    final seen = <String>{};
+    final tracks = <YtTrack>[];
+    for (final t in pool) {
+      if (tracks.length >= 6) break;
+      if (!seen.add(t.id)) continue;
+      tracks.add(t);
     }
-    for (final p in state.library.playlists) {
-      if (cells.length >= 8) break;
-      cells.add(_Cell.playlist(p));
-    }
-    for (final r in state.library.radios) {
-      if (cells.length >= 8) break;
-      cells.add(_Cell.radio(r));
-    }
-    if (cells.isEmpty) return const SizedBox.shrink();
+    if (tracks.isEmpty) return const SizedBox.shrink();
+    final scheme = Theme.of(context).colorScheme;
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 2, 16, 4),
-      child: GridView.builder(
-        shrinkWrap: true,
-        physics: const NeverScrollableScrollPhysics(),
-        gridDelegate:
-            const SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: 2,
-          mainAxisSpacing: 8,
-          crossAxisSpacing: 8,
-          mainAxisExtent: 56,
-        ),
-        itemCount: cells.length,
-        itemBuilder: (_, i) =>
-            _RecentCell(cell: cells[i], state: state),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: AdaptiveText(
+              data: 'Recently played',
+              background: scheme.surface,
+              style: const TextStyle(
+                  fontSize: 22, fontWeight: FontWeight.w800),
+            ),
+          ),
+          GridView.builder(
+            shrinkWrap: true,
+            physics: const NeverScrollableScrollPhysics(),
+            gridDelegate:
+                const SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: 2,
+              mainAxisSpacing: 8,
+              crossAxisSpacing: 8,
+              // 64dp rows: 2-line titles stay unclipped at 200% text
+              // scale; identical look at 1.0x.
+              mainAxisExtent: 64,
+            ),
+            itemCount: tracks.length,
+            itemBuilder: (_, i) => StaggerEntrance(
+              index: i,
+              child: _RecentSongCell(
+                  track: tracks[i],
+                  queue: tracks,
+                  index: i,
+                  state: state),
+            ),
+          ),
+        ],
       ),
     );
   }
 }
 
-class _Cell {
-  final UserPlaylist? playlist;
-  final SavedRadio? radio;
-  final bool likedTile;
-  const _Cell.liked()
-      : playlist = null,
-        radio = null,
-        likedTile = true;
-  const _Cell.playlist(UserPlaylist p)
-      : playlist = p,
-        radio = null,
-        likedTile = false;
-  const _Cell.radio(SavedRadio r)
-      : playlist = null,
-        radio = r,
-        likedTile = false;
-}
-
-class _RecentCell extends StatelessWidget {
-  final _Cell cell;
+/// One recent-song cell: 56dp art + title + artist, tappable to play.
+/// 64dp row keeps a >=48px tap target; press-scale honors motionMs.
+class _RecentSongCell extends StatelessWidget {
+  final YtTrack track;
+  final List<YtTrack> queue;
+  final int index;
   final AppState state;
-  const _RecentCell({required this.cell, required this.state});
+  const _RecentSongCell(
+      {required this.track,
+      required this.queue,
+      required this.index,
+      required this.state});
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    Widget art;
-    String title;
-    VoidCallback onTap;
-    if (cell.likedTile) {
-      art = Container(
-        width: 56,
-        height: 56,
-        decoration: const BoxDecoration(
-          gradient: LinearGradient(colors: [
-            Color(0xFF4B2DD0),
-            Color(0xFF8A9BB5),
-          ]),
-          borderRadius: BorderRadius.only(
-            topLeft: Radius.circular(8),
-            bottomLeft: Radius.circular(8),
-          ),
-        ),
-        child: const Icon(Icons.favorite,
-            color: Colors.white, size: 24),
-      );
-      title = 'Liked Songs';
-      onTap = () {
-        if (state.library.liked.isNotEmpty) {
-          state.actPlay(state.library.liked, 0);
-        }
-      };
-    } else if (cell.playlist != null) {
-      final p = cell.playlist!;
-      art = p.tracks.isNotEmpty
-          ? ClipRRect(
-              borderRadius: const BorderRadius.only(
-                topLeft: Radius.circular(8),
-                bottomLeft: Radius.circular(8),
-              ),
-              child: TrackArt(track: p.tracks.first, size: 56),
-            )
-          : Container(
-              width: 56,
-              height: 56,
-              decoration: BoxDecoration(
-                color: scheme.surfaceContainerHigh,
-                borderRadius: const BorderRadius.only(
-                  topLeft: Radius.circular(8),
-                  bottomLeft: Radius.circular(8),
-                ),
-              ),
-              child: Icon(Icons.folder_outlined,
-                  color: scheme.onSurfaceVariant),
-            );
-      title = p.name;
-      onTap = () {
-        if (p.tracks.isNotEmpty) {
-          state.actPlay(p.tracks, 0);
-        }
-      };
-    } else {
-      // Radio cell (only remaining variant).
-      final r = cell.radio!;
-      final seedThumb = r.thumbUrl.isNotEmpty
-          ? r.thumbUrl
-          : r.seed.thumbUrl;
-      art = seedThumb.isNotEmpty
-          ? ClipRRect(
-              borderRadius: const BorderRadius.only(
-                topLeft: Radius.circular(8),
-                bottomLeft: Radius.circular(8),
-              ),
-              child: TrackArt(track: r.seed, size: 56),
-            )
-          : Container(
-              width: 56,
-              height: 56,
-              decoration: BoxDecoration(
-                color: scheme.surfaceContainerHigh,
-                borderRadius: const BorderRadius.only(
-                  topLeft: Radius.circular(8),
-                  bottomLeft: Radius.circular(8),
-                ),
-              ),
-              child: Icon(Icons.radio_outlined,
-                  color: scheme.onSurfaceVariant),
-            );
-      title = r.title;
-      onTap = () => state.startRadio(r.seed);
-    }
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
+    return PressScale(
+      motionOn: state.motionOn,
+      onTap: () =>
+          state.actPlay(queue, index, origin: 'Home'),
+      child: RepaintBoundary(
+        child: Container(
+        constraints: const BoxConstraints(minHeight: 48),
         decoration: BoxDecoration(
           color: scheme.surfaceContainerHighest,
           borderRadius: BorderRadius.circular(8),
         ),
         child: Row(
           children: [
-            art,
+            ClipRRect(
+              borderRadius: const BorderRadius.only(
+                topLeft: Radius.circular(8),
+                bottomLeft: Radius.circular(8),
+              ),
+              child: TrackArt(track: track, size: 56),
+            ),
             const SizedBox(width: 8),
             Expanded(
               child: Padding(
                 padding: const EdgeInsets.only(right: 8),
-                child: Text(title,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                        fontSize: 12.5,
-                        fontWeight: FontWeight.w700)),
+                // Cell bg is surfaceContainerHighest (custom container):
+                // derive title/subtitle from that bg, never inherited.
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    AdaptiveText(
+                      data: track.title,
+                      background: scheme.surfaceContainerHighest,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w700),
+                    ),
+                    AdaptiveText(
+                      data: track.displayArtist(),
+                      background: scheme.surfaceContainerHighest,
+                      secondary: true,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 11.5),
+                    ),
+                  ],
+                ),
               ),
             ),
           ],
         ),
-      ),
-    );
-  }
-}
-
-/// Spotify "Jump back in": horizontal large cards (art + type +
-/// title + subtitle) from recent, falling back to top picks.
-class _JumpBackIn extends StatelessWidget {
-  final AppState state;
-  const _JumpBackIn({required this.state});
-
-  @override
-  Widget build(BuildContext context) {
-    final seen = <String>{};
-    final picks = <YtTrack>[];
-    for (final t in [
-      ...state.library.recent,
-      ...state.topPicks,
-    ]) {
-      if (picks.length >= 10) break;
-      if (!seen.add(t.id)) continue;
-      picks.add(t);
-    }
-    if (picks.isEmpty) return const SizedBox.shrink();
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const Padding(
-          padding: EdgeInsets.fromLTRB(16, 14, 16, 10),
-          child: Text('Jump back in',
-              style:
-                  TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
-        ),
-        SizedBox(
-          height: 236,
-          child: ListView.builder(
-            scrollDirection: Axis.horizontal,
-            padding:
-                const EdgeInsets.symmetric(horizontal: 16),
-            itemCount: picks.length,
-            itemBuilder: (_, i) =>
-                _JumpCard(track: picks[i], queue: picks, index: i),
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-class _JumpCard extends StatelessWidget {
-  final YtTrack track;
-  final List<YtTrack> queue;
-  final int index;
-  const _JumpCard(
-      {required this.track,
-      required this.queue,
-      required this.index});
-
-  @override
-  Widget build(BuildContext context) {
-    final state = AppScope.of(context);
-    return GestureDetector(
-      onTap: () => state.actPlay(queue, index),
-      child: Container(
-        width: 160,
-        margin: const EdgeInsets.only(right: 12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            ClipRRect(
-              borderRadius: BorderRadius.circular(8),
-              child: TrackArt(track: track, size: 160),
-            ),
-            const SizedBox(height: 6),
-            Text('Song',
-                style: TextStyle(
-                    fontSize: 11.5,
-                    color: Theme.of(context)
-                        .colorScheme
-                        .onSurfaceVariant)),
-            Text(track.title,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(fontWeight: FontWeight.w700)),
-            Text(track.displayArtist(),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                    fontSize: 12,
-                    color: Theme.of(context)
-                        .colorScheme
-                        .onSurfaceVariant)),
-          ],
         ),
       ),
     );
@@ -566,6 +578,23 @@ class SliverListSkeleton extends StatelessWidget {
   }
 }
 
+/// Update banner slot (H9/Y4): always mounted so [UpdateBannerMotion]
+/// can animate enter/dismiss; collapses to zero-size when no update is
+/// pending. Progress bar rides [UpdateProgressShimmer] while downloading.
+class _UpdateBannerSlot extends StatelessWidget {
+  const _UpdateBannerSlot();
+
+  @override
+  Widget build(BuildContext context) {
+    final state = AppScope.of(context);
+    return UpdateBannerMotion(
+      visible: state.pendingUpdate != null,
+      motionOn: state.motionOn,
+      child: _UpdateBanner(state: state),
+    );
+  }
+}
+
 /// Update banner (H9/Y4): green-tinted, tag + Download/Install +
 /// release notes + dismiss. Session-scoped dismiss only.
 class _UpdateBanner extends StatelessWidget {
@@ -578,6 +607,13 @@ class _UpdateBanner extends StatelessWidget {
     if (u == null) return const SizedBox.shrink();
     final prog = state.updateProgress;
     final downloaded = state.updateDownloaded;
+    final active = prog >= 0;
+    final scheme = Theme.of(context).colorScheme;
+    // Banner bg is a green wash over the surface: derive label
+    // colors from the blended result, inside the existing
+    // UpdateBannerMotion wrapper (untouched above).
+    final bannerBg = Color.alphaBlend(
+        spotifyGreen.withValues(alpha: 0.14), scheme.surface);
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
       child: Container(
@@ -588,62 +624,93 @@ class _UpdateBanner extends StatelessWidget {
           border: Border.all(
               color: spotifyGreen.withValues(alpha: 0.4)),
         ),
-        child: Row(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(Icons.system_update_outlined,
-                color: spotifyGreen),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('Cresca ${u.tag} available',
-                      style: const TextStyle(
-                          fontWeight: FontWeight.w700)),
-                  Text(
-                      prog >= 0
-                          ? 'Downloading… ${prog.round()}%'
-                          : downloaded
-                              ? 'Downloaded — ready to install.'
-                              : 'Tap Update to download.',
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodySmall),
-                ],
+            Row(
+              children: [
+                const Icon(Icons.system_update_outlined,
+                    color: spotifyGreen),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      AdaptiveText(
+                          data: 'Cresca Music ${u.tag} available',
+                          background: bannerBg,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                              fontWeight: FontWeight.w700)),
+                      AdaptiveText(
+                          data: active
+                              ? 'Downloading… ${prog.round()}%'
+                              : downloaded
+                                  ? 'Downloaded — ready to install.'
+                                  : 'Tap Update to download.',
+                          background: bannerBg,
+                          secondary: true,
+                          style: Theme.of(context)
+                              .textTheme
+                              .bodySmall),
+                    ],
+                  ),
+                ),
+                TextButton(
+                  onPressed: () => state.openReleasePage(),
+                  child: const Text("What's new"),
+                ),
+                FilledButton(
+                  style: spotifyPlayStyle(),
+                  onPressed: active
+                      ? null
+                      : () async {
+                          try {
+                            if (downloaded) {
+                              await state.installUpdate();
+                            } else {
+                              final msg =
+                                  await state.downloadUpdate();
+                              if (context.mounted &&
+                                  msg.isNotEmpty) {
+                                ScaffoldMessenger.of(context)
+                                    .showSnackBar(SnackBar(
+                                        content: Text(msg)));
+                              }
+                            }
+                          } catch (_) {}
+                        },
+                  child: Text(
+                      downloaded ? 'Install' : 'Update'),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.close, size: 18),
+                  tooltip: 'Dismiss',
+                  onPressed: () => state.dismissUpdate(),
+                ),
+              ],
+            ),
+            if (active)
+              Padding(
+                padding: const EdgeInsets.only(top: 8, right: 8),
+                child: UpdateProgressShimmer(
+                  motionOn: state.motionOn,
+                  active: true,
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(4),
+                    child: LinearProgressIndicator(
+                      value: (prog / 100).clamp(0.0, 1.0),
+                      minHeight: 4,
+                      backgroundColor: spotifyGreen.withValues(
+                          alpha: 0.2),
+                      valueColor:
+                          const AlwaysStoppedAnimation<Color>(
+                              spotifyGreen),
+                    ),
+                  ),
+                ),
               ),
-            ),
-            TextButton(
-              onPressed: () => state.openReleasePage(),
-              child: const Text("What's new"),
-            ),
-            FilledButton(
-              style: spotifyPlayStyle(),
-              onPressed: prog >= 0
-                  ? null
-                  : () async {
-                      try {
-                        if (downloaded) {
-                          await state.installUpdate();
-                        } else {
-                          final msg =
-                              await state.downloadUpdate();
-                          if (context.mounted &&
-                              msg.isNotEmpty) {
-                            ScaffoldMessenger.of(context)
-                                .showSnackBar(SnackBar(
-                                    content: Text(msg)));
-                          }
-                        }
-                      } catch (_) {}
-                    },
-              child: Text(
-                  downloaded ? 'Install' : 'Update'),
-            ),
-            IconButton(
-              icon: const Icon(Icons.close, size: 18),
-              tooltip: 'Dismiss',
-              onPressed: () => state.dismissUpdate(),
-            ),
           ],
         ),
       ),
@@ -677,7 +744,8 @@ class _ErrorCard extends StatelessWidget {
   }
 }
 
-/// Top Picks + Play-all + Shuffle + See All (H3).
+/// Top Picks + Play-all + Shuffle + See All (H3): 2x2 GRID of
+/// per-song cards (art + title + artist, tappable to play).
 class _TopPicks extends StatelessWidget {
   final List<YtTrack> tracks;
   const _TopPicks({required this.tracks});
@@ -685,26 +753,39 @@ class _TopPicks extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final state = AppScope.of(context);
+    // Songs-only display pass: top picks arrive gated from state, but
+    // cached/mixed lists can still carry cards — never render those.
+    final tracks = songsOnlyTracks(this.tracks);
+    if (tracks.isEmpty) return const SizedBox.shrink();
+    // 2-row horizontal grid (2x2 look, slides right for more): up
+    // to 12 songs; the pool re-ranks per visit + pull-to-refresh.
+    final shown = tracks.take(12).toList();
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+      padding: const EdgeInsets.fromLTRB(16, 12, 0, 0),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              Expanded(
-                child: Text(state.topSeed.title,
-                    style: Theme.of(context).textTheme.titleLarge),
-              ),
-              TextButton(
-                  onPressed: () => openSeeAllQuery(
-                      context, state.topSeed.title, state.topSeed.query,
-                      initial: tracks),
-                  child: const Text('See All')),
-            ],
+          Padding(
+            padding: const EdgeInsets.only(right: 16),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(state.topSeed.title,
+                      style: Theme.of(context).textTheme.titleLarge),
+                ),
+                TextButton(
+                    onPressed: () => openSeeAllQuery(
+                        context, state.topSeed.title, state.topSeed.query,
+                        initial: tracks),
+                    child: const Text('See All')),
+              ],
+            ),
           ),
-          Text(state.topSeed.subtitle,
-              style: Theme.of(context).textTheme.bodySmall),
+          Padding(
+            padding: const EdgeInsets.only(right: 16),
+            child: Text(state.topSeed.subtitle,
+                style: Theme.of(context).textTheme.bodySmall),
+          ),
           Row(
             children: [
               FilledButton.icon(
@@ -727,13 +808,29 @@ class _TopPicks extends StatelessWidget {
               ),
             ],
           ),
+          const SizedBox(height: 8),
           SizedBox(
-            height: 178,
-            child: ListView.builder(
+            height: 412,
+            child: GridView.builder(
               scrollDirection: Axis.horizontal,
-              itemCount: tracks.length,
-              itemBuilder: (_, i) => _PickCard(
-                  track: tracks[i], queue: tracks, index: i),
+              gridDelegate:
+                  const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 2,
+                mainAxisSpacing: 10,
+                crossAxisSpacing: 12,
+                // Cells ~150 wide in a 194-tall row.
+                childAspectRatio: 1.3,
+              ),
+              padding:
+                  const EdgeInsets.only(right: 16),
+              itemCount: shown.length,
+              itemBuilder: (_, i) => StaggerEntrance(
+                index: i,
+                child: _PickCard(
+                    track: shown[i],
+                    queue: tracks,
+                    index: i),
+              ),
             ),
           ),
         ],
@@ -752,98 +849,42 @@ class _PickCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final state = AppScope.of(context);
-    return GestureDetector(
-      onTap: () => state.actPlay(queue, index),
-      child: Container(
-        width: 124,
-        margin: const EdgeInsets.only(right: 10, top: 8),
+    // Rail card (reference look): square rounded art on top, title
+    // (1-2 lines) + artist (1 line) BELOW on the page surface — no
+    // overlay text. Tappable to play; press-scale honors motionMs.
+    final surface = Theme.of(context).colorScheme.surface;
+    return PressScale(
+      motionOn: state.motionOn,
+      onTap: () => state.actPlay(queue, index,
+          origin: 'Home'),
+      child: RepaintBoundary(
         child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+          crossAxisAlignment:
+              CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
-            TrackArt(track: track, size: 112),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(14),
+              child: TrackArt(track: track, size: 140),
+            ),
             const SizedBox(height: 6),
-            Text(track.title,
-                maxLines: 1,
+            AdaptiveText(
+                data: track.title,
+                background: surface,
+                maxLines: 2,
                 overflow: TextOverflow.ellipsis,
                 style: const TextStyle(
-                    fontSize: 12.5,
-                    fontWeight: FontWeight.w600)),
-            Text(track.displayArtist(),
+                    fontSize: 13.5,
+                    fontWeight: FontWeight.w700)),
+            AdaptiveText(
+                data: track.displayArtist(),
+                background: surface,
+                secondary: true,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                    fontSize: 11.5,
-                    color: Theme.of(context)
-                        .colorScheme
-                        .onSurfaceVariant)),
+                style: const TextStyle(fontSize: 11.5)),
           ],
         ),
-      ),
-    );
-  }
-}
-
-/// Hero card with working Play/Shuffle (whole list = queue, H7).
-class _HeroCard extends StatelessWidget {
-  final List<YtTrack> tracks;
-  const _HeroCard({required this.tracks});
-
-  @override
-  Widget build(BuildContext context) {
-    if (tracks.isEmpty) return const SizedBox.shrink();
-    final state = AppScope.of(context);
-    final track = tracks.first;
-    final scheme = Theme.of(context).colorScheme;
-    return Container(
-      margin: const EdgeInsets.all(16),
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(16),
-        gradient: LinearGradient(colors: [
-          scheme.primary,
-          scheme.primaryContainer
-        ]),
-      ),
-      child: Row(
-        children: [
-          TrackArt(track: track, size: 72),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(track.title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                        color: scheme.onPrimary,
-                        fontWeight: FontWeight.bold)),
-                Text(track.displayArtist(),
-                    style: TextStyle(color: scheme.onPrimary)),
-                Row(
-                  children: [
-                    FilledButton(
-                        style: spotifyPlayStyle(),
-                        onPressed: () => state.actPlay(tracks, 0),
-                        child: const Text('Play')),
-                    const SizedBox(width: 8),
-                    OutlinedButton(
-                      onPressed: () {
-                        final order = List<int>.generate(
-                            tracks.length, (i) => i)
-                          ..shuffle();
-                        state.actPlay(
-                            [for (final i in order) tracks[i]], 0);
-                      },
-                      child: const Text('Shuffle'),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        ],
       ),
     );
   }
@@ -865,6 +906,9 @@ class _Moods extends StatelessWidget {
             ActionChip(
               avatar: const Icon(Icons.circle, size: 8),
               label: Text(m.$1),
+              // Padded tap target (48px) with a compact visual.
+              materialTapTargetSize:
+                  MaterialTapTargetSize.padded,
               onPressed: () =>
                   openSeeAllQuery(context, m.$1, m.$2),
             ),
@@ -879,10 +923,55 @@ class _Rail extends StatelessWidget {
   final AppState state;
   const _Rail({required this.rail, required this.state});
 
+  /// A rail must never render a blank header: some server/cached
+  /// sections arrive with empty titles. Derive a human title from the
+  /// query token (`__browse__quick_picks` → `Quick Picks`,
+  /// `__related__<id>` → `Related Mix`) so the category is always
+  /// named. Colors are explicit on the page surface (never inherited,
+  /// never white-on-white).
+  static String headerTitle(dynamic section) {
+    try {
+      final t = (section.title as String).trim();
+      if (t.isNotEmpty) return t;
+    } catch (_) {}
+    try {
+      final q = (section.query as String).trim();
+      if (q.startsWith('__related__')) return 'Related Mix';
+      final core = q.replaceAll(RegExp(r'^__[a-z]+__'), '');
+      final words = core
+          .split(RegExp(r'[^a-zA-Z0-9]+'))
+          .where((w) => w.isNotEmpty)
+          .map((w) => w[0].toUpperCase() + w.substring(1))
+          .join(' ')
+          .trim();
+      if (words.isNotEmpty) return words;
+    } catch (_) {}
+    return 'Top Picks';
+  }
+
+  static String headerSubtitle(dynamic section) {
+    try {
+      final s = (section.subtitle as String).trim();
+      if (s.isNotEmpty) return s;
+    } catch (_) {}
+    return 'YouTube Music';
+  }
+
   @override
   Widget build(BuildContext context) {
-    final List<YtTrack> tracks = rail.tracks;
-    if (tracks.isEmpty) return const SizedBox.shrink();
+    // Songs-only display pass over the rail (cached + mixed-source
+    // lists can carry playlist/video/podcast cards). Thin rails (<3
+    // playable) never render — same rule as the state-side fetch.
+    late final List<YtTrack> tracks;
+    try {
+      tracks = songsOnlyTracks(rail.tracks as List<YtTrack>);
+    } catch (_) {
+      return const SizedBox.shrink();
+    }
+    if (tracks.length < minRailTracks) return const SizedBox.shrink();
+    final title = headerTitle(rail.section);
+    final subtitle = headerSubtitle(rail.section);
+    final surface = Theme.of(context).colorScheme.surface;
     return Padding(
       padding: const EdgeInsets.only(top: 8),
       child: Column(
@@ -896,22 +985,24 @@ class _Rail extends StatelessWidget {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(rail.section.title,
-                          style: Theme.of(context)
-                              .textTheme
-                              .titleMedium),
-                      if ((rail.section.subtitle as String)
-                          .isNotEmpty)
-                        Text(rail.section.subtitle,
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodySmall),
+                      AdaptiveText(
+                          data: title,
+                          background: surface,
+                          style: const TextStyle(
+                              fontSize: 17,
+                              fontWeight: FontWeight.w600)),
+                      AdaptiveText(
+                          data: subtitle,
+                          background: surface,
+                          secondary: true,
+                          style:
+                              const TextStyle(fontSize: 13)),
                     ],
                   ),
                 ),
                 TextButton(
                   onPressed: () =>
-                      openSeeAllStatic(context, rail.section.title,
+                      openSeeAllStatic(context, title,
                           tracks, rail.section.query),
                   child: const Text('See All'),
                 ),
@@ -919,18 +1010,188 @@ class _Rail extends StatelessWidget {
             ),
           ),
           SizedBox(
-            height: 178,
+            height: 208,
             child: ListView.builder(
               scrollDirection: Axis.horizontal,
               padding:
                   const EdgeInsets.symmetric(horizontal: 16),
               itemCount: tracks.length,
-              itemBuilder: (_, i) => _PickCard(
-                  track: tracks[i], queue: tracks, index: i),
+              itemBuilder: (_, i) => StaggerEntrance(
+                index: i,
+                // Horizontal rail: fixed 150dp song cards (the grid
+                // sizes _PickCard itself; here the width is pinned).
+                child: Padding(
+                  padding: const EdgeInsets.only(right: 10, top: 8),
+                  child: SizedBox(
+                    width: 150,
+                    height: 200,
+                    child: _PickCard(
+                        track: tracks[i], queue: tracks, index: i),
+                  ),
+                ),
+              ),
             ),
           ),
         ],
       ),
+    );
+  }
+}
+
+/// Endless-discovery tail: loading skeleton (fixed height so arriving
+/// rails never jump the layout), honest error + Retry, honest end card.
+/// Shown only once the initial rails exist; the Podcasts filter owns its
+/// own list and never shows this.
+class _DiscoveryTail extends StatelessWidget {
+  final AppState state;
+  const _DiscoveryTail({required this.state});
+
+  @override
+  Widget build(BuildContext context) {
+    if (state.rails.isEmpty) return const SizedBox.shrink();
+    if (state.discoveryLoading) {
+      final scheme = Theme.of(context).colorScheme;
+      final base = scheme.surfaceContainerHighest;
+      // One rail tall (~header + 208px horizontal cards): arriving rails
+      // replace this 1:1 with no scroll jump.
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+        child: SizedBox(
+          height: 260,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                  width: 180,
+                  height: 18,
+                  decoration: BoxDecoration(
+                      color: base,
+                      borderRadius: BorderRadius.circular(4))),
+              const SizedBox(height: 6),
+              Container(
+                  width: 120,
+                  height: 13,
+                  decoration: BoxDecoration(
+                      color: base,
+                      borderRadius: BorderRadius.circular(4))),
+              const SizedBox(height: 12),
+              Expanded(
+                child: Row(
+                  children: [
+                    for (var i = 0; i < 3; i++)
+                      Expanded(
+                        child: Padding(
+                          padding: EdgeInsets.only(
+                              right: i == 2 ? 0 : 10),
+                          child: Column(
+                            crossAxisAlignment:
+                                CrossAxisAlignment.start,
+                            children: [
+                              Expanded(
+                                child: Container(
+                                    decoration: BoxDecoration(
+                                        color: base,
+                                        borderRadius:
+                                            BorderRadius.circular(
+                                                14))),
+                              ),
+                              const SizedBox(height: 6),
+                              Container(
+                                  height: 13,
+                                  decoration: BoxDecoration(
+                                      color: base,
+                                      borderRadius:
+                                          BorderRadius.circular(
+                                              4))),
+                              const SizedBox(height: 4),
+                              Container(
+                                  width: 90,
+                                  height: 11,
+                                  decoration: BoxDecoration(
+                                      color: base,
+                                      borderRadius:
+                                          BorderRadius.circular(
+                                              4))),
+                            ],
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    if (state.discoveryError.isNotEmpty && state.discoveryHasMore) {
+      final scheme = Theme.of(context).colorScheme;
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(14, 12, 8, 12),
+          decoration: BoxDecoration(
+            color: scheme.surfaceContainerHighest,
+            borderRadius: BorderRadius.circular(14),
+          ),
+          child: Row(
+            children: [
+              const Icon(Icons.cloud_off_outlined, size: 20),
+              const SizedBox(width: 10),
+              Expanded(
+                child: AdaptiveText(
+                  data: state.discoveryError,
+                  background: scheme.surfaceContainerHighest,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                      fontSize: 13, fontWeight: FontWeight.w600),
+                ),
+              ),
+              FilledButton(
+                onPressed: () => state.retryDiscovery(),
+                child: const Text('Retry'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    if (!state.discoveryHasMore) {
+      final scheme = Theme.of(context).colorScheme;
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(16, 20, 16, 0),
+        child: Center(
+          child: AdaptiveText(
+            data:
+                'You\u2019re all caught up \u2014 pull to refresh for a fresh rotation.',
+            background: scheme.surface,
+            secondary: true,
+            align: TextAlign.center,
+            style: const TextStyle(fontSize: 13),
+          ),
+        ),
+      );
+    }
+    return const SizedBox.shrink();
+  }
+}
+
+/// Refresh dissolve: opacity-only fade behind the native spinner.
+/// Duration is pre-collapsed via motionMs by the caller.
+class _Dissolve extends StatelessWidget {
+  final double opacity;
+  final int ms;
+  final Widget child;
+  const _Dissolve(
+      {required this.opacity, required this.ms, required this.child});
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      duration: Duration(milliseconds: ms),
+      opacity: opacity,
+      child: child,
     );
   }
 }

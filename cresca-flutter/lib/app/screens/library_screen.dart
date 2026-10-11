@@ -3,14 +3,18 @@
 // Recent + user mosaics), favorite artists row, virtual Liked/Recent
 // folders, new-playlist dialog. Full custom covers land with L6 polish.
 
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
 import '../../core/track.dart';
 import '../app.dart';
+import '../design.dart';
 import '../state.dart';
 import '../widgets/downloads_sheet.dart';
 import '../widgets/profile_sheet.dart';
 import '../widgets/session_sheet.dart';
+import '../widgets/track_row.dart';
 import 'playlist_screen.dart';
 import 'see_all.dart';
 
@@ -30,27 +34,41 @@ class LibraryScreen extends StatelessWidget {
             children: [
               Expanded(
                 child: ListView(
-                  padding: const EdgeInsets.only(
+                  padding: EdgeInsets.only(
                       // Bottom chrome (mini player + pill) is app-shell;
-                      // lists scroll under the glass.
-                      bottom: 210),
+                      // lists scroll under the glass. Live measured
+                      // clearance (210 fallback pre-measure).
+                      bottom:
+                          BottomChromeScope.clearanceOf(context)),
                   children: [
                     Padding(
                       padding: const EdgeInsets.all(16),
-                      child: Text(
-                        '${state.library.liked.length} liked • '
-                        '${state.library.recent.length} recent • '
-                        '${state.library.playlists.length} playlists',
-                        style: Theme.of(context)
-                            .textTheme
-                            .titleMedium,
+                      child: StaggerEntrance(
+                        child: Text(
+                          '${state.library.liked.length} liked • '
+                          '${state.library.recent.length} recent • '
+                          '${state.library.playlists.length} playlists',
+                          style: Theme.of(context)
+                              .textTheme
+                              .titleMedium,
+                        ),
                       ),
                     ),
                     _QuickTiles(state: state, loggedIn: loggedIn),
                     const _SectionTitle('Folders'),
-                    _FolderGrid(state: state),
+                    StaggerEntrance(
+                      key: ValueKey(
+                          'lib-folders-${state.library.playlists.length}'),
+                      index: 1,
+                      child: _FolderGrid(state: state),
+                    ),
                     if (state.library.artists.isNotEmpty)
-                      _FavArtists(state: state),
+                      StaggerEntrance(
+                        key: ValueKey(
+                            'lib-artists-${state.library.artists.length}'),
+                        index: 2,
+                        child: _FavArtists(state: state),
+                      ),
                   ],
                 ),
               ),
@@ -74,27 +92,35 @@ class _QuickTiles extends StatelessWidget {
       child: Row(
         children: [
           Expanded(
-            child: _Tile(
-              icon: Icons.person_outline,
-              label: 'Profile',
-              onTap: () => openProfileSheet(context),
+            child: StaggerEntrance(
+              child: _Tile(
+                icon: Icons.person_outline,
+                label: 'Profile',
+                onTap: () => openProfileSheet(context),
+              ),
             ),
           ),
           const SizedBox(width: 8),
           Expanded(
-            child: _Tile(
-              icon: Icons.account_circle_outlined,
-              label: loggedIn ? 'Signed in' : 'Sign in',
-              onTap: () => openSessionSheet(context),
+            child: StaggerEntrance(
+              index: 1,
+              child: _Tile(
+                icon: Icons.account_circle_outlined,
+                label: loggedIn ? 'Signed in' : 'Sign in',
+                onTap: () => openSessionSheet(context),
+              ),
             ),
           ),
           const SizedBox(width: 8),
           Expanded(
-            child: _Tile(
-              icon: Icons.download_outlined,
-              label:
-                  'Downloads (${state.downloads.listAll().length})',
-              onTap: () => openDownloadsSheet(context),
+            child: StaggerEntrance(
+              index: 2,
+              child: _Tile(
+                icon: Icons.download_outlined,
+                label:
+                    'Downloads (${state.downloads.listAll().length})',
+                onTap: () => openDownloadsSheet(context),
+              ),
             ),
           ),
         ],
@@ -112,20 +138,28 @@ class _Tile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Top user-visible bug was white-on-light-grey here: derive the
+    // glyph + label from the actual tile bg, never hardcoded.
+    final tileBg =
+        Theme.of(context).colorScheme.surfaceContainerHighest;
     return GestureDetector(
       onTap: onTap,
       child: Container(
         padding: const EdgeInsets.symmetric(vertical: 12),
         decoration: BoxDecoration(
           borderRadius: BorderRadius.circular(12),
-          color: Theme.of(context).colorScheme.surfaceContainerHighest,
+          color: tileBg,
         ),
         child: Column(
           children: [
-            Icon(icon),
+            Icon(icon, color: textOn(tileBg)),
             const SizedBox(height: 4),
-            Text(label,
-                style: Theme.of(context).textTheme.bodySmall),
+            AdaptiveText(
+                data: label,
+                background: tileBg,
+                secondary: true,
+                style:
+                    Theme.of(context).textTheme.bodySmall),
           ],
         ),
       ),
@@ -192,32 +226,46 @@ class _FolderGrid extends StatelessWidget {
       itemCount: folders.length + 1,
       itemBuilder: (_, i) {
         if (i >= folders.length) {
-          return GestureDetector(
-            onTap: () async {
-              try {
-                final name = await _askName(context);
-                if (name == null) return;
-                await state.library.createPlaylist(name);
-              } catch (_) {}
-            },
-            child: Container(
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(
-                    color:
-                        Theme.of(context).colorScheme.outlineVariant),
-              ),
-              child: const Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(Icons.add, size: 32),
-                  Text('New playlist'),
-                ],
+          return StaggerEntrance(
+            index: i,
+            child: GestureDetector(
+              onTap: () async {
+                try {
+                  final name = await _askName(context);
+                  if (name == null) return;
+                  await state.library.createPlaylist(name);
+                } catch (_) {}
+              },
+              child: Container(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(
+                      color:
+                          Theme.of(context).colorScheme.outlineVariant),
+                ),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.add,
+                        size: 32,
+                        color: Theme.of(context)
+                            .colorScheme
+                            .onSurface),
+                    AdaptiveText(
+                        data: 'New playlist',
+                        background: Theme.of(context)
+                            .colorScheme
+                            .surface),
+                  ],
+                ),
               ),
             ),
           );
         }
-        return _FolderCard(folder: folders[i]);
+        return StaggerEntrance(
+          index: i,
+          child: _FolderCard(folder: folders[i]),
+        );
       },
     );
   }
@@ -246,7 +294,13 @@ class _FolderCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return GestureDetector(
+    final scheme = Theme.of(context).colorScheme;
+    // Folder titles/counts sit on the page surface: derive from it.
+    final pageBg = scheme.surface;
+    // RepaintBoundary: folder cards hold mosaic image grids — keep
+    // each card out of the list's repaint scope while scrolling.
+    return RepaintBoundary(
+      child: GestureDetector(
       onTap: folder.onOpen,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -255,32 +309,32 @@ class _FolderCard extends StatelessWidget {
             child: Container(
               decoration: BoxDecoration(
                 borderRadius: BorderRadius.circular(16),
-                gradient: folder.heart
-                    ? const LinearGradient(colors: [
-                        Color(0xFF1DB954),
-                        Color(0xFF0D5C2B)
-                      ])
-                    : null,
-                color: folder.heart
-                    ? null
-                    : Theme.of(context)
-                        .colorScheme
-                        .surfaceContainerHighest,
+                // Neutral Liked tile (green is reserved for actions):
+                // same surface treatment as Home, heart in primary.
+                color: scheme.surfaceContainerHighest,
               ),
               clipBehavior: Clip.hardEdge,
               child: folder.heart
-                  ? const Center(
+                  ? Center(
                       child: Icon(Icons.favorite,
-                          size: 48, color: Colors.white))
+                          size: 48,
+                          color: scheme.primary))
                   : MosaicArt(tracks: folder.tracks),
             ),
           ),
           const SizedBox(height: 4),
-          Text(folder.title,
-              maxLines: 1, overflow: TextOverflow.ellipsis),
-          Text('${folder.count} songs',
+          AdaptiveText(
+              data: folder.title,
+              background: pageBg,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis),
+          AdaptiveText(
+              data: '${folder.count} songs',
+              background: pageBg,
+              secondary: true,
               style: Theme.of(context).textTheme.bodySmall),
         ],
+      ),
       ),
     );
   }
@@ -320,15 +374,23 @@ class _MosaicTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Tight mosaic decode: tiles are ~1/4 of the folder card, so a
+    // ~100px mem cache is plenty — never the full upload.
     if (track.thumbUrl.isEmpty) {
       return Container(color: Theme.of(context).colorScheme.primaryContainer);
     }
-    return Image.network(track.thumbUrl,
-        fit: BoxFit.cover,
-        errorBuilder: (_, _, _) => Container(
-            color: Theme.of(context)
-                .colorScheme
-                .primaryContainer));
+    return CachedNetworkImage(
+      imageUrl: track.thumbUrl,
+      fit: BoxFit.cover,
+      memCacheWidth: 112,
+      memCacheHeight: 112,
+      maxWidthDiskCache: 224,
+      maxHeightDiskCache: 224,
+      fadeInDuration: const Duration(milliseconds: 150),
+      fadeOutDuration: const Duration(milliseconds: 1),
+      errorWidget: (_, _, _) => Container(
+          color: Theme.of(context).colorScheme.primaryContainer),
+    );
   }
 }
 
@@ -343,33 +405,67 @@ class _FavArtists extends StatelessWidget {
       children: [
         const _SectionTitle('Favorite artists'),
         SizedBox(
-          height: 92,
+          // Room for 2-line names at 200% text scale.
+          height: 112,
           child: ListView.builder(
             scrollDirection: Axis.horizontal,
             padding: const EdgeInsets.symmetric(horizontal: 16),
             itemCount: state.library.artists.length,
             itemBuilder: (_, i) {
               final a = state.library.artists[i];
-              return Container(
-                width: 72,
-                margin: const EdgeInsets.only(right: 8),
-                child: Column(
-                  children: [
-                    CircleAvatar(
-                      radius: 24,
-                      backgroundImage: a.thumbUrl.isEmpty
-                          ? null
-                          : NetworkImage(a.thumbUrl),
-                      child: a.thumbUrl.isEmpty
-                          ? const Icon(Icons.person)
-                          : null,
+              return StaggerEntrance(
+                index: i,
+                child: Container(
+                  width: 72,
+                  margin: const EdgeInsets.only(right: 8),
+                  child: RepaintBoundary(
+                    child: Column(
+                    children: [
+                      // Tight 48px avatar decode (~144px mem cache),
+                      // not the full upload.
+                      SizedBox(
+                        width: 48,
+                        height: 48,
+                        child: ClipOval(
+                          child: a.thumbUrl.isEmpty
+                              ? Container(
+                                  color: Theme.of(context)
+                                      .colorScheme
+                                      .surfaceContainerHighest,
+                                  child: const Icon(Icons.person),
+                                )
+                              : CachedNetworkImage(
+                                  imageUrl: a.thumbUrl,
+                                  width: 48,
+                                  height: 48,
+                                  fit: BoxFit.cover,
+                                  memCacheWidth: 144,
+                                  memCacheHeight: 144,
+                                  maxWidthDiskCache: 144,
+                                  maxHeightDiskCache: 144,
+                                  fadeInDuration: const Duration(
+                                      milliseconds: 150),
+                                  fadeOutDuration:
+                                      const Duration(milliseconds: 1),
+                                  errorWidget: (_, _, _) =>
+                                      const Icon(Icons.person),
+                                ),
+                        ),
+                      ),
+                      Text(a.name,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          textAlign: TextAlign.center,
+                          style: Theme.of(context)
+                              .textTheme
+                              .bodySmall
+                              ?.copyWith(
+                                  color: Theme.of(context)
+                                      .colorScheme
+                                      .onSurfaceVariant)),
+                    ],
                     ),
-                    Text(a.name,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style:
-                            Theme.of(context).textTheme.bodySmall),
-                  ],
+                  ),
                 ),
               );
             },
@@ -383,6 +479,32 @@ class _FavArtists extends StatelessWidget {
 Future<String?> _askName(BuildContext context) async {
   try {
     final c = TextEditingController();
+    // One dialog idiom per platform: Cupertino on iOS, Material
+    // elsewhere. Behavior identical (trimmed name or null).
+    if (_isIOS(context)) {
+      final name = await showCupertinoDialog<String>(
+        context: context,
+        builder: (d) => CupertinoAlertDialog(
+          title: const Text('New playlist'),
+          content: CupertinoTextField(
+            controller: c,
+            autofocus: true,
+            placeholder: 'Playlist name',
+          ),
+          actions: [
+            CupertinoDialogAction(
+                onPressed: () => Navigator.pop(d),
+                child: const Text('Cancel')),
+            CupertinoDialogAction(
+                isDefaultAction: true,
+                onPressed: () => Navigator.pop(d, c.text),
+                child: const Text('Create')),
+          ],
+        ),
+      );
+      final t = (name ?? '').trim();
+      return t.isEmpty ? null : t;
+    }
     final name = await showDialog<String>(
       context: context,
       builder: (d) => AlertDialog(
@@ -407,6 +529,14 @@ Future<String?> _askName(BuildContext context) async {
     return t.isEmpty ? null : t;
   } catch (_) {
     return null;
+  }
+}
+
+bool _isIOS(BuildContext context) {
+  try {
+    return Theme.of(context).platform == TargetPlatform.iOS;
+  } catch (_) {
+    return false;
   }
 }
 

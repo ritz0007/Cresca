@@ -65,6 +65,17 @@ class YtTrack {
       return 'Unknown Artist';
     }
   }
+
+  /// Normalized artist key for affinity caps + diversity buckets:
+  /// display artist, topic suffix stripped, lowercased, whitespace
+  /// collapsed. Never blank ('unknown artist' fallback).
+  String artistKey() {
+    try {
+      return artistKeyOf(displayArtist());
+    } catch (_) {
+      return 'unknown artist';
+    }
+  }
 }
 
 /// One artist hit: name + art + subscriber label.
@@ -248,4 +259,32 @@ List<YtTrack> distinctById(List<YtTrack> tracks) {
     if (seen.add(t.id)) out.add(t);
   }
   return out;
+}
+
+/// Normalized artist key: topic suffix stripped, lowercased, inner
+/// whitespace collapsed. Never blank.
+String artistKeyOf(String artist) {
+  try {
+    var a = artist.trim().toLowerCase();
+    if (a.length > 8 && a.endsWith(' - topic')) {
+      a = a.substring(0, a.length - 8).trim();
+    }
+    a = a.replaceAll(RegExp(r'\s+'), ' ');
+    return a.isEmpty ? 'unknown artist' : a;
+  } catch (_) {
+    return 'unknown artist';
+  }
+}
+
+/// Token set for artist-overlap scoring (words > 2 chars).
+Set<String> artistTokensOf(String artist) {
+  try {
+    return artistKeyOf(artist)
+        .split(RegExp(r'[^a-z0-9]+'))
+        .map((e) => e.trim())
+        .where((e) => e.length > 2)
+        .toSet();
+  } catch (_) {
+    return const {};
+  }
 }

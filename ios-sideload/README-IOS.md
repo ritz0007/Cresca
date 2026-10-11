@@ -1,5 +1,19 @@
 # Cresca iOS — Sideload .ipa from MacBook
 
+## 0. Prebuilt .ipa (no Mac needed, recommended)
+
+1. On GitHub → Releases → latest → download `Cresca-iOS-unsigned.ipa`.
+2. Self-sign it with **Sideloadly** (or AltStore) using your Apple ID
+   (free ID = 7-day cert, refresh over Wi-Fi; $99/yr dev account = 1 yr).
+3. iPhone → Settings → General → VPN & Device Management → Trust your
+   Apple ID → open Cresca Music.
+4. TrollStore (where your iOS version supports it) installs the same
+   file permanently with no refresh.
+
+Apple forbids installing unsigned apps, so the published file must be
+signed by YOU on install — there is no tap-to-install .ipa. Steps 1–4
+below are only for building from source instead.
+
 MVP port (search + stream + lyrics + likes). No pods. Builds on Mac only —
 Windows cannot emit an .ipa.
 
