@@ -14,7 +14,4 @@ targets:
         MARKETING_VERSION: 2.0.0
         CURRENT_PROJECT_VERSION: 22
     info:
-      properties:
-        CFBundleDisplayName: Cresca Music
-        UIBackgroundModes: [audio]
-        UILaunchScreen: {}
+      path: Info.plist
