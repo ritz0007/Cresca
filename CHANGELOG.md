@@ -47,6 +47,13 @@
   permission (`lib/system/live_updates.dart`), Spotify PKCE auth slice
   (`lib/auth/spotify.dart`), encrypted YouTube session G1
   (`lib/auth/session.dart`, session sheet).
+- Queue + lyrics + video interaction pass (U5): queue reorder haptic on
+  grab + 5 s Snackbar-Undo on reorder/remove (engine `restoreRemoved`
+  re-inserts + restores order, sounding track never yanks), drag handles
+  + long-press with labelled `Reorder …` semantics and track-id keys;
+  lyrics explicit `Resume` pill (finger beats auto-scroll until tapped,
+  tap-vs-drag gate 300 ms/8 dp); video one-tap labelled `Close video`
+  + quality-picker option semantics. Portrait lock unchanged.
 - Fixes since the port began (per commit messages): Range pre-flight skips
   403s in seconds; shell-overlay mini-player Material-wrapper crash fix;
   artist resolve skips YTM type badges + strips "Topic"; endless-scroll

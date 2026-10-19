@@ -114,6 +114,59 @@ void main() {
       expect(q.playOrder(), [2, 1, 0]);
     });
 
+    test('reorder snapshot + applyOrder restores exact order (Undo)', () {
+      final q = QueueEngine();
+      q.setQueue([t('a'), t('b'), t('c'), t('d')], 1);
+      final prev = q.playOrder();
+      q.moveInOrder(1, 3);
+      expect(q.playOrder(), isNot(prev));
+      q.applyOrder(prev); // void; must not throw
+      expect(q.playOrder(), prev);
+      expect(q.current?.id, 'b'); // sounding track untouched
+    });
+
+    test('restoreRemoved re-inserts + restores order (remove Undo)', () {
+      final q = QueueEngine();
+      q.setQueue([t('a'), t('b'), t('c')], 1);
+      final prev = q.playOrder();
+      q.removeAt(0);
+      expect(q.items.map((e) => e.id).toList(), ['b', 'c']);
+      expect(
+          q.restoreRemoved(index: 0, track: t('a'), prevOrder: prev),
+          isTrue);
+      expect(q.items.map((e) => e.id).toList(), ['a', 'b', 'c']);
+      expect(q.playOrder(), prev);
+      expect(q.current?.id, 'b'); // still sounding, no yank
+    });
+
+    test('restoreRemoved of sounding row rejoins as upcoming', () {
+      final q = QueueEngine();
+      q.setQueue([t('a'), t('b'), t('c')], 1);
+      final prev = q.playOrder();
+      q.removeAt(1); // sounding row gone; playback moves on
+      expect(q.current?.id, 'c');
+      expect(
+          q.restoreRemoved(index: 1, track: t('b'), prevOrder: prev),
+          isTrue);
+      expect(q.items.map((e) => e.id).toList(), ['a', 'b', 'c']);
+      expect(q.current?.id, 'c'); // never yanks back to 'b'
+    });
+
+    test('restoreRemoved no-ops on shape change, never throws', () {
+      final q = QueueEngine();
+      q.setQueue([t('a'), t('b'), t('c')], 0);
+      final prev = q.playOrder();
+      q.removeAt(0);
+      q.removeAt(0); // second mutation: stale snapshot
+      expect(
+          q.restoreRemoved(index: 0, track: t('a'), prevOrder: prev),
+          isFalse);
+      expect(
+          q.restoreRemoved(index: 99, track: t('z'), prevOrder: prev),
+          isFalse);
+      expect(q.items.map((e) => e.id).toList(), ['c']);
+    });
+
     test('adoptJamQueue keeps sounding seat, caps 60, silent', () {
       final q = QueueEngine();
       q.setQueue([t('a'), t('b'), t('c')], 1);
@@ -165,6 +218,34 @@ void main() {
       q.setQueue([t('a')]);
       expect(q.hasNext(exhaustHookArmed: false), false);
       expect(q.hasNext(exhaustHookArmed: true), true);
+    });
+
+    test('single next = single advance under late index event', () {
+      // Controller contract (double-skip fix): next() adopts the
+      // engine index BEFORE seeking the gapless window, so the late
+      // currentIndexStream event (_onIndex tag-adopt) finds
+      // idx == currentIndex and returns instead of advancing again.
+      final q = QueueEngine();
+      q.setQueue([t('a'), t('b'), t('c')], 0);
+      final predicted = q.upcomingIds(1).first.id;
+      final r = q.next();
+      expect(r.step, NextStep.play);
+      expect(q.current?.id, predicted);
+      // Late index event adopts the same id by tag: no second advance.
+      final idx = q.items.indexWhere((e) => e.id == predicted);
+      q.playAt(idx);
+      expect(q.current?.id, 'b');
+    });
+
+    test('single previous = single step back under late index event', () {
+      final q = QueueEngine();
+      q.setQueue([t('a'), t('b'), t('c')], 2);
+      final predicted = q.previousIds(1).first.id;
+      expect(q.previous(), 1);
+      expect(q.current?.id, predicted);
+      final idx = q.items.indexWhere((e) => e.id == predicted);
+      q.playAt(idx);
+      expect(q.current?.id, 'b');
     });
   });
 

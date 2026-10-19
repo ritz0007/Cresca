@@ -44,7 +44,6 @@ import 'package:video_player/video_player.dart';
 
 import '../design.dart';
 import '../state.dart';
-import '../../core/motion.dart' show motionMs;
 import '../../core/track.dart';
 
 /// True when a rendition height is a progressive-muxed (video+audio)
@@ -547,6 +546,16 @@ class _VideoEmbedState extends State<VideoEmbed> {
     final off = !widget.state.motionOn;
     if (off) {
       _videoFade = 1.0;
+      // Single live decoder even without the fade: drop the held frame
+      // now instead of parking a second decoder behind a static picture.
+      final prev = _prevVp;
+      _prevVp = null;
+      if (prev != null) {
+        try {
+          prev.removeListener(_onVideoTick);
+        } catch (_) {}
+        unawaited(prev.dispose());
+      }
       return;
     }
     _videoFade = 0.0;
@@ -1183,8 +1192,9 @@ class _VideoEmbedState extends State<VideoEmbed> {
     _armHide();
   }
 
-  /// Sheet-seek helper: scrub the picture (the sheet seeks the engine
-  /// itself, so both clocks agree).
+  /// Sheet-seek helper: scrub BOTH clocks to [ms] (the sheet's own
+  /// engine seek is idempotent, so every path lands both together
+  /// instead of splitting picture from soundtrack).
   Future<void> _seekVideo(int ms) async {
     final vp = _vp;
     if (vp == null || !_ready) return;
@@ -1192,6 +1202,11 @@ class _VideoEmbedState extends State<VideoEmbed> {
       _syncing = true;
       await vp.seekTo(Duration(milliseconds: ms));
       _lastVideoMs = ms;
+      try {
+        await widget.state.controller.player
+            .seek(Duration(milliseconds: ms));
+        _lastAudioMs = ms;
+      } catch (_) {}
     } catch (_) {}
     _syncing = false;
     if (mounted) setState(() {});
@@ -1243,6 +1258,14 @@ class _VideoEmbedState extends State<VideoEmbed> {
   /// Holds the last frame when there is one; single-flight guarded
   /// inside [_openUrl].
   void _retry() {
+    _freshRetry();
+  }
+
+  /// Manual fresh cycle (Retry / Next-quality exhausted): the automatic
+  /// chain only re-serves memo rows — so evict everything tried and
+  /// re-resolve from network. Without this both buttons dead-end
+  /// after one full exhaustion. Never throws.
+  void _freshRetry() {
     if (!mounted || _opening) return;
     int posMs = _resumeMs;
     try {
@@ -1250,20 +1273,24 @@ class _VideoEmbedState extends State<VideoEmbed> {
           .inMilliseconds;
     } catch (_) {}
     try {
-      widget.state.resolver.dropVideoUrl(_playUrl, _url);
+      for (final u in List.of(_triedUrls)) {
+        widget.state.resolver.dropVideoUrl(_playUrl, u);
+      }
     } catch (_) {}
     try {
-      _triedUrls.remove(_url);
+      _triedUrls.clear();
     } catch (_) {}
     _freshRetried = false;
     final holding = _ready && _vp != null;
-    setState(() {
-      _failed = false;
-      if (!holding) _ready = false;
-      if (holding) _swapping = true;
-    });
+    try {
+      setState(() {
+        _failed = false;
+        if (!holding) _ready = false;
+        if (holding) _swapping = true;
+      });
+    } catch (_) {}
     _syncHandle();
-    unawaited(_openUrl((_url, _height), initialMs: posMs));
+    unawaited(_reloadFresh(posMs));
   }
 
   /// Try the next untried rendition, else report failure. No
@@ -1274,7 +1301,9 @@ class _VideoEmbedState extends State<VideoEmbed> {
     try {
       final next = _nextUntried();
       if (next == null) {
-        _fail();
+        // Everything tried: start a genuinely fresh cycle from network
+        // instead of failing instantly (the button would dead-end).
+        _freshRetry();
         return;
       }
       if (mounted) {
@@ -1319,8 +1348,10 @@ class _VideoEmbedState extends State<VideoEmbed> {
           fit: BoxFit.cover,
           alignment: Alignment.topCenter,
           child: SizedBox(
-            width: 1280,
-            height: 1280 / ar,
+            // Layout at the slot width, not a fixed 1280: small phones
+            // decoded 1280-wide pixels for a ~380px slot.
+            width: _slotW > 0 ? _slotW : 1280,
+            height: (_slotW > 0 ? _slotW : 1280) / ar,
             child: VideoPlayer(c),
           ),
         ),
@@ -1375,14 +1406,19 @@ class _VideoEmbedState extends State<VideoEmbed> {
                   color: Colors.black.withValues(alpha: 0.45),
                 ),
                 child: Center(
-                  child: _DelayedSpinner(
-                      motionOn: widget.state.motionOn),
+                  // Base-API spinner (DelayedSpinner lives in an
+                  // unlanded design.dart edit; swap back on rebase).
+                  child: const SizedBox(
+                      width: 24,
+                      height: 24,
+                      child: CircularProgressIndicator(
+                          strokeWidth: 2.5,
+                          color: Colors.white))),
                 ),
               ),
-            ),
-          ],
-        );
-      }
+            ],
+          );
+        }
       return top;
     }
     if (_failed) {
@@ -1433,9 +1469,12 @@ class _VideoEmbedState extends State<VideoEmbed> {
         ),
       );
     }
-    return Center(
-      child: _DelayedSpinner(
-          motionOn: widget.state.motionOn),
+    return const Center(
+      child: SizedBox(
+          width: 24,
+          height: 24,
+          child: CircularProgressIndicator(
+              strokeWidth: 2.5, color: Colors.white)),
     );
   }
 
@@ -1462,18 +1501,25 @@ class _VideoEmbedState extends State<VideoEmbed> {
                         fontWeight: FontWeight.w700)),
               ),
               for (final o in opts.take(6))
-                ListTile(
-                  leading: const Icon(
-                      Icons.high_quality_outlined),
-                  title: Text('${o.$2}p'),
-                  subtitle: Text(videoHeightMuxed(o.$2)
-                      ? 'Muxed video+audio'
-                      : 'Video + synced audio'),
-                  trailing: o.$1 == _url
-                      ? const Icon(Icons.check)
-                      : null,
-                  onTap: () =>
-                      Navigator.pop(context, o),
+                Semantics(
+                  button: true,
+                  label: o.$1 == _url
+                      ? 'Video quality ${o.$2}p, selected'
+                      : 'Video quality ${o.$2}p',
+                  excludeSemantics: true,
+                  child: ListTile(
+                    leading: const Icon(
+                        Icons.high_quality_outlined),
+                    title: Text('${o.$2}p'),
+                    subtitle: Text(videoHeightMuxed(o.$2)
+                        ? 'Muxed video+audio'
+                        : 'Video + synced audio'),
+                    trailing: o.$1 == _url
+                        ? const Icon(Icons.check)
+                        : null,
+                    onTap: () =>
+                        Navigator.pop(context, o),
+                  ),
                 ),
             ],
           ),
@@ -1510,8 +1556,9 @@ class _VideoEmbedState extends State<VideoEmbed> {
       // Audio-only toggle path: hand this position back to the main
       // audio player — playback never stops. With the dual-player model
       // both clocks agree; the video clock wins when the user scrubbed
-      // video last, otherwise no seek.
-      _resumeHandoff();
+      // video last, otherwise no seek. dispose can't await, so the
+      // handoff runs first and owns the engine seek (unawaited).
+      unawaited(_resumeHandoff());
     } catch (_) {}
     try {
       _vp?.removeListener(_onVideoTick);
@@ -1739,10 +1786,16 @@ class _VideoEmbedState extends State<VideoEmbed> {
                       key: const ValueKey('pending'),
                       child: _failed
                           ? _slotChild()
-                          : Center(
-                              child: _DelayedSpinner(
-                                  motionOn:
-                                      widget.state.motionOn)),
+                          : const Center(
+                              child: SizedBox(
+                                  width: 24,
+                                  height: 24,
+                                  child:
+                                      CircularProgressIndicator(
+                                          strokeWidth:
+                                              2.5,
+                                          color:
+                                              Colors.white))),
                     ),
             ),
             IgnorePointer(
@@ -1762,15 +1815,22 @@ class _VideoEmbedState extends State<VideoEmbed> {
                       Positioned(
                         top: 12,
                         left: 12,
-                        child: IconButton(
-                          icon: const Icon(Icons.close,
-                              color: Colors.white),
-                          tooltip: 'Exit fullscreen',
-                          onPressed: () {
-                            try {
-                              widget.onCollapse?.call();
-                            } catch (_) {}
-                          },
+                        // One-tap labelled Close: pops this route only,
+                        // never the player beneath.
+                        child: Semantics(
+                          button: true,
+                          label: 'Close video',
+                          excludeSemantics: true,
+                          child: IconButton(
+                            icon: const Icon(Icons.close,
+                                color: Colors.white),
+                            tooltip: 'Close video',
+                            onPressed: () {
+                              try {
+                                widget.onCollapse?.call();
+                              } catch (_) {}
+                            },
+                          ),
                         ),
                       ),
                       Positioned(
@@ -1827,58 +1887,6 @@ class _VideoEmbedState extends State<VideoEmbed> {
             ),
           ],
         ),
-      ),
-    );
-  }
-}
-
-/// Pre-sized spinner (24dp, white) that fades in only after 300 ms —
-/// no flicker on fast resolves. Motion-off shows instantly.
-class _DelayedSpinner extends StatefulWidget {
-  final bool motionOn;
-  const _DelayedSpinner({this.motionOn = true});
-
-  @override
-  State<_DelayedSpinner> createState() => _DelayedSpinnerState();
-}
-
-class _DelayedSpinnerState extends State<_DelayedSpinner> {
-  bool _show = false;
-
-  @override
-  void initState() {
-    super.initState();
-    if (!widget.motionOn) {
-      _show = true;
-      return;
-    }
-    Future<void>.delayed(const Duration(milliseconds: 300), () {
-      if (mounted) setState(() => _show = true);
-    });
-  }
-
-  @override
-  void didUpdateWidget(covariant _DelayedSpinner old) {
-    super.didUpdateWidget(old);
-    if (widget.motionOn != old.motionOn && !widget.motionOn) {
-      setState(() => _show = true);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(
-      width: 24,
-      height: 24,
-      child: AnimatedOpacity(
-        opacity: _show ? 1.0 : 0.0,
-        duration:
-            Duration(milliseconds: motionMs(widget.motionOn, 180)),
-        curve: Curves.easeOut,
-        child: _show
-            ? const CircularProgressIndicator(
-                color: Colors.white, strokeWidth: 2)
-            : null,
       ),
     );
   }
