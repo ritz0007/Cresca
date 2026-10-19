@@ -36,6 +36,7 @@ import 'screens/search_screen.dart';
 import 'screens/trending_screen.dart';
 import 'state.dart';
 import 'design.dart';
+import 'widgets/downloads_sheet.dart';
 import 'widgets/mini_player.dart';
 
 /// Inherited access to the app state (rows, sheets, screens).
@@ -154,6 +155,9 @@ class _CrescaAppState extends State<CrescaApp> {
   // Search double-tap hint without touching the T1 focus path.
   final GlobalKey<ScaffoldMessengerState> _messengerKey =
       GlobalKey<ScaffoldMessengerState>();
+  // U7: navigator key lets the update-notification tap (no
+  // BuildContext) open the downloads surface.
+  final GlobalKey<NavigatorState> _navKey = GlobalKey<NavigatorState>();
   bool _searchHintShown = false;
 
   @override
@@ -162,6 +166,11 @@ class _CrescaAppState extends State<CrescaApp> {
     // Rebuild chrome (theme mode) when app state changes appearance.
     try {
       widget.state.addListener(_onState);
+    } catch (_) {}
+    // U7: notification tap → downloads sheet (single progress surface).
+    try {
+      widget.state.updates.onLaunchDownloads =
+          _openDownloadsFromNotification;
     } catch (_) {}
     // A1: the splash timeline (hold → fade-out → onDone) now lives in
     // _SplashOverlay. No timer here.
@@ -179,6 +188,13 @@ class _CrescaAppState extends State<CrescaApp> {
       } catch (_) {}
       try {
         widget.state.addListener(_onState);
+      } catch (_) {}
+      try {
+        old.state.updates.onLaunchDownloads = null;
+      } catch (_) {}
+      try {
+        widget.state.updates.onLaunchDownloads =
+            _openDownloadsFromNotification;
       } catch (_) {}
     }
   }
@@ -223,6 +239,14 @@ class _CrescaAppState extends State<CrescaApp> {
       } catch (_) {}
     }
     setState(() => _tab = i);
+  }
+
+  void _openDownloadsFromNotification() {
+    try {
+      final ctx = _navKey.currentContext;
+      if (ctx == null || !mounted) return;
+      openDownloadsSheet(ctx);
+    } catch (_) {}
   }
 
   void _showSearchHint() {
@@ -277,6 +301,7 @@ class _CrescaAppState extends State<CrescaApp> {
         title: 'Cresca Music',
         debugShowCheckedModeBanner: false,
         scaffoldMessengerKey: _messengerKey,
+        navigatorKey: _navKey,
         themeMode: switch (state.appearance) {
           'light' => ThemeMode.light,
           'dark' => ThemeMode.dark,

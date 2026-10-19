@@ -13,6 +13,7 @@ import '../state.dart';
 import '../updates.dart'
     show UpdateBannerMotion, UpdateProgressShimmer;
 import '../widgets/cresca_logo.dart';
+import '../widgets/downloads_sheet.dart';
 import '../widgets/profile_sheet.dart';
 import '../widgets/session_sheet.dart';
 import '../widgets/track_row.dart';
@@ -632,29 +633,46 @@ class _UpdateBanner extends StatelessWidget {
                 const Icon(Icons.system_update_outlined,
                     color: spotifyGreen),
                 const SizedBox(width: 10),
+                // U7: the banner is a launcher, not a second progress
+                // source — tapping the status opens the downloads sheet,
+                // which owns the same state object this banner reads.
                 Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      AdaptiveText(
-                          data: 'Cresca Music ${u.tag} available',
-                          background: bannerBg,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                              fontWeight: FontWeight.w700)),
-                      AdaptiveText(
-                          data: active
-                              ? 'Downloading… ${prog.round()}%'
-                              : downloaded
-                                  ? 'Downloaded — ready to install.'
-                                  : 'Tap Update to download.',
-                          background: bannerBg,
-                          secondary: true,
-                          style: Theme.of(context)
-                              .textTheme
-                              .bodySmall),
-                    ],
+                  child: Semantics(
+                    button: true,
+                    label:
+                        'Update details — open downloads',
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () =>
+                          openDownloadsSheet(context),
+                      child: Column(
+                        crossAxisAlignment:
+                            CrossAxisAlignment.start,
+                        children: [
+                          AdaptiveText(
+                              data:
+                                  'Cresca Music ${u.tag} available',
+                              background: bannerBg,
+                              maxLines: 2,
+                              overflow:
+                                  TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                  fontWeight:
+                                      FontWeight.w700)),
+                          AdaptiveText(
+                              data: active
+                                  ? 'Downloading… ${prog.round()}% — tap for details'
+                                  : downloaded
+                                      ? 'Downloaded — ready to install. Tap for details.'
+                                      : 'Tap Update to download. Tap for details.',
+                              background: bannerBg,
+                              secondary: true,
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .bodySmall),
+                        ],
+                      ),
+                    ),
                   ),
                 ),
                 TextButton(

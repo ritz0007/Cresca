@@ -40,7 +40,7 @@ Future<void> showTrackMenu(BuildContext context, AppState state,
           _actAddToPlaylist(
               sheet, context, state, track, motionOn, 3),
           _actDownload(sheet, context, state, track, motionOn, 4),
-          _actLike(sheet, state, track, liked, motionOn, 5),
+          _actLike(sheet, context, state, track, liked, motionOn, 5),
           CupertinoActionSheetAction(
             onPressed: () {
               Navigator.pop(sheet);
@@ -213,15 +213,48 @@ CupertinoActionSheetAction _actDownload(
 
 CupertinoActionSheetAction _actLike(
     BuildContext sheet,
+    BuildContext context,
     AppState state,
     YtTrack track,
     bool liked,
     bool motionOn,
     int index) {
   return CupertinoActionSheetAction(
-    onPressed: () {
+    onPressed: () async {
       Navigator.pop(sheet);
-      state.actToggleLike(track);
+      if (!liked) {
+        state.actToggleLike(track);
+        return;
+      }
+      // U7: unlike is destructive — snapshot the slot pre-mutation
+      // and offer 5 s Undo that restores it exactly (§6).
+      final at =
+          state.library.liked.indexWhere((e) => e.id == track.id);
+      await state.actToggleLike(track);
+      if (!context.mounted) return;
+      try {
+        final messenger = ScaffoldMessenger.of(context);
+        messenger.hideCurrentSnackBar();
+        messenger.showSnackBar(
+          SnackBar(
+            content: Text('Removed "${track.title}"'),
+            duration: const Duration(seconds: 5),
+            action: SnackBarAction(
+              label: 'Undo',
+              onPressed: () async {
+                try {
+                  await state.library.restoreLike(track,
+                      index: at < 0 ? 0 : at);
+                  try {
+                    await state.controller.handler
+                        .broadcastState();
+                  } catch (_) {}
+                } catch (_) {}
+              },
+            ),
+          ),
+        );
+      } catch (_) {}
     },
     child: _m(Text(liked ? 'Unlike' : 'Like'), index, motionOn),
   );

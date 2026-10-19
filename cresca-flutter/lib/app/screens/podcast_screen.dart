@@ -501,27 +501,41 @@ class _PodcastScreenState extends State<PodcastScreen> {
         children: [
           SizedBox(
             height: _target,
-            child: PressScale(
-              motionOn: on,
-              onTap: _cycleSpeed,
-              child: Container(
-                padding: const EdgeInsets.symmetric(
-                    horizontal: 14),
-                decoration: BoxDecoration(
-                  color: scheme.surfaceContainerHighest
-                      .withValues(alpha: 0.6),
-                  borderRadius:
-                      BorderRadius.circular(24),
-                ),
-                alignment: Alignment.center,
-                child: AnimatedDefaultTextStyle(
-                  duration:
-                      Duration(milliseconds: switchMs),
-                  style: TextStyle(
-                      color: scheme.onSurface,
-                      fontWeight: FontWeight.w700),
-                  child: Text(
-                      '${_speed.toStringAsFixed(1)}× speed'),
+            child: Semantics(
+              button: true,
+              label: podcastSpeedLabel(_speed),
+              excludeSemantics: true,
+              child: PressScale(
+                motionOn: on,
+                onTap: _cycleSpeed,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 14),
+                  decoration: BoxDecoration(
+                    color: scheme.surfaceContainerHighest
+                        .withValues(alpha: 0.6),
+                    borderRadius:
+                        BorderRadius.circular(24),
+                  ),
+                  alignment: Alignment.center,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.speed,
+                          size: 18,
+                          color: scheme.onSurface),
+                      const SizedBox(width: 6),
+                      AnimatedDefaultTextStyle(
+                        duration:
+                            Duration(milliseconds: switchMs),
+                        style: TextStyle(
+                            color: scheme.onSurface,
+                            fontWeight: FontWeight.w700),
+                        child: Text(
+                            '${_speed.toStringAsFixed(1)}× speed'),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -529,38 +543,48 @@ class _PodcastScreenState extends State<PodcastScreen> {
           const SizedBox(width: 8),
           SizedBox(
             height: _target,
-            child: PressScale(
-              motionOn: on,
-              onTap: _sleepMenu,
-              child: Container(
-                padding: const EdgeInsets.symmetric(
-                    horizontal: 14),
-                decoration: BoxDecoration(
-                  color: sleeping
-                      ? scheme.primary
-                          .withValues(alpha: 0.2)
-                      : scheme.surfaceContainerHighest
-                          .withValues(alpha: 0.6),
-                  borderRadius:
-                      BorderRadius.circular(24),
-                ),
-                alignment: Alignment.center,
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.bedtime_outlined,
-                        size: 18,
-                        color: scheme.onSurface),
-                    const SizedBox(width: 6),
-                    Text(
-                      sleeping
-                          ? 'Sleep ${fmtEpisodeMs(_sleepLeftMs)}'
-                          : 'Sleep timer',
-                      style: TextStyle(
-                          color: scheme.onSurface,
-                          fontWeight: FontWeight.w600),
-                    ),
-                  ],
+            // U7: labeled sleep state ("Sleep: 20 min" / "Sleep: off")
+            // instead of a bare glyph + timer text.
+            child: Semantics(
+              button: true,
+              label: sleeping
+                  ? 'Sleep timer, ${podcastSleepLabel(_sleepLeftMs)}'
+                  : 'Sleep timer, off',
+              excludeSemantics: true,
+              child: PressScale(
+                motionOn: on,
+                onTap: _sleepMenu,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 14),
+                  decoration: BoxDecoration(
+                    color: sleeping
+                        ? scheme.primary
+                            .withValues(alpha: 0.2)
+                        : scheme.surfaceContainerHighest
+                            .withValues(alpha: 0.6),
+                    borderRadius:
+                        BorderRadius.circular(24),
+                  ),
+                  alignment: Alignment.center,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.bedtime_outlined,
+                          size: 18,
+                          color: scheme.onSurface),
+                      const SizedBox(width: 6),
+                      Text(
+                        sleeping
+                            ? podcastSleepLabel(
+                                _sleepLeftMs)
+                            : 'Sleep: off',
+                        style: TextStyle(
+                            color: scheme.onSurface,
+                            fontWeight: FontWeight.w600),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -939,14 +963,25 @@ class _PodcastScreenState extends State<PodcastScreen> {
 
   Widget _downloadButton(PodcastEpisode ep,
       PodcastDownloadState dl, ColorScheme scheme) {
-    Widget icon;
+    // U7: icon + state text ("Offline"/"Saved"/"42%") instead of a
+    // bare glyph — readable without icon literacy, labelled for
+    // screen readers.
+    final String text;
+    if (dl.downloaded) {
+      text = 'Saved';
+    } else if (dl.downloading && dl.progress >= 0) {
+      text = '${dl.progress}%';
+    } else {
+      text = 'Offline';
+    }
+    final Widget icon;
     if (dl.downloaded) {
       icon = Icon(Icons.download_done,
-          color: scheme.primary);
+          size: 18, color: scheme.primary);
     } else if (dl.downloading) {
       icon = SizedBox(
-        width: 20,
-        height: 20,
+        width: 18,
+        height: 18,
         child: CircularProgressIndicator(
           strokeWidth: 2,
           value: dl.progress >= 0
@@ -957,20 +992,46 @@ class _PodcastScreenState extends State<PodcastScreen> {
       );
     } else {
       icon = Icon(Icons.download_outlined,
-          color: scheme.onSurfaceVariant);
+          size: 18, color: scheme.onSurfaceVariant);
     }
-    return SizedBox(
-      width: _target,
-      height: _target,
-      child: IconButton(
-        tooltip: dl.downloaded
-            ? 'Downloaded for offline'
-            : 'Download for offline',
-        iconSize: 22,
-        onPressed: dl.downloading
-            ? null
-            : () => widget.onDownload?.call(ep),
-        icon: icon,
+    return Semantics(
+      button: true,
+      label: dl.downloaded
+          ? 'Saved for offline'
+          : 'Download for offline',
+      excludeSemantics: true,
+      child: SizedBox(
+        height: _target,
+        child: PressScale(
+          motionOn: widget.motionOn,
+          onTap: dl.downloading
+              ? null
+              : () => widget.onDownload?.call(ep),
+          child: Container(
+            padding: const EdgeInsets.symmetric(
+                horizontal: 14),
+            decoration: BoxDecoration(
+              color: scheme.surfaceContainerHighest
+                  .withValues(alpha: 0.6),
+              borderRadius:
+                  BorderRadius.circular(24),
+            ),
+            alignment: Alignment.center,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                icon,
+                const SizedBox(width: 6),
+                Text(
+                  text,
+                  style: TextStyle(
+                      color: scheme.onSurface,
+                      fontWeight: FontWeight.w600),
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }

@@ -28,49 +28,63 @@ class LibraryScreen extends StatelessWidget {
       animation: state,
       builder: (_, _) {
         final loggedIn = state.ytSession.isLoggedIn;
+        // U7/F per-section counts (engine-backed, re-synced every
+        // frame — no stale counts after kill/relaunch).
+        final dlCount = state.downloads.listAll().length;
+        final dlSize = _fmtSize(state.downloads.totalBytes());
+        // U7: U3 sliver pattern — no nested scrollables; the folder
+        // grid is a real SliverGrid, the artists rail keeps its
+        // bounded height inside a box adapter. Clearance rides a
+        // trailing SliverPadding.
         return Scaffold(
           appBar: AppBar(title: const Text('Library')),
-          body: Column(
-            children: [
-              Expanded(
-                child: ListView(
-                  padding: EdgeInsets.only(
-                      // Bottom chrome (mini player + pill) is app-shell;
-                      // lists scroll under the glass. Live measured
-                      // clearance (210 fallback pre-measure).
-                      bottom:
-                          BottomChromeScope.clearanceOf(context)),
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.all(16),
-                      child: StaggerEntrance(
-                        child: Text(
-                          '${state.library.liked.length} liked • '
-                          '${state.library.recent.length} recent • '
-                          '${state.library.playlists.length} playlists',
-                          style: Theme.of(context)
-                              .textTheme
-                              .titleMedium,
-                        ),
-                      ),
+          body: CustomScrollView(
+            slivers: [
+              SliverPadding(
+                padding: const EdgeInsets.all(16),
+                sliver: SliverToBoxAdapter(
+                  child: StaggerEntrance(
+                    child: Text(
+                      '${state.library.liked.length} liked • '
+                      '${state.library.recent.length} recent • '
+                      '${state.library.playlists.length} playlists • '
+                      '$dlCount downloads • $dlSize offline',
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context)
+                          .textTheme
+                          .titleMedium,
                     ),
-                    _QuickTiles(state: state, loggedIn: loggedIn),
-                    const _SectionTitle('Folders'),
-                    StaggerEntrance(
-                      key: ValueKey(
-                          'lib-folders-${state.library.playlists.length}'),
-                      index: 1,
-                      child: _FolderGrid(state: state),
-                    ),
-                    if (state.library.artists.isNotEmpty)
-                      StaggerEntrance(
-                        key: ValueKey(
-                            'lib-artists-${state.library.artists.length}'),
-                        index: 2,
-                        child: _FavArtists(state: state),
-                      ),
-                  ],
+                  ),
                 ),
+              ),
+              SliverToBoxAdapter(
+                child: _QuickTiles(
+                    state: state, loggedIn: loggedIn),
+              ),
+              const SliverToBoxAdapter(
+                  child: _SectionTitle('Folders')),
+              SliverPadding(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 16),
+                sliver: _FolderGrid(state: state),
+              ),
+              if (state.library.artists.isNotEmpty)
+                SliverToBoxAdapter(
+                  child: StaggerEntrance(
+                    key: ValueKey(
+                        'lib-artists-${state.library.artists.length}'),
+                    index: 2,
+                    child: _FavArtists(state: state),
+                  ),
+                ),
+              SliverPadding(
+                // Bottom chrome (mini player + pill) is app-shell;
+                // lists scroll under the glass. Live measured
+                // clearance (210 fallback pre-measure).
+                padding: EdgeInsets.only(
+                    bottom: BottomChromeScope.clearanceOf(
+                        context)),
               ),
             ],
           ),
@@ -212,10 +226,8 @@ class _FolderGrid extends StatelessWidget {
           onOpen: () => openPlaylistScreen(context, p.id),
         ),
     ];
-    return GridView.builder(
-      shrinkWrap: true,
-      physics: const NeverScrollableScrollPhysics(),
-      padding: const EdgeInsets.symmetric(horizontal: 16),
+    // U7: real sliver — no shrinkWrap, no nested scroll physics.
+    return SliverGrid.builder(
       gridDelegate:
           const SliverGridDelegateWithFixedCrossAxisCount(
         crossAxisCount: 2,
@@ -351,8 +363,24 @@ class MosaicArt extends StatelessWidget {
         .where((t) => t.thumbUrl.isNotEmpty)
         .take(4)
         .toList();
+    // U7/F: missing art gets the gradient fallback immediately —
+    // never a white flash, never a network fetch during scroll.
+    final scheme = Theme.of(context).colorScheme;
     if (thumbs.isEmpty) {
-      return const Center(child: Icon(Icons.music_note, size: 40));
+      return Container(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              scheme.primaryContainer,
+              scheme.surfaceContainerHighest,
+            ],
+          ),
+        ),
+        child: const Center(
+            child: Icon(Icons.music_note, size: 40)),
+      );
     }
     if (thumbs.length == 1) {
       return _MosaicTile(track: thumbs[0]);
@@ -375,9 +403,22 @@ class _MosaicTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     // Tight mosaic decode: tiles are ~1/4 of the folder card, so a
-    // ~100px mem cache is plenty — never the full upload.
+    // ~100px mem cache is plenty — never the full upload. Missing art
+    // gets the gradient fallback (U7/F), never white.
     if (track.thumbUrl.isEmpty) {
-      return Container(color: Theme.of(context).colorScheme.primaryContainer);
+      final scheme = Theme.of(context).colorScheme;
+      return Container(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              scheme.primaryContainer,
+              scheme.surfaceContainerHighest,
+            ],
+          ),
+        ),
+      );
     }
     return CachedNetworkImage(
       imageUrl: track.thumbUrl,
@@ -537,6 +578,17 @@ bool _isIOS(BuildContext context) {
     return Theme.of(context).platform == TargetPlatform.iOS;
   } catch (_) {
     return false;
+  }
+}
+
+/// Storage size for the hero counts (U7/F): KB below 1 MB, else MB
+/// with one decimal. Never throws — blank on failure.
+String _fmtSize(int bytes) {
+  try {
+    if (bytes < 1024 * 1024) return '${bytes ~/ 1024} KB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  } catch (_) {
+    return '';
   }
 }
 

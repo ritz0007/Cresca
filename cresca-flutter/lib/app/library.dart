@@ -856,6 +856,24 @@ class LibraryStore {
     } catch (_) {}
   }
 
+  /// Reinserts [t] at [index] for the unlike-Undo path (U7: plain
+  /// toggleLike would re-add at 0, losing the slot — §6 snapshot
+  /// rule). No-op when already liked. Returns true when restored.
+  Future<bool> restoreLike(YtTrack t, {int index = 0}) async {
+    try {
+      if (t.id.isEmpty || isLiked(t.id)) return false;
+      liked.insert(index.clamp(0, liked.length), t);
+      if (liked.length > likedCap) {
+        liked = liked.sublist(0, likedCap);
+      }
+      await atomicWrite(_likedFile,
+          jsonEncode([for (final e in liked.take(likedCap)) trackRow(e)]));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// Unique recents rail (deduped, [recentCap] cap, `recent.json` stays
   /// the fast list + fallback) AND the full play log: every call also
   /// appends one row to [playHistory] (no dedupe there), so no caller

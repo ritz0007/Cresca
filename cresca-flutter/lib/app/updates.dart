@@ -135,6 +135,11 @@ class UpdateChecker {
   final FlutterLocalNotificationsPlugin _notes;
   bool _notesReady = false;
 
+  /// Fired when the update notification is tapped (payload
+  /// 'downloads'). The app shell wires this to open the downloads
+  /// surface — the notification carries no other navigation.
+  void Function()? onLaunchDownloads;
+
   /// Last-seen tag per session (banner dedupe); persisted notified tags
   /// live in SharedPreferences via the callbacks.
   UpdateChecker({http.Client? httpClient})
@@ -147,7 +152,16 @@ class UpdateChecker {
       const settings = InitializationSettings(
         android: AndroidInitializationSettings('@mipmap/ic_launcher'),
       );
-      await _notes.initialize(settings);
+      // Tap deep-links to the downloads surface (U7: single progress
+      // surface). One channel only — created below, never duplicated.
+      await _notes.initialize(
+        settings,
+        onDidReceiveNotificationResponse: (r) {
+          try {
+            if (r.payload == 'downloads') onLaunchDownloads?.call();
+          } catch (_) {}
+        },
+      );
       const channel = AndroidNotificationChannel(
         updateChannelId,
         'Cresca updates',
@@ -242,6 +256,9 @@ class UpdateChecker {
             importance: Importance.high,
           ),
         ),
+        // Payload routes the tap to the downloads surface (U7); the
+        // channel above is reused, never recreated per tag.
+        payload: 'downloads',
       );
       await markNotified(u.tag);
     } catch (_) {}

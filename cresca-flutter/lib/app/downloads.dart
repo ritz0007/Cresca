@@ -388,6 +388,24 @@ class DownloadStore {
     }
   }
 
+  /// True when the row errored and needs an inline Retry (U7: failed
+  /// files show per-file Retry, never a global dead end). A row with a
+  /// complete file on disk is never failed, and filename-only rows
+  /// (no store row) report false — they are complete by construction.
+  bool isFailed(String trackId) {
+    try {
+      final row = rows[trackId];
+      if (row == null) return false;
+      if (fileFor(trackId) != null) return false;
+      final st = status[row.taskId];
+      return st == TaskStatus.failed ||
+          st == TaskStatus.notFound ||
+          st == TaskStatus.canceled;
+    } catch (_) {
+      return false;
+    }
+  }
+
   File? fileFor(String trackId) {
     try {
       final row = rows[trackId];

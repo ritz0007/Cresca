@@ -168,43 +168,40 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
   Future<void> _delete(
       BuildContext context, AppState state, UserPlaylist p) async {
     try {
-      // One dialog idiom per platform. Behavior identical.
-      final bool? yes;
-      if (_isIOS(context)) {
-        yes = await showCupertinoDialog<bool>(
-          context: context,
-          builder: (d) => CupertinoAlertDialog(
-            title: Text('Delete "${p.name}"?'),
-            actions: [
-              CupertinoDialogAction(
-                  onPressed: () => Navigator.pop(d, false),
-                  child: const Text('Cancel')),
-              CupertinoDialogAction(
-                  isDestructiveAction: true,
-                  onPressed: () => Navigator.pop(d, true),
-                  child: const Text('Delete')),
-            ],
-          ),
-        );
-      } else {
-        yes = await showDialog<bool>(
-          context: context,
-          builder: (d) => AlertDialog(
-            title: Text('Delete "${p.name}"?'),
-            actions: [
-              TextButton(
-                  onPressed: () => Navigator.pop(d, false),
-                  child: const Text('Cancel')),
-              TextButton(
-                  onPressed: () => Navigator.pop(d, true),
-                  child: const Text('Delete')),
-            ],
-          ),
-        );
-      }
-      if (yes != true) return;
+      // U7: no confirmation dialog — Undo is faster and less
+      // annoying. Snapshot before mutating (index pre-mutation —
+      // later concurrent edits can't shift the restore slot).
+      final at = state.library.playlists
+          .indexWhere((e) => e.id == p.id);
+      final snapshot = UserPlaylist(
+        id: p.id,
+        name: p.name,
+        tracks: List.of(p.tracks),
+        createdAt: p.createdAt,
+        coverPath: p.coverPath,
+        spotifyId: p.spotifyId,
+      );
+      final messenger = ScaffoldMessenger.of(context);
       await state.library.deletePlaylist(p.id);
       if (mounted) Navigator.pop(context);
+      try {
+        messenger.hideCurrentSnackBar();
+        messenger.showSnackBar(
+          SnackBar(
+            content: Text('Removed "${snapshot.name}"'),
+            duration: const Duration(seconds: 5),
+            action: SnackBarAction(
+              label: 'Undo',
+              onPressed: () async {
+                try {
+                  await state.library.restorePlaylist(snapshot,
+                      index: at < 0 ? 0 : at);
+                } catch (_) {}
+              },
+            ),
+          ),
+        );
+      } catch (_) {}
     } catch (_) {}
   }
 
@@ -273,15 +270,19 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
                                         opacity: anim,
                                         child: child),
                             child: SizedBox(
-                              key: ValueKey(
-                                  'pl-art-${p.tracks.length}-${p.tracks.isEmpty ? 'empty' : p.tracks.first.id}'),
                               width: 120,
                               height: 120,
                               child: ClipRRect(
                                 borderRadius:
                                     BorderRadius.circular(12),
-                                child:
-                                    MosaicArt(tracks: p.tracks),
+                                // U7: built once per playlist (memoized
+                                // below) — progress/playhead rebuilds
+                                // reuse the composited art.
+                                child: _MemoMosaic(
+                                  key: ValueKey(
+                                      'pl-mosaic-${p.id}|${p.coverPath}|${_thumbSig(p.tracks)}'),
+                                  tracks: p.tracks,
+                                ),
                               ),
                             ),
                           ),
@@ -369,15 +370,19 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
                           try {
                             SemanticsService.sendAnnouncement(
                                 View.of(context),
-                                'Removed ${removed.title}. Undo available.',
+                                'Removed "${removed.title}". Undo available.',
                                 TextDirection.ltr);
                           } catch (_) {}
                           if (!context.mounted) return;
-                          ScaffoldMessenger.of(context)
-                              .showSnackBar(
+                          final messenger =
+                              ScaffoldMessenger.of(context);
+                          messenger.hideCurrentSnackBar();
+                          messenger.showSnackBar(
                             SnackBar(
                               content: Text(
-                                  'Removed ${removed.title}'),
+                                  'Removed "${removed.title}"'),
+                              duration:
+                                  const Duration(seconds: 5),
                               action: SnackBarAction(
                                 label: 'Undo',
                                 onPressed: () async {
@@ -441,11 +446,22 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
                           i++)
                         StaggerEntrance(
                           index: i,
-                          child: TrackRow(
-                            track: _suggested[i],
-                            contextQueue: _suggested,
-                            index: i,
-                            origin: 'Playlist',
+                          child: Row(
+                            children: [
+                              Expanded(
+                                child: TrackRow(
+                                  track: _suggested[i],
+                                  contextQueue: _suggested,
+                                  index: i,
+                                  origin: 'Playlist',
+                                ),
+                              ),
+                              _AddButton(
+                                state: state,
+                                playlist: p,
+                                track: _suggested[i],
+                              ),
+                            ],
                           ),
                         ),
                     ],
@@ -457,5 +473,113 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
         );
       },
     );
+  }
+}
+
+/// Visible-thumb signature for the mosaic key (U7): the mosaic
+/// renders at most the first 4 thumbs, so id list + length is the
+/// exact invalidation signal. Never throws.
+String _thumbSig(List<YtTrack> tracks) {
+  try {
+    return '${tracks.length}:${tracks.take(4).map((t) => t.id).join(',')}';
+  } catch (_) {
+    return '';
+  }
+}
+
+/// Mosaic header built once per playlist (U7): the composited art
+/// widget is cached in State, so parent rebuilds (progress ticks,
+/// playhead) reuse it instead of re-resolving the grid per frame.
+/// A new key (playlist / cover / thumb change) mounts a fresh state
+/// and swaps exactly once.
+class _MemoMosaic extends StatefulWidget {
+  final List<YtTrack> tracks;
+  const _MemoMosaic({super.key, required this.tracks});
+
+  @override
+  State<_MemoMosaic> createState() => _MemoMosaicState();
+}
+
+class _MemoMosaicState extends State<_MemoMosaic> {
+  late Widget _child;
+
+  @override
+  void initState() {
+    super.initState();
+    _child = MosaicArt(tracks: widget.tracks);
+  }
+
+  @override
+  Widget build(BuildContext context) => _child;
+}
+
+/// Per-row Add for Suggested (U7/F): adds without navigating away —
+/// the user stays in context. Undo removes it again. Guards the
+/// idempotent add: an already-present track toasts instead of
+/// offering an Undo that would delete a pre-existing entry.
+class _AddButton extends StatelessWidget {
+  final AppState state;
+  final UserPlaylist playlist;
+  final YtTrack track;
+  const _AddButton({
+    required this.state,
+    required this.playlist,
+    required this.track,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 48,
+      height: 48,
+      child: IconButton(
+        tooltip: 'Add to ${playlist.name}',
+        iconSize: 22,
+        onPressed: () => _add(context),
+        icon: const Icon(Icons.add),
+      ),
+    );
+  }
+
+  Future<void> _add(BuildContext context) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      if (playlist.tracks.any((e) => e.id == track.id)) {
+        try {
+          messenger.showSnackBar(SnackBar(
+              content:
+                  Text('Already in ${playlist.name}')));
+        } catch (_) {}
+        return;
+      }
+      final ok = await state.library
+          .addToPlaylist(playlist.id, track);
+      if (!ok) {
+        try {
+          messenger.showSnackBar(const SnackBar(
+              content: Text(
+                  'Could not add — playlist is full')));
+        } catch (_) {}
+        return;
+      }
+      try {
+        messenger.hideCurrentSnackBar();
+        messenger.showSnackBar(
+          SnackBar(
+            content: Text('Added to ${playlist.name}'),
+            duration: const Duration(seconds: 5),
+            action: SnackBarAction(
+              label: 'Undo',
+              onPressed: () async {
+                try {
+                  await state.library.removeFromPlaylist(
+                      playlist.id, track.id);
+                } catch (_) {}
+              },
+            ),
+          ),
+        );
+      } catch (_) {}
+    } catch (_) {}
   }
 }

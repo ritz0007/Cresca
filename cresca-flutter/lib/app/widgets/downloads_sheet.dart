@@ -11,6 +11,7 @@ import '../app.dart';
 import '../design.dart';
 import '../downloads.dart';
 import '../state.dart';
+import '../../core/track.dart';
 import 'track_row.dart';
 
 Future<void> openDownloadsSheet(BuildContext context) async {
@@ -63,6 +64,9 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
 
   /// Swipe-delete with Undo: stash the file bytes + row first (the
   /// store has no restore API), delete, then offer Undo for 5 s.
+  /// Copy follows the deck: 'Removed "<title>"' when the stash
+  /// restores the exact file, 'Deleted "<title>" — needs re-download'
+  /// when the bytes were already unreadable (Undo re-downloads).
   /// Both delete and restore are announced for screen readers.
   Future<void> _deleteWithUndo(
       BuildContext context, AppState state, int index) async {
@@ -85,22 +89,27 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
     try {
       await state.downloads.delete(track.id);
     } catch (_) {}
+    final restorable = _trash.containsKey(track.id);
+    final msg = restorable
+        ? 'Removed "${track.title}"'
+        : 'Deleted "${track.title}" — needs re-download';
     try {
       SemanticsService.sendAnnouncement(
-          View.of(context), 'Deleted ${track.title}', direction);
+          View.of(context), msg, direction);
     } catch (_) {}
     try {
       messenger.clearSnackBars();
       messenger
           .showSnackBar(
             SnackBar(
-              content: Text('Deleted ${track.title}'),
+              content: Text(msg),
               duration: const Duration(seconds: 5),
               action: SnackBarAction(
                 label: 'Undo',
-                onPressed: () =>
-                    _restore(context, state, track.id,
-                        track.title),
+                onPressed: () => restorable
+                    ? _restore(context, state, track.id,
+                        track.title)
+                    : _redownload(context, state, track),
               ),
             ),
           )
@@ -109,6 +118,64 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
         // Grace period over — drop the stash.
         _trash.remove(track.id);
       });
+    } catch (_) {}
+  }
+
+  /// Fresh stream URL for a sheet row (stored URLs expire — same
+  /// fallback the episode coordinator uses). Never throws.
+  Future<String?> _freshUrl(AppState state, YtTrack track) {
+    try {
+      return state.resolver.audioUrl(track.watchUrl.isEmpty
+          ? 'https://www.youtube.com/watch?v=${track.id}'
+          : track.watchUrl);
+    } catch (_) {
+      return Future.value(null);
+    }
+  }
+
+  /// Undo when the bytes were already gone: re-enqueue through the
+  /// store with a freshly resolved URL (stored URLs expire). Failure
+  /// surfaces an honest message, never a silent no-op.
+  Future<void> _redownload(BuildContext context, AppState state,
+      YtTrack track) async {
+    try {
+      final ok = await state.downloads.retry(
+        track,
+        () => _freshUrl(state, track),
+      );
+      if (!context.mounted) return;
+      try {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(ok
+                ? 'Re-downloading ${track.title}'
+                : 'Could not restore download')));
+      } catch (_) {}
+    } catch (_) {
+      try {
+        ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+                content: Text('Could not restore download')));
+      } catch (_) {}
+    }
+  }
+
+  /// Inline Retry for a failed row (U7: per-file Retry). Same
+  /// re-resolve path as the delete-Undo above.
+  Future<void> _retry(BuildContext context, AppState state,
+      YtTrack track) async {
+    try {
+      final ok = await state.downloads.retry(
+        track,
+        () => _freshUrl(state, track),
+      );
+      if (!ok && context.mounted) {
+        try {
+          ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                  content:
+                      Text('Download failed to start')));
+        } catch (_) {}
+      }
     } catch (_) {}
   }
 
@@ -167,6 +234,17 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
             .withValues(alpha: 0.94);
         final dark =
             Theme.of(context).brightness == Brightness.dark;
+        // U7 aggregate: in-flight files summarized on one line (the
+        // per-file rows below carry the exact %).
+        var activeN = 0;
+        var activeSum = 0;
+        for (final (t, _, _) in items) {
+          final pct = state.downloads.progressFor(t.id);
+          if (pct >= 0 && pct < 100) {
+            activeN++;
+            activeSum += pct;
+          }
+        }
         return CustomScrollView(
           controller: widget.scroll,
           slivers: [
@@ -194,6 +272,18 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
                   style:
                       TextStyle(color: glassText(dark))),
             ),
+            // U7: the sheet is the single progress surface. The app
+            // update APK (when pending) reads the same AppState fields
+            // the home banner reads — one state, two readers.
+            if (state.pendingUpdate != null)
+              SliverToBoxAdapter(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(
+                      16, 0, 16, 8),
+                  child: _UpdateProgressRow(
+                      state: state),
+                ),
+              ),
             SliverToBoxAdapter(
               child: Padding(
                 padding:
@@ -225,6 +315,25 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
                 ),
               ),
             ),
+            // Aggregate progress line (U7): only while files are in
+            // flight. Reads the same DownloadStore the rows read.
+            if (activeN > 0)
+              SliverToBoxAdapter(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(
+                      16, 0, 16, 4),
+                  child: Text(
+                    'Downloading $activeN file${activeN == 1 ? '' : 's'} — ${(activeSum / activeN).round()}%',
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodySmall
+                        ?.copyWith(
+                            color: Theme.of(context)
+                                .colorScheme
+                                .onSurfaceVariant),
+                  ),
+                ),
+              ),
             // Empty ⇄ list crossfade (180 ms, opacity only).
             SliverToBoxAdapter(
               child: AnimatedSwitcher(
@@ -284,6 +393,13 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
                 final (track, file, mb) = items[i];
                 final pct =
                     state.downloads.progressFor(track.id);
+                // U7: failed rows show an inline Retry (per file),
+                // never a global dead end. Filename-only rows (no
+                // store row) are complete by construction — isFailed
+                // reports false for those.
+                final failed =
+                    state.downloads.isFailed(track.id);
+                final active = pct >= 0 && pct < 100;
                 // First-frame stagger: rows fade + rise on sheet open
                 // (40 ms steps, capped at 8 — transform/opacity only).
                 return FadeSlide(
@@ -324,25 +440,49 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
                         '${pct >= 0 && pct < 100 ? ' • $pct%' : ''}',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis),
-                    trailing: pct >= 0 && pct < 100
+                    trailing: failed
                         ? SizedBox(
-                            width: 24,
-                            height: 24,
-                            // Smooth progress sweep (180 ms tween
-                            // retargeted toward each new value) +
-                            // opacity-only pulse while downloading.
-                            child: PulseOpacity(
-                              motionOn:
-                                  state.motionOn,
-                              child: _SmoothProgress(
-                                value: pct / 100,
-                                ms: state
-                                    .motionMs(180),
+                            width: 48,
+                            height: 48,
+                            child: Semantics(
+                              button: true,
+                              label:
+                                  'Retry download of ${track.title}',
+                              child: IconButton(
+                                tooltip:
+                                    'Retry download',
+                                iconSize: 22,
+                                onPressed: () =>
+                                    _retry(context,
+                                        state, track),
+                                icon: Icon(
+                                    Icons.refresh,
+                                    color: Theme.of(
+                                            context)
+                                        .colorScheme
+                                        .primary),
                               ),
                             ),
                           )
-                        : const Icon(
-                            Icons.offline_pin_outlined),
+                        : active
+                            ? SizedBox(
+                                width: 24,
+                                height: 24,
+                                // Smooth progress sweep (180 ms tween
+                                // retargeted toward each new value) +
+                                // opacity-only pulse while downloading.
+                                child: PulseOpacity(
+                                  motionOn:
+                                      state.motionOn,
+                                  child: _SmoothProgress(
+                                    value: pct / 100,
+                                    ms: state
+                                        .motionMs(180),
+                                  ),
+                                ),
+                              )
+                            : const Icon(
+                                Icons.offline_pin_outlined),
                     onTap: () {
                       try {
                         state.controller.playQueue([track], 0);
@@ -413,6 +553,103 @@ class _LocChip extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+/// App-update row inside the downloads sheet (U7): status + action
+/// for the pending APK, reading the same AppState fields as the home
+/// banner (single state, two readers). No progress plumbing here —
+/// the sheet never fetches, it only reads.
+class _UpdateProgressRow extends StatelessWidget {
+  final AppState state;
+  const _UpdateProgressRow({required this.state});
+
+  @override
+  Widget build(BuildContext context) {
+    final u = state.pendingUpdate;
+    if (u == null) return const SizedBox.shrink();
+    final prog = state.updateProgress;
+    final downloaded = state.updateDownloaded;
+    final active = prog >= 0;
+    final status = active
+        ? 'Downloading… ${prog.round()}%'
+        : downloaded
+            ? 'Downloaded — ready to install.'
+            : 'Tap Update to download.';
+    return Semantics(
+      label: 'App update ${u.tag}. $status',
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+        decoration: BoxDecoration(
+          color: spotifyGreen.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+              color: spotifyGreen.withValues(alpha: 0.35)),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.system_update_outlined,
+                    color: spotifyGreen, size: 20),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text('App update ${u.tag}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                          fontWeight: FontWeight.w700)),
+                ),
+                FilledButton(
+                  style: spotifyPlayStyle(),
+                  onPressed: active
+                      ? null
+                      : () => _run(context),
+                  child: Text(
+                      downloaded ? 'Install' : 'Update'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Text(status,
+                style: Theme.of(context)
+                    .textTheme
+                    .bodySmall),
+            if (active)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(4),
+                  child: LinearProgressIndicator(
+                    value: (prog / 100).clamp(0.0, 1.0),
+                    minHeight: 4,
+                    backgroundColor: spotifyGreen.withValues(
+                        alpha: 0.2),
+                    valueColor:
+                        const AlwaysStoppedAnimation<Color>(
+                            spotifyGreen),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _run(BuildContext context) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final msg = state.updateDownloaded
+          ? await state.installUpdate()
+          : await state.downloadUpdate();
+      if (msg.isEmpty) return;
+      try {
+        messenger.showSnackBar(SnackBar(content: Text(msg)));
+      } catch (_) {}
+    } catch (_) {}
   }
 }
 

@@ -42,6 +42,28 @@ double nextPodcastSpeed(double current) {
   }
 }
 
+/// Screen-reader label for the speed control (U7: icon-only is not
+/// enough — "Playback speed, 1.5x"). Never throws.
+String podcastSpeedLabel(double speed) {
+  try {
+    return 'Playback speed, ${clampPodcastSpeed(speed).toStringAsFixed(1)}x';
+  } catch (_) {
+    return 'Playback speed';
+  }
+}
+
+/// Visible + screen-reader sleep text (U7: "Sleep: 20 min" /
+/// "Sleep: off" — minutes ceiling so 19:01 still reads 20 min).
+/// Never throws.
+String podcastSleepLabel(int leftMs) {
+  try {
+    if (leftMs <= 0) return 'Sleep: off';
+    return 'Sleep: ${(leftMs + 59999) ~/ 60000} min';
+  } catch (_) {
+    return 'Sleep: off';
+  }
+}
+
 /// Minimal surface the speed helper needs from the real player
 /// (just_audio's AudioPlayer satisfies this structurally: setSpeed +
 /// speed + playbackEvent-less synchronous getter).

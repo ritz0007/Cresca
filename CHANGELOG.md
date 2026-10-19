@@ -92,6 +92,12 @@
   Favorite Artists strip in Library
 - Song Radio rework: radios persist as square cards (like, save as
   playlist, endless songs sheet), player 3-dot menu gains Start radio
+- Library U7: one download progress surface (banner/notification tap
+  opens the downloads sheet; sheet shows per-file %, aggregate line,
+  app-update row, inline Retry), 5 s Undo on playlist delete,
+  row-remove, unlike (slot-exact), suggested-Add and download delete
+  (exact restore vs re-download copy), labeled podcast speed/sleep/
+  download controls, memoized playlist mosaic, sliver Library
 
 ## 1.4.0
 - Spotify import + live sync: one-tap login (baked client ID, PKCE, no
