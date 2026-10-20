@@ -15,6 +15,7 @@ import 'package:http/http.dart' as http;
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
 import '../core/discovery.dart';
+import '../core/search_failures.dart';
 import '../core/track.dart';
 import 'cache.dart';
 import 'innertube.dart';
@@ -106,6 +107,10 @@ class YoutubeRepository {
   final Map<String, _SnapRow> _queryMemo = {};
   final Map<String, Future<List<YtTrack>>> _queryFlight = {};
   final Map<String, Future<Map<String, List<YtTrack>>>> _homeFlight = {};
+  // U6: keys whose last search fetch failed at transport (never cached,
+  // cleared by the next successful fetch). searchNow consults this so
+  // offline reads as error, never as empty.
+  final SearchFailureLedger searchFailures = SearchFailureLedger();
   static const int _queryMemoCap = 50;
   static const int _homeMemoCap = 8;
 
@@ -258,30 +263,54 @@ class YoutubeRepository {
         }
       } catch (_) {}
       List<YtTrack> out;
+      // Transport failures are recorded, never cached: Retry re-fetches,
+      // so a recovered network paints instead of serving the failure
+      // again (U6: offline reads as error, never as empty).
+      var transportFailed = false;
       try {
         out = await mine;
       } catch (_) {
         out = [];
+        transportFailed = true;
       } finally {
         try {
           if (_queryFlight[key] == mine) _queryFlight.remove(key);
         } catch (_) {}
       }
       try {
-        if (out.isNotEmpty) {
-          _memoStore(_queryMemo, key, out,
-              DateTime.now().millisecondsSinceEpoch, _queryMemoCap);
+        if (transportFailed) {
+          searchFailures.noteFailure(key);
         } else {
-          _snapEmptyAt['search:$key'] =
-              DateTime.now().millisecondsSinceEpoch;
-          while (_snapEmptyAt.length > negativeCap) {
-            _snapEmptyAt.remove(_snapEmptyAt.keys.first);
+          searchFailures.noteSuccess(key);
+          if (out.isNotEmpty) {
+            _memoStore(_queryMemo, key, out,
+                DateTime.now().millisecondsSinceEpoch, _queryMemoCap);
+          } else {
+            _snapEmptyAt['search:$key'] =
+                DateTime.now().millisecondsSinceEpoch;
+            while (_snapEmptyAt.length > negativeCap) {
+              _snapEmptyAt.remove(_snapEmptyAt.keys.first);
+            }
           }
         }
       } catch (_) {}
       return out;
     } catch (_) {
       return [];
+    }
+  }
+
+  /// True when the last fetch for [query] failed at transport (U6: the
+  /// search screen raises Retry instead of empty). Genuine empties clear
+  /// the mark, so "No results" still shows when the fetch succeeded.
+  /// Never throws.
+  bool searchFailed(String query, {int max = 15}) {
+    try {
+      final q = query.trim();
+      if (q.isEmpty) return false;
+      return searchFailures.failed('q:${q.toLowerCase()}|$max');
+    } catch (_) {
+      return false;
     }
   }
 

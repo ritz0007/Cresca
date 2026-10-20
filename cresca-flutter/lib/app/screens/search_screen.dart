@@ -189,9 +189,9 @@ class _SearchScreenState extends State<SearchScreen> {
       // fallback is rebuilt locally below, so no rows are passed up
       // front and nothing is lost.
       //
-      // searchNow rethrows transport errors (single caller): a failure
-      // keeps the stale rows and raises _searchError — error reads as
-      // "couldn't load", never as empty.
+      // searchNow throws StateError on transport failure (single
+      // caller): a failure keeps the stale rows and raises _searchError
+      // — error reads as "couldn't load", never as empty.
       List<YtTrack> rawHits;
       // Futures are constructed before the guarded await so both lanes
       // fly together; transport failure is caught below.

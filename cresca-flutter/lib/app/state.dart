@@ -1842,9 +1842,14 @@ class AppState extends ChangeNotifier {
   // U6: transport errors propagate to the search screen (single
   // caller), which keeps stale rows and raises ErrorRetry / inline
   // banner — an offline search reads as "couldn't load", never as
-  // empty. Songs-only gate stays on the success path.
+  // empty. The repo never throws, so emptiness alone is not an error:
+  // only an empty result WITH a recorded transport failure throws.
+  // Songs-only gate stays on the success path.
   Future<List<YtTrack>> searchNow(String query, {int max = 15}) async {
     final hits = songsOnlyTracks(await repo.searchMusic(query, max: max));
+    if (hits.isEmpty && repo.searchFailed(query, max: max)) {
+      throw StateError('search transport failed: $query');
+    }
     unawaited(repo.saveSnapshot('search_${query.hashCode}', hits));
     unawaited(_precacheSearchTop(hits));
     return hits;
