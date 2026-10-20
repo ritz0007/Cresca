@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import '../../core/home_feed.dart';
 import '../../core/track.dart';
 import '../app.dart';
+import '../artwork_cache.dart';
 import '../design.dart';
 import '../state.dart';
 import '../updates.dart'
@@ -972,11 +973,21 @@ class _Rail extends StatelessWidget {
     final title = headerTitle(rail.section);
     final subtitle = headerSubtitle(rail.section);
     final surface = Theme.of(context).colorScheme.surface;
+    String prefetchTick;
+    try {
+      prefetchTick =
+          '${rail.section.query}:${tracks.length}:${tracks.first.id}';
+    } catch (_) {
+      prefetchTick = '${tracks.length}';
+    }
     return Padding(
       padding: const EdgeInsets.only(top: 8),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // U9: warm this rail's visible thumbs post-frame (idle
+          // only, never during flings) so first scroll never pops.
+          ArtPrefetch(tick: prefetchTick, tracks: tracks),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
             child: Row(

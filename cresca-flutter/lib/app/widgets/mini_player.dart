@@ -151,6 +151,11 @@ class _MiniPlayerState extends State<_MiniBodyHost>
                       scale: _pressed ? pressedScale : 1.0,
                       child: Glass(
                         radius: 16,
+                        // U9 blur budget: the mini player is bottom
+                        // chrome next to the tab bar, so it stays
+                        // static (tint/rim/shadow only). Live filters
+                        // per frame are the tab bar + active sheet.
+                        blur: 0,
                         child: Column(
                           mainAxisSize: MainAxisSize.min,
                           children: [

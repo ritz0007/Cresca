@@ -19,6 +19,7 @@ import 'package:flutter/material.dart';
 
 import '../../core/track.dart';
 import '../app.dart';
+import '../artwork_cache.dart';
 import '../state.dart';
 import '../widgets/player_sheet.dart';
 import '../widgets/track_row.dart';
@@ -454,6 +455,9 @@ class _SearchScreenState extends State<SearchScreen> {
                                         width: 48,
                                         height: 48,
                                         fit: BoxFit.cover,
+                                        cacheManager:
+                                            artworkCacheManager,
+                                        useOldImageOnUrlChange: true,
                                         memCacheWidth: 144,
                                         memCacheHeight: 144,
                                         maxWidthDiskCache: 144,

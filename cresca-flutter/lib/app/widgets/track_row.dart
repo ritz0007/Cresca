@@ -10,6 +10,7 @@ import 'package:flutter/material.dart';
 
 import '../../core/track.dart';
 import '../app.dart';
+import '../artwork_cache.dart';
 import 'track_menu.dart';
 
 /// One-shot cascade entrance: fade + 12px rise, 220ms, 40ms stagger.
@@ -359,6 +360,11 @@ class _Art extends StatelessWidget {
           child: CachedNetworkImage(
             key: ValueKey('art-${track.thumbUrl}'),
             imageUrl: track.thumbUrl,
+            cacheManager: artworkCacheManager,
+            // Keep the old frame across URL swaps (3.4.1 exposes
+            // Image's gaplessPlayback as useOldImageOnUrlChange) —
+            // re-scroll never flashes white.
+            useOldImageOnUrlChange: true,
             width: size,
             height: size,
             fit: BoxFit.cover,

@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 
 import '../../core/track.dart';
 import '../app.dart';
+import '../artwork_cache.dart';
 import '../design.dart';
 import '../state.dart';
 import '../widgets/downloads_sheet.dart';
@@ -382,6 +383,8 @@ class _MosaicTile extends StatelessWidget {
     return CachedNetworkImage(
       imageUrl: track.thumbUrl,
       fit: BoxFit.cover,
+      cacheManager: artworkCacheManager,
+      useOldImageOnUrlChange: true,
       memCacheWidth: 112,
       memCacheHeight: 112,
       maxWidthDiskCache: 224,
@@ -439,6 +442,8 @@ class _FavArtists extends StatelessWidget {
                                   width: 48,
                                   height: 48,
                                   fit: BoxFit.cover,
+                                  cacheManager: artworkCacheManager,
+                                  useOldImageOnUrlChange: true,
                                   memCacheWidth: 144,
                                   memCacheHeight: 144,
                                   maxWidthDiskCache: 144,

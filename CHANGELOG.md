@@ -74,6 +74,14 @@
     the ID story before release.
   - Manifest sets `usesCleartextTraffic="true"` (localhost just_audio
     proxy); scope or document before release.
+- U9 performance: blur budget enforced (mini player static, live filters
+  = tab bar + active sheet; settled `MeshBackdrop` wash freezes to a
+  static repaint), download-progress fan-out clamped to ~2 Hz,
+  artwork LRU wired (ImageCache 200 entries / 48 MB, `crescaArt` disk
+  store 2000 objects / 30-day stale, shared `CacheManager`, old-frame
+  retention on URL swaps, dark placeholders, rail + queue-next-3
+  idle prefetch skipping scroll motion) — `lib/app/artwork_cache.dart`,
+  `test/u9_perf_test.dart` (8 tests).
 
 ## 1.4.1
 - Updater reliability: verified-complete installs only (partial files no

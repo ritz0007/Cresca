@@ -11,6 +11,7 @@ dependencies:
   flutter:
     sdk: flutter
   cached_network_image: ^3.4.1
+  flutter_cache_manager: ^3.4.5
   palette_generator: ^0.3.3+5
   shared_preferences: ^2.5.3
   flutter_secure_storage: ^9.2.4

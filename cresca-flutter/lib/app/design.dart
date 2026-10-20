@@ -225,13 +225,19 @@ class Glass extends StatelessWidget {
     // RepaintBoundary confines the backdrop-blur repaint to this
     // element's band; inner content must not add its own blur pass
     // (no stacked blurs — the one static sigma here is the layer).
+    // U9 blur budget: blur <= 0 skips the BackdropFilter node entirely
+    // (a zero-sigma filter still costs a saveLayer). Tint/rim/shadow
+    // stay, so the frosted look survives without the live pass.
+    final Widget content = blur <= 0
+        ? child2
+        : BackdropFilter(
+            filter: ImageFilter.blur(
+                sigmaX: blur, sigmaY: blur),
+            child: child2,
+          );
     return ClipRect(
       child: RepaintBoundary(
-        child: BackdropFilter(
-          filter: ImageFilter.blur(
-              sigmaX: blur, sigmaY: blur),
-          child: child2,
-        ),
+        child: content,
       ),
     );
   }
@@ -480,6 +486,11 @@ class _MeshBackdropState extends State<MeshBackdrop>
   List<Color>? _prev;
   List<Color>? _shown;
   int _paletteKey = 0;
+  // U9 settle freeze: true once the one-shot glide rests AND the palette
+  // crossfade completes. The static branch in build then drops the
+  // AnimatedBuilder from the tree, so unrelated rebuilds (progress,
+  // downloads) never retick the wash paint.
+  bool _settled = false;
 
   @override
   void initState() {
@@ -489,10 +500,21 @@ class _MeshBackdropState extends State<MeshBackdrop>
     _drift = AnimationController(
         vsync: this,
         duration: Duration(milliseconds: motion.sheetEnterMs * 4));
+    _drift.addStatusListener(_onDriftStatus);
     if (widget.motionOn) {
       _drift.forward(from: 0);
     } else {
       _drift.value = 1;
+      _settled = true;
+    }
+  }
+
+  void _onDriftStatus(AnimationStatus s) {
+    if (!mounted) return;
+    if (s == AnimationStatus.completed) {
+      if (!_settled) setState(() => _settled = true);
+    } else if (s == AnimationStatus.forward) {
+      if (_settled) setState(() => _settled = false);
     }
   }
 
@@ -503,10 +525,12 @@ class _MeshBackdropState extends State<MeshBackdrop>
     // Palette swaps re-glide once from rest, then settle again.
     if (widget.motionOn != old.motionOn) {
       if (widget.motionOn) {
+        _settled = false;
         _drift.forward(from: 0);
       } else {
         _drift.stop();
         _drift.value = 1;
+        _settled = true;
       }
     }
   }
@@ -545,6 +569,10 @@ class _MeshBackdropState extends State<MeshBackdrop>
       _prev = _shown;
       _shown = colors;
       _paletteKey++;
+      // Unfreeze synchronously: the post-frame re-glide below ticks a
+      // controller no AnimatedBuilder listens to unless this build
+      // already takes the animated branch.
+      _settled = false;
       if (widget.motionOn) {
         // Post-frame: build must stay side-effect free for the value,
         // but restarting the (already-mounted) controller is safe.
@@ -571,52 +599,76 @@ class _MeshBackdropState extends State<MeshBackdrop>
         ),
       ),
     );
+    Widget wash(List<Color> cs, double drift) {
+      // RepaintBoundary confines the soft-gradient paint to the
+      // backdrop bounds so drifting blobs never repaint content
+      // above. Single paint layer here by design — callers must
+      // not stack another filter over this wash, and the falloff
+      // is static (drift moves blob centers only, no per-frame
+      // MaskFilter blur pass).
+      return RepaintBoundary(
+        child: CustomPaint(
+          painter: _MeshPainter(colors: cs, drift: drift),
+        ),
+      );
+    }
+    // U9 settled freeze: the rested frame paints once as a static
+    // child — no AnimatedBuilder in the tree, so unrelated rebuilds
+    // never retick the wash. Re-glide (palette/motion change) clears
+    // _settled above and takes the animated branch again.
+    if (_settled && _prev == null && _shown != null) {
+      return Stack(
+        fit: StackFit.expand,
+        children: [
+          Container(color: scheme.surface),
+          wash(_shown!, on ? 1.0 : 0.0),
+          scrim,
+        ],
+      );
+    }
     return Stack(
       fit: StackFit.expand,
       children: [
         Container(color: scheme.surface),
         AnimatedBuilder(
-      animation: _drift,
-      builder: (_, _) {
-        Widget wash(List<Color> cs, double drift) {
-          // RepaintBoundary confines the soft-gradient paint to the
-          // backdrop bounds so drifting blobs never repaint content
-          // above. Single paint layer here by design — callers must
-          // not stack another filter over this wash, and the falloff
-          // is static (drift moves blob centers only, no per-frame
-          // MaskFilter blur pass).
-          return RepaintBoundary(
-            child: CustomPaint(
-              painter:
-                  _MeshPainter(colors: cs, drift: drift),
-            ),
-          );
-        }
-        final drift = on ? _drift.value : 0.0;
-        if (_prev != null) {
-          return Stack(
-            fit: StackFit.expand,
-            children: [
-              wash(_prev!, on ? drift : 0.0),
-              TweenAnimationBuilder<double>(
-                key: ValueKey(_paletteKey),
-                tween: Tween(begin: 0, end: 1),
-                duration: Duration(milliseconds: fadeMs),
-                curve: Curves.easeOut,
-                onEnd: () {
-                  if (mounted) setState(() => _prev = null);
-                },
-                builder: (_, v, child) => Opacity(
-                  opacity: v,
-                  child: wash(_shown!, drift),
-                ),
-              ),
-            ],
-          );
-        }
-        return wash(_shown!, drift);
-      },
-    ),
+          animation: _drift,
+          builder: (_, _) {
+            final drift = on ? _drift.value : 0.0;
+            if (_prev != null) {
+              return Stack(
+                fit: StackFit.expand,
+                children: [
+                  wash(_prev!, on ? drift : 0.0),
+                  TweenAnimationBuilder<double>(
+                    key: ValueKey(_paletteKey),
+                    tween: Tween(begin: 0, end: 1),
+                    duration:
+                        Duration(milliseconds: fadeMs),
+                    curve: Curves.easeOut,
+                    onEnd: () {
+                      if (mounted) {
+                        setState(() {
+                          _prev = null;
+                          // Fade done + drift resting = fully settled.
+                          // (If the drift is still gliding its
+                          // completion listener freezes us instead.)
+                          if (!_drift.isAnimating) {
+                            _settled = true;
+                          }
+                        });
+                      }
+                    },
+                    builder: (_, v, child) => Opacity(
+                      opacity: v,
+                      child: wash(_shown!, drift),
+                    ),
+                  ),
+                ],
+              );
+            }
+            return wash(_shown!, drift);
+          },
+        ),
         scrim,
         // Heavy blur melts the blobs into a wash. The mesh painter
         // already renders soft radial gradients directly, so the

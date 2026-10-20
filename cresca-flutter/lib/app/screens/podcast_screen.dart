@@ -20,6 +20,7 @@ import 'package:flutter/material.dart';
 import '../../core/motion.dart' as motion;
 import '../../podcasts/models.dart';
 import '../../podcasts/playback_support.dart';
+import '../artwork_cache.dart';
 import '../design.dart';
 
 /// Minimum touch target (48 px) applied to every control on this screen.
@@ -777,6 +778,22 @@ class _PodcastScreenState extends State<PodcastScreen> {
                   child: CachedNetworkImage(
                     imageUrl: ep.thumbUrl,
                     fit: BoxFit.cover,
+                    cacheManager: artworkCacheManager,
+                    useOldImageOnUrlChange: true,
+                    // Dark placeholder (never white): matches the
+                    // track-row fallback hues until art arrives.
+                    placeholder: (_, _) => Container(
+                      decoration: const BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: [
+                            Color(0xFF0E5C2E),
+                            Color(0xFF08351B)
+                          ],
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                        ),
+                      ),
+                    ),
                     errorWidget: (_, _, _) => Container(
                       color: scheme
                           .surfaceContainerHighest,
@@ -990,6 +1007,8 @@ class _PodcastScreenState extends State<PodcastScreen> {
                 width: 44,
                 height: 44,
                 fit: BoxFit.cover,
+                cacheManager: artworkCacheManager,
+                useOldImageOnUrlChange: true,
                 errorWidget: (_, _, _) => Icon(
                     Icons.podcasts,
                     color:

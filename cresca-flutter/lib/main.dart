@@ -36,6 +36,7 @@ import 'package:flutter/semantics.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'app/app.dart';
+import 'app/artwork_cache.dart';
 import 'app/state.dart';
 
 Future<Directory> _filesDir() async {
@@ -71,6 +72,8 @@ Future<void> _boot() async {
   }
   await lockPortrait();
   final dir = await _filesDir();
+  // U9 image LRU: pin the in-memory ImageCache before first paint.
+  initArtworkCache();
 
   // Phase 1: first paint — static brand bridge, ~1 frame of work.
   runApp(const _BootSplash());

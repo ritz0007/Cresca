@@ -17,6 +17,7 @@ import 'package:just_audio/just_audio.dart';
 
 import '../../core/motion.dart';
 import '../../core/track.dart';
+import '../artwork_cache.dart';
 import '../../audio/system_volume.dart';
 import '../../data/details.dart';
 import '../../data/lyrics.dart';
@@ -970,6 +971,8 @@ class _ArtBlurBackdrop extends StatelessWidget {
                     child: CachedNetworkImage(
                       imageUrl: art,
                       fit: BoxFit.cover,
+                      cacheManager: artworkCacheManager,
+                      useOldImageOnUrlChange: true,
                       // maxres 404s often: fall back to the thumb
                       // that provably loads (the poster uses it) so
                       // the wash never goes translucent.
@@ -977,6 +980,8 @@ class _ArtBlurBackdrop extends StatelessWidget {
                           CachedNetworkImage(
                         imageUrl: track.thumbUrl,
                         fit: BoxFit.cover,
+                        cacheManager: artworkCacheManager,
+                        useOldImageOnUrlChange: true,
                         errorWidget: (_, _, _) =>
                             const SizedBox.shrink(),
                       ),
@@ -2621,6 +2626,8 @@ class _ArtistHeaderArt extends StatelessWidget {
                 fit: BoxFit.cover,
                 width: 168,
                 height: 168,
+                cacheManager: artworkCacheManager,
+                useOldImageOnUrlChange: true,
                 errorWidget: (_, _, _) => Icon(
                     Icons.person,
                     size: 72,

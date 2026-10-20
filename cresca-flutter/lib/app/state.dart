@@ -155,6 +155,11 @@ class AppState extends ChangeNotifier {
   bool updateChecking = false;
   double updateProgress = -1;
 
+  // U9 rebuild scoping: download chunk progress fires per received
+  // part — clamp the AppState fan-out (every TrackRow rebuilds per
+  // notify) to ~2 Hz. The sheet's progress bars still move smoothly.
+  int _lastDlNotifyMs = 0;
+
   /// Appearance: system / light / dark (L4).
   String appearance = 'system';
 
@@ -352,6 +357,10 @@ class AppState extends ChangeNotifier {
     controller.localFileFor = downloads.fileFor;
     downloads.onChanged = () {
       try {
+        final now =
+            DateTime.now().millisecondsSinceEpoch;
+        if (now - _lastDlNotifyMs < 500) return;
+        _lastDlNotifyMs = now;
         notifyListeners();
       } catch (_) {}
     };

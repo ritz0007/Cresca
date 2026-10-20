@@ -10,6 +10,7 @@ import 'package:flutter/material.dart';
 import '../../core/queue.dart';
 import '../../core/track.dart';
 import '../app.dart';
+import '../artwork_cache.dart';
 import '../design.dart';
 import '../state.dart';
 import 'track_menu.dart';
@@ -66,6 +67,17 @@ class QueueSheet extends StatelessWidget {
                 crossAxisAlignment:
                     CrossAxisAlignment.start,
                 children: [
+                  // U9: warm the next-3 thumbs post-frame (idle only,
+                  // never during flings) so advancing never pops art.
+                  ArtPrefetch(
+                    tick: cur?.id ?? 'empty',
+                    tracks: [
+                      for (final i in next.take(3))
+                        if (i >= 0 &&
+                            i < engine.items.length)
+                          engine.items[i],
+                    ],
+                  ),
                   Semantics(
                     label: 'Drag handle',
                     container: true,
