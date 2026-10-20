@@ -50,6 +50,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _onScroll() {
     try {
+      if (!mounted) return;
       _maybePrefetch(AppScope.of(context));
     } catch (_) {}
   }
@@ -79,6 +80,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    _scroll.removeListener(_onScroll);
     _scroll.dispose();
     super.dispose();
   }
@@ -149,11 +151,10 @@ class _HomeScreenState extends State<HomeScreen> {
                 child: Padding(
                   padding:
                       const EdgeInsets.symmetric(horizontal: 16),
+                  // Copy deck: loading is spinner-only (app bar) — the
+                  // hint stays constant so rows never shift copy.
                   child: Text(
-                    state.homeStatus ==
-                            HomeStatus.loading
-                        ? 'Loading…'
-                        : 'Pull to refresh',
+                    'Pull to refresh',
                     style:
                         Theme.of(context).textTheme.labelSmall,
                   ),
@@ -275,12 +276,8 @@ class _HomeScreenState extends State<HomeScreen> {
                       ),
                     ),
                   ),
-                // Endless tail: fixed-height skeleton holds layout while
-                // the next rails load (no jump on arrival); honest
-                // error-with-retry and end states.
-                SliverToBoxAdapter(
-                  child: _DiscoveryTail(state: state),
-                ),
+                // Endless tail lives in the terminal clearance slot below
+                // (canonical EndFooter pattern for U6/U7).
               ],
               // Bottom chrome (mini player + pill) is app-shell; the
               // list scrolls under the glass (Spotify parity). Live
@@ -289,7 +286,13 @@ class _HomeScreenState extends State<HomeScreen> {
               SliverPadding(
                   padding: EdgeInsets.only(
                       bottom:
-                          BottomChromeScope.clearanceOf(context))),
+                          BottomChromeScope.clearanceOf(context)),
+                  // EndFooter: fixed-height skeleton holds layout while
+                  // the next rails load (no jump on arrival); honest
+                  // error-with-retry and end states.
+                  sliver: SliverToBoxAdapter(
+                    child: _DiscoveryTail(state: state),
+                  )),
             ],
           ),
         ),
@@ -449,6 +452,33 @@ class _RecentsGrid extends StatelessWidget {
     }
     if (tracks.isEmpty) return const SizedBox.shrink();
     final scheme = Theme.of(context).colorScheme;
+    // Fixed 2-col layout (≤6 cells → ≤3 rows) as plain Column+Row:
+    // this grid lives inside the outer CustomScrollView, so a nested
+    // scrollable here (shrinkWrap + NeverScrollable) would re-measure
+    // its full extent on every outer scroll frame. Rows are 64dp like
+    // before (2-line titles stay unclipped at 200% text scale).
+    final rows = <Widget>[];
+    for (var r = 0; r < tracks.length; r += 2) {
+      final cells = <Widget>[];
+      for (var c = r; c < r + 2 && c < tracks.length; c++) {
+        if (cells.isNotEmpty) cells.add(const SizedBox(width: 8));
+        cells.add(Expanded(
+          child: SizedBox(
+            height: 64,
+            child: StaggerEntrance(
+              index: c,
+              child: _RecentSongCell(
+                  track: tracks[c],
+                  queue: tracks,
+                  index: c,
+                  state: state),
+            ),
+          ),
+        ));
+      }
+      if (rows.isNotEmpty) rows.add(const SizedBox(height: 8));
+      rows.add(Row(children: cells));
+    }
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 2, 16, 4),
       child: Column(
@@ -463,28 +493,7 @@ class _RecentsGrid extends StatelessWidget {
                   fontSize: 22, fontWeight: FontWeight.w800),
             ),
           ),
-          GridView.builder(
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            gridDelegate:
-                const SliverGridDelegateWithFixedCrossAxisCount(
-              crossAxisCount: 2,
-              mainAxisSpacing: 8,
-              crossAxisSpacing: 8,
-              // 64dp rows: 2-line titles stay unclipped at 200% text
-              // scale; identical look at 1.0x.
-              mainAxisExtent: 64,
-            ),
-            itemCount: tracks.length,
-            itemBuilder: (_, i) => StaggerEntrance(
-              index: i,
-              child: _RecentSongCell(
-                  track: tracks[i],
-                  queue: tracks,
-                  index: i,
-                  state: state),
-            ),
-          ),
+          ...rows,
         ],
       ),
     );
@@ -1163,8 +1172,8 @@ class _DiscoveryTail extends StatelessWidget {
         padding: const EdgeInsets.fromLTRB(16, 20, 16, 0),
         child: Center(
           child: AdaptiveText(
-            data:
-                'You\u2019re all caught up \u2014 pull to refresh for a fresh rotation.',
+            // Terminal footer copy (deck-exact).
+            data: 'You\u2019re all caught up',
             background: scheme.surface,
             secondary: true,
             align: TextAlign.center,
