@@ -1,5 +1,6 @@
-// App shell: 5 tabs + glass bottom bar + double-tap-search-focus
-// (T1–T2, first re-tap shows a one-time focus hint), splash + intro
+// App shell: 5 tabs + glass bottom bar + hint-chip search focus
+// (U2 — the chip replaces the old double-tap/Tooltip/SnackBar trio),
+// splash + intro overlay (A1, readiness-gated), portrait lock +
 // overlay (A1, readiness-gated), portrait lock + edge-to-edge
 // (A2, in main), crash file-logger hookup (A9, in main).
 //
@@ -144,17 +145,11 @@ class CrescaApp extends StatefulWidget {
 
 class _CrescaAppState extends State<CrescaApp> {
   int _tab = 0;
-  int _lastSearchTap = 0;
   bool _splash = true;
   // P1: measured bottom-chrome height (MiniPlayer + tab bar + inset),
   // published via BottomChromeScope so lists stop using `bottom: 210`.
   double _chromeHeight = 0.0;
   final GlobalKey _chromeKey = GlobalKey();
-  // P2: messenger key lets _onTab (no BuildContext) show the one-time
-  // Search double-tap hint without touching the T1 focus path.
-  final GlobalKey<ScaffoldMessengerState> _messengerKey =
-      GlobalKey<ScaffoldMessengerState>();
-  bool _searchHintShown = false;
 
   @override
   void initState() {
@@ -198,22 +193,10 @@ class _CrescaAppState extends State<CrescaApp> {
   }
 
   void _onTab(int i) {
-    final now = DateTime.now().millisecondsSinceEpoch;
-    // T1: double-tap Search icon (<doubleTapMs) focuses search +
-    // keyboard. P2: the gesture was undiscoverable, so the first
-    // single re-tap on an already-active Search tab shows a one-time
-    // hint instead of silently doing nothing. T1 timing is untouched.
-    if (i == 4) {
-      if (_tab == 4) {
-        if (now - _lastSearchTap < doubleTapMs) {
-          widget.state.requestSearchFocus();
-        } else if (!_searchHintShown) {
-          _searchHintShown = true;
-          _showSearchHint();
-        }
-      }
-      _lastSearchTap = now;
-    }
+    // U2: the old double-tap-Search-to-focus gesture (+ Tooltip hint +
+    // one-time SnackBar) is gone — hidden gestures that need three
+    // overlapping hints are a failed gesture. Discovery is the visible
+    // "Tap to type" chip on the Search tab (hides after first focus).
     // Per-visit taste rotation: every arrival on Home re-ranks Top
     // Picks from the accumulated pool (instant, no network). Re-taps
     // on the active Home tab leave the list alone.
@@ -223,20 +206,6 @@ class _CrescaAppState extends State<CrescaApp> {
       } catch (_) {}
     }
     setState(() => _tab = i);
-  }
-
-  void _showSearchHint() {
-    try {
-      _messengerKey.currentState?.showSnackBar(
-        const SnackBar(
-          content: Text('Tip: tap Search again to focus the search field'),
-          // Content display timeout, not animation — kept readable even
-          // with motion off.
-          duration: Duration(seconds: 2),
-          behavior: SnackBarBehavior.floating,
-        ),
-      );
-    } catch (_) {}
   }
 
   /// Reads the chrome Column size post-frame and publishes it via
@@ -276,7 +245,6 @@ class _CrescaAppState extends State<CrescaApp> {
       child: MaterialApp(
         title: 'Cresca Music',
         debugShowCheckedModeBanner: false,
-        scaffoldMessengerKey: _messengerKey,
         themeMode: switch (state.appearance) {
           'light' => ThemeMode.light,
           'dark' => ThemeMode.dark,
@@ -392,20 +360,31 @@ class _CrescaAppState extends State<CrescaApp> {
                                 opacity: anim, child: child),
                         child: KeyedSubtree(
                           key: ValueKey<int>(_tab),
-                          // P2: visible affordance for the T1 double-tap
-                          // gesture — long-press anywhere on the bar shows
-                          // the hint (Tooltip also feeds screen readers).
-                          // The one-time SnackBar in _onTab covers the
-                          // first single re-tap on Search.
-                          child: Tooltip(
-                            message:
-                                'Double-tap Search to focus the search field',
-                            child: FloatingTabBar(
-                              current: _tab,
-                              onTap: _onTab,
-                              bottomInset: bottomInset,
-                              motionOn: state.motionOn,
-                            ),
+                          // U2: visible affordance for search focus — the
+                          // "Tap to type" chip on the Search tab replaces
+                          // the old Tooltip/long-press/SnackBar trio.
+                          // Tapping it selects Search and focuses the
+                          // field; first focus dismisses it for the
+                          // session (AppState.searchHintDismissed).
+                          child: FloatingTabBar(
+                            current: _tab,
+                            onTap: _onTab,
+                            bottomInset: bottomInset,
+                            motionOn: state.motionOn,
+                            showSearchHint:
+                                !state.searchHintDismissed,
+                            onSearchHintTap: () {
+                              try {
+                                if (_tab != 4) _onTab(4);
+                                WidgetsBinding.instance
+                                    .addPostFrameCallback((_) {
+                                  try {
+                                    state.requestSearchFocus();
+                                  } catch (_) {}
+                                });
+                                state.dismissSearchHint();
+                              } catch (_) {}
+                            },
                           ),
                         ),
                       ),

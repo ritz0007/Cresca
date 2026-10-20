@@ -19,6 +19,7 @@ import 'package:flutter/material.dart';
 
 import '../../core/track.dart';
 import '../app.dart';
+import '../design.dart';
 import '../state.dart';
 import '../widgets/player_sheet.dart';
 import '../widgets/track_row.dart';
@@ -59,6 +60,13 @@ class _SearchScreenState extends State<SearchScreen> {
     super.initState();
     _focus.addListener(() {
       if (mounted) setState(() => _focused = _focus.hasFocus);
+      // U2: first focus dismisses the shell's "Tap to type" chip for
+      // the rest of the session (flag lives in AppState, not persisted).
+      if (_focus.hasFocus) {
+        try {
+          AppScope.of(context).dismissSearchHint();
+        } catch (_) {}
+      }
     });
     WidgetsBinding.instance.addPostFrameCallback((_) {
       try {
@@ -298,11 +306,10 @@ class _SearchScreenState extends State<SearchScreen> {
             // never runs a wide shadow pass while scrolling/typing.
             boxShadow: _focused
                 ? [
+                    // U2: focus ring rides Spotify green (== scheme
+                    // primary in both modes; pinned explicitly).
                     BoxShadow(
-                      color: Theme.of(context)
-                          .colorScheme
-                          .primary
-                          .withValues(alpha: 0.35),
+                      color: spotifyGreen.withValues(alpha: 0.35),
                       blurRadius: 6,
                       spreadRadius: 0,
                     ),
@@ -320,6 +327,9 @@ class _SearchScreenState extends State<SearchScreen> {
           child: CupertinoSearchTextField(
             controller: _text,
             focusNode: _focus,
+            // U2: never steal focus on tab switch (screen-reader flow);
+            // focus only on explicit tap (hint chip tap).
+            autofocus: false,
             placeholder: 'Search songs, artists',
             style: TextStyle(color: scheme.onSurface),
             placeholderStyle:

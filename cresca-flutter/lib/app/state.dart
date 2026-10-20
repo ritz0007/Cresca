@@ -257,6 +257,19 @@ class AppState extends ChangeNotifier {
     } catch (_) {}
   }
 
+  /// U2: search hint chip dismissal (session-only, never persisted).
+  /// Set the first time the search field gains focus; the shell reads
+  /// it to hide the "Tap to type" chip for the rest of the session.
+  bool searchHintDismissed = false;
+
+  void dismissSearchHint() {
+    if (searchHintDismissed) return;
+    try {
+      searchHintDismissed = true;
+      notifyListeners();
+    } catch (_) {}
+  }
+
   AppState(this.filesDir);
 
   Future<void> init() async {

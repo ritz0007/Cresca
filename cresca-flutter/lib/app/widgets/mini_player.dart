@@ -1,6 +1,7 @@
-// Mini-player (P10): swipe L/R = next/prev (glide + snap-back + peek
-// chevrons), tap opens the full sheet, equalizer bars, red play button,
-// progress bar, loading/error states.
+// Mini-player (U2): swipe L/R = next/prev (glide + snap-back),
+// tap opens the full sheet, equalizer bars, green Spotify play
+// button, progress bar (green when trackable), loading/error
+// states. First 3 appearances overlay peek chevrons (1.2s fade).
 
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
@@ -38,6 +39,12 @@ class _MiniPlayerState extends State<_MiniBodyHost>
   bool _peekRight = false;
   bool _pressed = false;
   YtTrack? _lastTrack;
+  // U2: onboarding peek — overlay chevrons on the first 3 MiniPlayer
+  // appearances, fading after 1.2s. Plain in-memory counter (reset on
+  // relaunch, never persisted).
+  int _showCount = 0;
+  bool _hadTrack = false;
+  bool _peekIntro = false;
 
   @override
   Widget build(BuildContext context) {
@@ -59,6 +66,31 @@ class _MiniPlayerState extends State<_MiniBodyHost>
     final display = track ?? _lastTrack;
     if (display == null) return const SizedBox.shrink();
     final hasTrack = track != null;
+    // U2: rising edge of a loaded track = one appearance. First 3
+    // show intro chevrons (motion-off skips them); the fade timer
+    // hides them 1.2s in. Counter is in-memory only.
+    if (hasTrack && !_hadTrack) {
+      _hadTrack = true;
+      _showCount++;
+      if (_showCount <= 3 && state.motionOn) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          try {
+            setState(() => _peekIntro = true);
+            Future<void>.delayed(
+                const Duration(milliseconds: 1200), () {
+              if (!mounted) return;
+              try {
+                setState(() => _peekIntro = false);
+              } catch (_) {}
+            });
+          } catch (_) {}
+        });
+      }
+    } else if (!hasTrack) {
+      _hadTrack = false;
+      _peekIntro = false;
+    }
     final scheme = Theme.of(context).colorScheme;
     final dark = Theme.of(context).brightness == Brightness.dark;
     // Narrow phones (360dp): shrink trailing glyphs so the
@@ -159,11 +191,21 @@ class _MiniPlayerState extends State<_MiniBodyHost>
                                   4, 6, 4, 6),
                               child: Row(
                               children: [
-                                if (_peekRight)
-                                  const Padding(
-                                    padding: EdgeInsets.only(left: 4),
-                                    child: Icon(Icons.chevron_left,
-                                        size: 18),
+                                // U2: intro chevrons (first 3 shows) share
+                                // the swipe-peek slots; labelled so the
+                                // a11y dump sees them, onSurfaceVariant 50%.
+                                if (_peekRight || _peekIntro)
+                                  Padding(
+                                    padding: const EdgeInsets.only(left: 4),
+                                    child: Semantics(
+                                      label: _peekIntro
+                                          ? 'Swipe left or right for next or previous track'
+                                          : null,
+                                      child: Icon(Icons.chevron_left,
+                                          size: 18,
+                                          color: scheme.onSurfaceVariant
+                                              .withValues(alpha: 0.5)),
+                                    ),
                                   ),
                                 Expanded(
                                   child: Semantics(
@@ -281,70 +323,76 @@ class _MiniPlayerState extends State<_MiniBodyHost>
                                     ],
                                   );
                                 }
-                                // Reference mini style: plain white
-                                // glyphs, pause + next, no fill.
-                                // Play/pause morph: scale + rotation (180ms).
+                                // U2: primary action speaks Spotify green
+                                // (green pill, black glyph) like every other
+                                // primary action. Play/pause morph kept;
+                                // Tooltip feeds the a11y label.
                                 return Row(
                                   mainAxisSize:
                                       MainAxisSize.min,
                                   children: [
-                                    IconButton(
-                                      iconSize: trailingIconSize,
-                                      icon: AnimatedSwitcher(
-                                        duration: Duration(
-                                            milliseconds:
-                                                state.motionMs(
-                                                    180)),
-                                        transitionBuilder:
-                                            (child, anim) {
-                                          final curved =
-                                              CurvedAnimation(
-                                                  parent: anim,
-                                                  curve: Curves
-                                                      .easeOut);
-                                          return ScaleTransition(
-                                            scale: Tween<
-                                                        double>(
-                                                    begin: 0.6,
-                                                    end: 1.0)
-                                                .animate(
-                                                    curved),
-                                            child:
-                                                RotationTransition(
-                                              turns: Tween<
-                                                      double>(
-                                                  begin:
-                                                      -0.12,
-                                                  end: 0.0)
-                                                  .animate(
-                                                      curved),
-                                              child: FadeTransition(
-                                                  opacity:
-                                                      curved,
-                                                  child:
-                                                      child),
-                                            ),
-                                          );
-                                        },
-                                        child: Icon(
-                                          playing
-                                              ? Icons.pause
-                                              : Icons
-                                                  .play_arrow,
-                                          key: ValueKey<bool>(
-                                              playing),
-                                        ),
-                                      ),
-                                      color: Theme.of(
-                                              context)
-                                          .colorScheme
-                                          .onSurface,
-                                      tooltip: playing
+                                    Tooltip(
+                                      message: playing
                                           ? 'Pause'
                                           : 'Play',
-                                      onPressed: () =>
-                                          state.controller
-                                              .togglePlay(),
+                                      child: FilledButton(
+                                        style: spotifyPlayStyle()
+                                            .copyWith(
+                                          minimumSize: const WidgetStatePropertyAll(
+                                              Size(48, 40)),
+                                          padding: const WidgetStatePropertyAll(
+                                              EdgeInsets.zero),
+                                        ),
+                                        onPressed: () =>
+                                            state.controller
+                                                .togglePlay(),
+                                        child: AnimatedSwitcher(
+                                          duration: Duration(
+                                              milliseconds:
+                                                  state.motionMs(
+                                                      180)),
+                                          transitionBuilder:
+                                              (child, anim) {
+                                            final curved =
+                                                CurvedAnimation(
+                                                    parent: anim,
+                                                    curve: Curves
+                                                        .easeOut);
+                                            return ScaleTransition(
+                                              scale: Tween<
+                                                          double>(
+                                                      begin: 0.6,
+                                                      end: 1.0)
+                                                  .animate(
+                                                      curved),
+                                              child:
+                                                  RotationTransition(
+                                                turns: Tween<
+                                                        double>(
+                                                    begin:
+                                                        -0.12,
+                                                    end: 0.0)
+                                                    .animate(
+                                                        curved),
+                                                child:
+                                                    FadeTransition(
+                                                        opacity:
+                                                            curved,
+                                                        child:
+                                                            child),
+                                              ),
+                                            );
+                                          },
+                                          child: Icon(
+                                            playing
+                                                ? Icons.pause
+                                                : Icons
+                                                    .play_arrow,
+                                            key: ValueKey<bool>(
+                                                playing),
+                                          ),
+                                        ),
+                                      ),
                                     ),
                                     IconButton(
                                       iconSize: trailingIconSize,
@@ -366,10 +414,18 @@ class _MiniPlayerState extends State<_MiniBodyHost>
                     ],
                   ),
                 ),
-                    if (_peekLeft)
-                      const Padding(
-                        padding: EdgeInsets.only(right: 4),
-                        child: Icon(Icons.chevron_right, size: 18),
+                    if (_peekLeft || _peekIntro)
+                      Padding(
+                        padding: const EdgeInsets.only(right: 4),
+                        child: Semantics(
+                          label: _peekIntro
+                              ? 'Swipe left or right for next or previous track'
+                              : null,
+                          child: Icon(Icons.chevron_right,
+                              size: 18,
+                              color: scheme.onSurfaceVariant
+                                  .withValues(alpha: 0.5)),
+                        ),
                       ),
                   ],
                               ),
@@ -450,12 +506,15 @@ class _Progress extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // U2: green when trackable, onSurfaceVariant when indeterminate.
+    final scheme = Theme.of(context).colorScheme;
     return StreamBuilder<Duration>(
       stream: state.controller.player.positionStream,
       builder: (_, snap) {
         final pos = snap.data ?? Duration.zero;
         final total = state.controller.player.duration ?? Duration.zero;
-        final f = total.inMilliseconds <= 0
+        final trackable = total.inMilliseconds > 0;
+        final f = !trackable
             ? 0.0
             : (pos.inMilliseconds / total.inMilliseconds).clamp(0.0, 1.0);
         // Smooth the bar between position ticks (no setState storms:
@@ -469,17 +528,14 @@ class _Progress extends StatelessWidget {
             child: ClipRRect(
               borderRadius: BorderRadius.circular(2),
               child: LinearProgressIndicator(
-              value: value,
+              value: trackable ? value : null,
               minHeight: 2.5,
-              backgroundColor: Theme.of(context)
-                  .colorScheme
-                  .surfaceContainerHighest
+              backgroundColor: scheme.surfaceContainerHighest
                   .withValues(alpha: 0.6),
               valueColor: AlwaysStoppedAnimation<Color>(
-                Theme.of(context)
-                    .colorScheme
-                    .onSurface
-                    .withValues(alpha: 0.9),
+                trackable
+                    ? spotifyGreen
+                    : scheme.onSurfaceVariant,
               ),
               ),
             ),

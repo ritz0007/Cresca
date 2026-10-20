@@ -1,6 +1,11 @@
 # Changelog — Cresca Music
 
 ## 1.5.1 (Flutter port — unreleased; pubspec still `1.5.0+20`)
+- U2 shell: visible "Tap to type" search hint chip replaces the
+  double-tap/Tooltip/SnackBar trio, tab labels ellipsize at 200% text
+  scale, MiniPlayer play uses `spotifyPlayStyle()` with 3-show peek
+  chevrons (`lib/app/app.dart`, `design.dart`, `search_screen.dart`,
+  `state.dart`, `widgets/mini_player.dart`; `test/u2_shell_test.dart`).
 - Full Flutter rewrite of the native app per `RESTRUCTURE.md` (catalog
   A1–A9, T1–T2, H1–H11, R1–R3, S1–S4, M1, P1–P16, L1–L6, G1–G2,
   C1–C5, Y1–Y4). 27 commits since `v1.4.1`; commit messages report

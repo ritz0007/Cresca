@@ -695,7 +695,19 @@ class FloatingTabBar extends StatelessWidget {
     required this.onTap,
     this.bottomInset = 24,
     this.motionOn = true,
+    // U2: visible search affordance. When true, the Search cell grows a
+    // "Tap to type" chip above its icon; tapping it focuses the search
+    // field (via [onSearchHintTap]) and dismisses the chip for the
+    // session. Replaces the old Tooltip/long-press/SnackBar trio.
+    this.showSearchHint = false,
+    this.onSearchHintTap,
   });
+
+  /// Tap handler for the U2 search hint chip (select Search + focus).
+  final VoidCallback? onSearchHintTap;
+
+  /// Whether the Search cell shows the "Tap to type" hint chip.
+  final bool showSearchHint;
 
   static const _items = [
     (Icons.home_outlined, Icons.home, 'Listen Now'),
@@ -811,6 +823,51 @@ class FloatingTabBar extends StatelessWidget {
                         child: Column(
                           mainAxisSize: MainAxisSize.min,
                           children: [
+                            // U2: visible search affordance — a "Tap to
+                            // type" chip above the Search icon. Session
+                            // flag hides it after first search focus.
+                            // Green pill / black text (primary-action
+                            // voice); row height wraps content and the
+                            // chrome clearance absorbs the growth.
+                            if (i == 4 && showSearchHint)
+                              Padding(
+                                padding: const EdgeInsets.only(
+                                    bottom: 4),
+                                child: Semantics(
+                                  button: true,
+                                  label:
+                                      'Search hint. Tap to type in the search field',
+                                  child: InkWell(
+                                    borderRadius:
+                                        BorderRadius.circular(
+                                            10),
+                                    onTap: onSearchHintTap,
+                                    child: Container(
+                                      padding: const EdgeInsets
+                                          .symmetric(
+                                              horizontal: 8,
+                                              vertical: 3),
+                                      decoration: BoxDecoration(
+                                        color: spotifyGreen,
+                                        borderRadius:
+                                            BorderRadius.circular(
+                                                10),
+                                      ),
+                                      child: const Text('Tap to type',
+                                          maxLines: 1,
+                                          softWrap: false,
+                                          overflow: TextOverflow
+                                              .ellipsis,
+                                          style: TextStyle(
+                                              color: Colors.black,
+                                              fontSize: 10,
+                                              fontWeight:
+                                                  FontWeight
+                                                      .w700)),
+                                    ),
+                                  ),
+                                ),
+                              ),
                             // Selection tint: 0→1 tween lerped per-frame
                             // (transform/opacity-class color lerp). A
                             // ColorTween(begin: unselected) snapped on
@@ -851,6 +908,7 @@ class FloatingTabBar extends StatelessWidget {
                                       : unselected),
                               child: Text(_items[i].$3,
                                   maxLines: 1,
+                                  softWrap: false,
                                   overflow:
                                       TextOverflow.ellipsis),
                             ),
