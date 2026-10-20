@@ -20,7 +20,7 @@ import 'package:flutter/material.dart';
 import '../../core/track.dart';
 import '../app.dart';
 import '../state.dart';
-import '../widgets/player_sheet.dart';
+import '../widgets/player_credits.dart';
 import '../widgets/track_row.dart';
 
 class SearchScreen extends StatefulWidget {
