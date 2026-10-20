@@ -12,6 +12,7 @@ import '../../jam/protocol.dart';
 import '../app.dart';
 import '../design.dart';
 import '../state.dart';
+import 'cresca_toast.dart';
 
 Future<void> openJamSheet(BuildContext context) async {
   try {
@@ -27,7 +28,10 @@ Future<void> openJamSheet(BuildContext context) async {
         builder: (_, scroll) => JamSheet(scroll: scroll),
       ),
     );
-  } catch (_) {}
+  } catch (e, st) {
+    await logUserFailure(context, 'open JAM failed', e, st);
+    await showCrescaToast(context, 'Could not open JAM — Retry');
+  }
 }
 
 class JamSheet extends StatelessWidget {
@@ -212,7 +216,9 @@ class _JoinFormState extends State<_JoinForm> {
           onChanged: (_) {
             try {
               setState(() {});
-            } catch (_) {}
+            } catch (_) {
+              // silent: rebuild nudge only, next keystroke rebuilds
+            }
           },
           decoration: const InputDecoration(
               labelText: 'Your name',
@@ -564,6 +570,7 @@ class _RoomCard extends StatelessWidget {
       if (n == null) return 'waiting for the host…';
       return '${n.playing ? 'Playing' : 'Paused'} · ${n.track.title}';
     } catch (_) {
+      // silent: status-line probe, empty line hides the row
       return '';
     }
   }
@@ -574,7 +581,13 @@ class _RoomCard extends StatelessWidget {
         text: 'Join my JAM on Cresca: $code\n'
             'cresca://jam/$code',
       ));
-    } catch (_) {}
+    } catch (e, st) {
+      await logUserFailure(context, 'share JAM invite failed', e, st);
+      if (context.mounted) {
+        await showCrescaToast(
+            context, "Couldn't share invite — try again");
+      }
+    }
   }
 }
 
@@ -603,7 +616,9 @@ class _DelayedSpinnerState extends State<_DelayedSpinner> {
       bool on = true;
       try {
         on = AppScope.of(context).motionOn;
-      } catch (_) {}
+      } catch (_) {
+        // silent: motion probe, animation default (on) is safe
+      }
       if (!on) {
         setState(() => _show = true);
         return;
@@ -620,7 +635,9 @@ class _DelayedSpinnerState extends State<_DelayedSpinner> {
     bool on = true;
     try {
       on = AppScope.of(context).motionOn;
-    } catch (_) {}
+    } catch (_) {
+      // silent: motion probe, animation default (on) is safe
+    }
     return SizedBox(
       width: widget.size,
       height: widget.size,

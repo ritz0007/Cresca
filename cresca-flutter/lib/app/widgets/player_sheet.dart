@@ -25,6 +25,7 @@ import '../app.dart';
 import '../design.dart';
 import '../state.dart';
 import 'audio_output_sheet.dart';
+import 'cresca_toast.dart';
 import 'lyrics_panel.dart';
 import 'queue_sheet.dart';
 import 'track_menu.dart';
@@ -59,7 +60,10 @@ Future<void> openPlayerSheet(BuildContext context,
             PlayerSheet(scroll: scroll, video: video),
       ),
     );
-  } catch (_) {}
+  } catch (e, st) {
+    await logUserFailure(context, 'open player failed', e, st);
+    await showCrescaToast(context, 'Could not open player — Retry');
+  }
 }
 
 class PlayerSheet extends StatefulWidget {
@@ -2424,20 +2428,25 @@ class _ArtistPageState extends State<ArtistPage> {
                                           Icons.shuffle),
                                       label:
                                           const Text('Shuffle'),
-                                      onPressed: () {
+                                      onPressed: () async {
                                         final order =
                                             List<int>.generate(
                                                 songs.length,
                                                 (i) => i)
                                               ..shuffle();
-                                        state.actPlay(
+                                        if (!await state.actPlay(
                                             [
                                               for (final i
                                                   in order)
                                                 songs[i]
                                             ],
                                             0,
-                                            origin: 'Artist');
+                                            origin: 'Artist')) {
+                                          if (context.mounted) {
+                                            await showCrescaToast(context,
+                                                'Could not play — Retry');
+                                          }
+                                        }
                                       },
                                     ),
                                   ),
@@ -2652,11 +2661,24 @@ class _ArtistVideoCard extends StatelessWidget {
       label: track.title,
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onTap: () {
+        onTap: () async {
           try {
-            state.actPlay(queue, index, origin: 'Artist videos');
+            if (!await state.actPlay(queue, index,
+                origin: 'Artist videos')) {
+              if (context.mounted) {
+                await showCrescaToast(
+                    context, 'Could not play — Retry');
+              }
+              return;
+            }
             openPlayerSheet(context, video: true);
-          } catch (_) {}
+          } catch (e, st) {
+            await state.crash.log('open player failed', e, st);
+            if (context.mounted) {
+              await showCrescaToast(
+                  context, 'Could not open player — Retry');
+            }
+          }
         },
         child: Container(
           width: 160,

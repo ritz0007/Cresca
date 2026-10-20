@@ -46,6 +46,7 @@ import '../design.dart';
 import '../state.dart';
 import '../../core/motion.dart' show motionMs;
 import '../../core/track.dart';
+import 'cresca_toast.dart';
 
 /// True when a rendition height is a progressive-muxed (video+audio)
 /// rendition. YouTube serves progressive muxed streams at most at ~720p;
@@ -112,7 +113,12 @@ Future<void> openVideoSheet(
       builder: (_) =>
           VideoFullscreenPage(state: state, track: track),
     ));
-  } catch (_) {}
+  } catch (e, st) {
+    await state.crash.log('open video failed', e, st);
+    if (context.mounted) {
+      await showCrescaToast(context, 'Could not open video — Retry');
+    }
+  }
 }
 
 /// Fullscreen expand route (kept): landscape + immersive while open,

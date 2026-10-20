@@ -69,6 +69,19 @@
     capture and record the exact warning text before sign-off.
   - Version bookkeeping: `cresca-flutter/pubspec.yaml` still
     `1.5.0+20`; bump name/code for 1.5.1 at release time.
+- Feedback system (U8): one shared toast helper
+  (`lib/app/widgets/cresca_toast.dart` — hide-before-show, 3 s,
+  maxLines 2, margin above the measured bottom chrome) + crash-log
+  breadcrumb on every user-path failure. Wired: sheet open (player,
+  queue, downloads, audio output/pipeline, JAM, video, session,
+  settings, track menu), logout wipe (incl. PO-token + taste seeds,
+  success toast "Signed out"), share, Spotify connect, update
+  check/download/install (failed-check banner copy "Update check
+  failed — Retry"), downloads delete/restore/offline-play, queue
+  reorder/play/add, lyrics retry/translate notices, playlist picker
+  save. Background work (prefetch, suggestions, memo probes) stays
+  silent with `// silent:` comments. 4 widget tests
+  (`test/cresca_toast_test.dart`); 202 tests green.
   - Application ID changed to `com.cresca.cresca_app` (native was
     `com.cresca.app`): side-by-side install, no upgrade path — decide
     the ID story before release.

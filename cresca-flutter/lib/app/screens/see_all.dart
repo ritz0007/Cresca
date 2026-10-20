@@ -8,6 +8,7 @@ import '../../core/track.dart';
 import '../app.dart';
 import '../design.dart';
 import '../state.dart';
+import '../widgets/cresca_toast.dart';
 import '../widgets/track_row.dart';
 
 Future<void> openSeeAllQuery(BuildContext context, String title,
@@ -16,7 +17,12 @@ Future<void> openSeeAllQuery(BuildContext context, String title,
     await Navigator.of(context).push(MaterialPageRoute(
         builder: (_) => SeeAllScreen(
             title: title, query: query, initial: initial ?? [])));
-  } catch (_) {}
+  } catch (e, st) {
+    await logUserFailure(context, 'open list failed', e, st);
+    if (context.mounted) {
+      await showCrescaToast(context, 'Could not open list — Retry');
+    }
+  }
 }
 
 Future<void> openSeeAllStatic(BuildContext context, String title,
@@ -25,7 +31,12 @@ Future<void> openSeeAllStatic(BuildContext context, String title,
     await Navigator.of(context).push(MaterialPageRoute(
         builder: (_) =>
             SeeAllScreen(title: title, staticTracks: tracks, query: query)));
-  } catch (_) {}
+  } catch (e, st) {
+    await logUserFailure(context, 'open list failed', e, st);
+    if (context.mounted) {
+      await showCrescaToast(context, 'Could not open list — Retry');
+    }
+  }
 }
 
 class SeeAllScreen extends StatefulWidget {
@@ -69,6 +80,7 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
       if (q.startsWith('__')) return null;
       return q;
     } catch (_) {
+      // silent: query probe, null means finite list
       return null;
     }
   }
@@ -83,6 +95,7 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
     try {
       _base = songsOnlyTracks(widget.staticTracks ?? widget.initial);
     } catch (_) {
+      // silent: filter probe, empty base renders the empty face
       _base = <YtTrack>[];
     }
     _tracks = List<YtTrack>.of(_base);
@@ -90,7 +103,9 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
     for (final t in _tracks) {
       try {
         _seen.add(t.id);
-      } catch (_) {}
+      } catch (_) {
+        // silent: id probe, dupes filtered by the pager below
+      }
     }
     _attachPager();
     _scroll.addListener(_onScroll);
@@ -118,6 +133,7 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
       }
       _pager = AppScope.of(context).repo.searchPager(q, pageSize: 20);
     } catch (_) {
+      // silent: pager attach only, null pager means finite list
       _pager = null;
     }
   }
@@ -126,7 +142,9 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
   void dispose() {
     try {
       _scroll.removeListener(_onScroll);
-    } catch (_) {}
+    } catch (_) {
+      // silent: listener detach only, dispose continues
+    }
     _scroll.dispose();
     super.dispose();
   }
@@ -141,10 +159,14 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
       try {
         final v = pos.viewportDimension;
         if (v.isFinite && v > 0) viewport = v;
-      } catch (_) {}
+      } catch (_) {
+        // silent: metrics probe, 800 default still triggers paging
+      }
       final remaining = pos.maxScrollExtent - pos.pixels;
       if (remaining <= viewport + 200) _more();
-    } catch (_) {}
+    } catch (_) {
+      // silent: scroll probe, next scroll event retries
+    }
   }
 
   void _maybeFill() {
@@ -159,9 +181,13 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
       try {
         final v = pos.viewportDimension;
         if (v.isFinite && v > 0) viewport = v;
-      } catch (_) {}
+      } catch (_) {
+        // silent: metrics probe, 800 default still fills
+      }
       if (pos.maxScrollExtent <= viewport * 1.5) _more();
-    } catch (_) {}
+    } catch (_) {
+      // silent: fill-check probe, scroll trigger covers it
+    }
   }
 
   /// Warms next-8 on open (H11).
@@ -172,7 +198,9 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
       // new POSTs. Batches of 3, self-bounded; never throws.
       final state = AppScope.of(context);
       await state.resolver.primeNext(_tracks.take(8).toList());
-    } catch (_) {}
+    } catch (_) {
+      // silent: background warm only, taps resolve on demand
+    }
   }
 
   Future<void> _refresh() async {
@@ -187,7 +215,9 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
           for (final t in _tracks) {
             try {
               _seen.add(t.id);
-            } catch (_) {}
+            } catch (_) {
+              // silent: id probe, pager dupes filtered below
+            }
           }
           _moreError = '';
           _exhausted = true;
@@ -204,12 +234,16 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
         for (final t in _tracks) {
           try {
             _seen.add(t.id);
-          } catch (_) {}
+          } catch (_) {
+            // silent: id probe, pager dupes filtered below
+          }
         }
       });
       _attachPager();
       await _more();
-    } catch (_) {}
+    } catch (_) {
+      // silent: refresh reset only, inline error row covers paging
+    }
   }
 
   Future<void> _more([int hop = 0]) async {
@@ -234,6 +268,7 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
       try {
         rawDyn = await pager.loadMore();
       } catch (_) {
+        // silent: page fetch, null renders the inline Retry row below
         rawDyn = null;
       }
       if (!mounted) return;
@@ -244,6 +279,7 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
       try {
         exhaustedNow = (pager.exhausted as bool?) ?? false;
       } catch (_) {
+        // silent: pager flag probe, false shows Retry instead of end
         exhaustedNow = false;
       }
       if (raw.isEmpty) {
@@ -268,6 +304,7 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
       try {
         clean = songsOnlyTracks(raw);
       } catch (_) {
+        // silent: filter probe, empty page shows the Retry row
         clean = <YtTrack>[];
       }
       var added = 0;
@@ -277,7 +314,9 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
             _tracks.add(t);
             added++;
           }
-        } catch (_) {}
+        } catch (_) {
+          // silent: id probe, dupe risk handled by the hop refill
+        }
       }
       if (!mounted) return;
       setState(() {
@@ -294,6 +333,8 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
       }
       WidgetsBinding.instance.addPostFrameCallback((_) => _maybeFill());
     } catch (_) {
+      // Silent: paging internals only — the inline Retry row above is
+      // the user-facing surface for _more failures.
       if (mounted) {
         setState(() {
           _loading = false;
@@ -372,7 +413,15 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
                       label: const Text('Play all'),
                       onPressed: _tracks.isEmpty
                           ? null
-                          : () => state.actPlay(_tracks, 0),
+                          : () async {
+                              if (!await state.actPlay(
+                                  _tracks, 0)) {
+                                if (context.mounted) {
+                                  await showCrescaToast(context,
+                                      'Could not play — Retry');
+                                }
+                              }
+                            },
                     ),
                   ),
                 const SizedBox(width: 8),
@@ -382,13 +431,18 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
                     label: const Text('Shuffle play'),
                     onPressed: _tracks.isEmpty
                         ? null
-                        : () {
+                        : () async {
                             final order = List<int>.generate(
                                 _tracks.length, (i) => i)
                               ..shuffle();
-                            state.actPlay(
+                            if (!await state.actPlay(
                                 [for (final i in order) _tracks[i]],
-                                0);
+                                0)) {
+                              if (context.mounted) {
+                                await showCrescaToast(context,
+                                    'Could not play — Retry');
+                              }
+                            }
                           },
                   ),
                 ),

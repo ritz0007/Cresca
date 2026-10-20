@@ -12,6 +12,7 @@ import '../../core/track.dart';
 import '../app.dart';
 import '../design.dart';
 import '../state.dart';
+import '../widgets/cresca_toast.dart';
 import '../widgets/track_menu.dart';
 import '../widgets/track_row.dart';
 import '../widgets/player_sheet.dart';
@@ -40,7 +41,9 @@ class _TrendingScreenState extends State<TrendingScreen> {
         if (state.trendingGlobal.isEmpty) {
           state.loadTrending();
         }
-      } catch (_) {}
+      } catch (_) {
+        // silent: post-frame load kick, pull-to-refresh covers retry
+      }
       _loadVideoTop();
     });
   }
@@ -75,17 +78,24 @@ class _TrendingScreenState extends State<TrendingScreen> {
           try {
             final top = (results[0] as List<YtTrack>);
             if (top.isNotEmpty) _topVideos = top;
-          } catch (_) {}
+          } catch (_) {
+            // silent: chart parse probe, audio-chart fallback stands
+          }
           try {
             for (var i = 0; i < titles.length; i++) {
               final vids = (results[i + 1] as List<YtTrack>);
               if (vids.isNotEmpty) _railVideos[titles[i]] = vids;
             }
-          } catch (_) {}
+          } catch (_) {
+            // silent: rail parse probe, audio-chart fallback stands
+          }
         });
-      } catch (_) {}
+      } catch (_) {
+        // silent: video fetch fan-out, audio-chart lists still render
+      }
       _videoLoading = false;
     } catch (_) {
+      // silent: loading flag reset guard, refresh retries below
       _videoLoading = false;
     }
   }
@@ -94,7 +104,9 @@ class _TrendingScreenState extends State<TrendingScreen> {
     try {
       final state = AppScope.of(context);
       await state.loadTrending(force: true);
-    } catch (_) {}
+    } catch (_) {
+      // silent: refresh load, inline error/Retry row covers failure
+    }
     await _loadVideoTop();
   }
 
@@ -281,13 +293,25 @@ class _VideoRankRow extends StatelessWidget {
     return RepaintBoundary(
       child: GestureDetector(
       behavior: HitTestBehavior.opaque,
-      onTap: () {
+      onTap: () async {
         try {
           // Video rows play in the player sheet with video mode on
           // (YTM parity): queue starts here, picture in the art slot.
-          state.actPlay(queue, index, origin: 'Trending');
+          if (!await state.actPlay(queue, index, origin: 'Trending')) {
+            if (context.mounted) {
+              await showCrescaToast(
+                  context, 'Could not play — Retry');
+            }
+            return;
+          }
           openPlayerSheet(context, video: true);
-        } catch (_) {}
+        } catch (e, st) {
+          await state.crash.log('open player failed', e, st);
+          if (context.mounted) {
+            await showCrescaToast(
+                context, 'Could not open player — Retry');
+          }
+        }
       },
       child: Padding(
         padding: const EdgeInsets.symmetric(vertical: 4),
@@ -410,11 +434,23 @@ class _TrendCard extends StatelessWidget {
     // Single scrim layer (TextScrim only); tight 4px text shadows so
     // dense rails never run a wide blur per card per frame.
     return GestureDetector(
-      onTap: () {
+      onTap: () async {
         try {
-          state.actPlay(queue, index, origin: 'Trending');
+          if (!await state.actPlay(queue, index, origin: 'Trending')) {
+            if (context.mounted) {
+              await showCrescaToast(
+                  context, 'Could not play — Retry');
+            }
+            return;
+          }
           openPlayerSheet(context, video: true);
-        } catch (_) {}
+        } catch (e, st) {
+          await state.crash.log('open player failed', e, st);
+          if (context.mounted) {
+            await showCrescaToast(
+                context, 'Could not open player — Retry');
+          }
+        }
       },
       child: RepaintBoundary(
         child: Container(

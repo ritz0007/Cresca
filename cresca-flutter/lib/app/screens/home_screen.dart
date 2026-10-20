@@ -13,6 +13,7 @@ import '../state.dart';
 import '../updates.dart'
     show UpdateBannerMotion, UpdateProgressShimmer;
 import '../widgets/cresca_logo.dart';
+import '../widgets/cresca_toast.dart';
 import '../widgets/profile_sheet.dart';
 import '../widgets/session_sheet.dart';
 import '../widgets/track_row.dart';
@@ -43,7 +44,9 @@ class _HomeScreenState extends State<HomeScreen> {
         } else {
           _maybePrefetch(state);
         }
-      } catch (_) {}
+      } catch (_) {
+        // silent: post-frame prefetch kick, scroll triggers it anyway
+      }
     });
     _scroll.addListener(_onScroll);
   }
@@ -51,7 +54,9 @@ class _HomeScreenState extends State<HomeScreen> {
   void _onScroll() {
     try {
       _maybePrefetch(AppScope.of(context));
-    } catch (_) {}
+    } catch (_) {
+      // silent: scroll prefetch probe, next scroll event retries
+    }
   }
 
   /// Early prefetch: fires when ~1.5 viewports of content remain (not at
@@ -74,7 +79,9 @@ class _HomeScreenState extends State<HomeScreen> {
       if (remaining < viewport * 1.5) {
         state.loadMoreDiscovery();
       }
-    } catch (_) {}
+    } catch (_) {
+      // silent: scroll prefetch probe, next scroll event retries
+    }
   }
 
   @override
@@ -194,7 +201,10 @@ class _HomeScreenState extends State<HomeScreen> {
                           await state.saveEpisodeProgress();
                           await state.controller.player
                               .pause();
-                        } catch (_) {}
+                        } catch (e, st) {
+                          await state.crash.log(
+                              'episode pause failed', e, st);
+                        }
                       },
                     ),
                   ),
@@ -509,8 +519,13 @@ class _RecentSongCell extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     return PressScale(
       motionOn: state.motionOn,
-      onTap: () =>
-          state.actPlay(queue, index, origin: 'Home'),
+      onTap: () async {
+        if (!await state.actPlay(queue, index, origin: 'Home')) {
+          if (context.mounted) {
+            await showCrescaToast(context, 'Could not play — Retry');
+          }
+        }
+      },
       child: RepaintBoundary(
         child: Container(
         constraints: const BoxConstraints(minHeight: 48),
@@ -668,18 +683,32 @@ class _UpdateBanner extends StatelessWidget {
                       : () async {
                           try {
                             if (downloaded) {
-                              await state.installUpdate();
+                              final msg =
+                                  await state.installUpdate();
+                              if (context.mounted &&
+                                  msg.isNotEmpty) {
+                                await showCrescaToast(
+                                    context, msg);
+                              }
                             } else {
                               final msg =
                                   await state.downloadUpdate();
                               if (context.mounted &&
                                   msg.isNotEmpty) {
-                                ScaffoldMessenger.of(context)
-                                    .showSnackBar(SnackBar(
-                                        content: Text(msg)));
+                                await showCrescaToast(
+                                    context, msg);
                               }
                             }
-                          } catch (_) {}
+                          } catch (e, st) {
+                            await state.crash.log(
+                                'update banner action failed',
+                                e,
+                                st);
+                            if (context.mounted) {
+                              await showCrescaToast(context,
+                                  'Update failed — Retry');
+                            }
+                          }
                         },
                   child: Text(
                       downloaded ? 'Install' : 'Update'),
@@ -792,18 +821,30 @@ class _TopPicks extends StatelessWidget {
                 style: spotifyPlayStyle(),
                 icon: const Icon(Icons.play_arrow),
                 label: const Text('Play all'),
-                onPressed: () => state.actPlay(tracks, 0),
+                onPressed: () async {
+                  if (!await state.actPlay(tracks, 0)) {
+                    if (context.mounted) {
+                      await showCrescaToast(
+                          context, 'Could not play — Retry');
+                    }
+                  }
+                },
               ),
               const SizedBox(width: 8),
               OutlinedButton.icon(
                 icon: const Icon(Icons.shuffle),
                 label: const Text('Shuffle'),
-                onPressed: () {
+                onPressed: () async {
                   final order =
                       List<int>.generate(tracks.length, (i) => i)
                         ..shuffle();
-                  state.actPlay(
-                      [for (final i in order) tracks[i]], 0);
+                  if (!await state.actPlay(
+                      [for (final i in order) tracks[i]], 0)) {
+                    if (context.mounted) {
+                      await showCrescaToast(
+                          context, 'Could not play — Retry');
+                    }
+                  }
                 },
               ),
             ],
@@ -855,8 +896,13 @@ class _PickCard extends StatelessWidget {
     final surface = Theme.of(context).colorScheme.surface;
     return PressScale(
       motionOn: state.motionOn,
-      onTap: () => state.actPlay(queue, index,
-          origin: 'Home'),
+      onTap: () async {
+        if (!await state.actPlay(queue, index, origin: 'Home')) {
+          if (context.mounted) {
+            await showCrescaToast(context, 'Could not play — Retry');
+          }
+        }
+      },
       child: RepaintBoundary(
         child: Column(
           crossAxisAlignment:
@@ -933,7 +979,9 @@ class _Rail extends StatelessWidget {
     try {
       final t = (section.title as String).trim();
       if (t.isNotEmpty) return t;
-    } catch (_) {}
+    } catch (_) {
+      // silent: title probe, falls through to query-derived title
+    }
     try {
       final q = (section.query as String).trim();
       if (q.startsWith('__related__')) return 'Related Mix';
@@ -945,7 +993,9 @@ class _Rail extends StatelessWidget {
           .join(' ')
           .trim();
       if (words.isNotEmpty) return words;
-    } catch (_) {}
+    } catch (_) {
+      // silent: query probe, falls through to default title
+    }
     return 'Top Picks';
   }
 
@@ -953,7 +1003,9 @@ class _Rail extends StatelessWidget {
     try {
       final s = (section.subtitle as String).trim();
       if (s.isNotEmpty) return s;
-    } catch (_) {}
+    } catch (_) {
+      // silent: subtitle probe, default subtitle below
+    }
     return 'YouTube Music';
   }
 
@@ -966,6 +1018,7 @@ class _Rail extends StatelessWidget {
     try {
       tracks = songsOnlyTracks(rail.tracks as List<YtTrack>);
     } catch (_) {
+      // silent: rail filter probe, unparseable rail renders nothing
       return const SizedBox.shrink();
     }
     if (tracks.length < minRailTracks) return const SizedBox.shrink();

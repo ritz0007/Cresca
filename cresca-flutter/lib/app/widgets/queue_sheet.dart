@@ -12,6 +12,7 @@ import '../../core/track.dart';
 import '../app.dart';
 import '../design.dart';
 import '../state.dart';
+import 'cresca_toast.dart';
 import 'track_menu.dart';
 import 'track_row.dart';
 
@@ -34,7 +35,10 @@ Future<void> openQueueSheet(BuildContext context) async {
         ),
       ),
     );
-  } catch (_) {}
+  } catch (e, st) {
+    await logUserFailure(context, 'open queue failed', e, st);
+    await showCrescaToast(context, 'Could not open queue — Retry');
+  }
 }
 
 /// Queue layout language: one gutter, quiet headers, even rows.
@@ -158,7 +162,10 @@ class QueueSheet extends StatelessWidget {
                           .moveInOrder(
                               pos + 1 + a, pos + 1 + b);
                       state.poke();
-                    } catch (_) {}
+                    } catch (e, st) {
+                      state.crash.log(
+                          'queue reorder failed', e, st);
+                    }
                   },
                   itemBuilder: (_, i) {
                     final itemIndex = next[i];
@@ -405,7 +412,9 @@ class _QueueRowState extends State<_QueueRow>
     int ms = 220;
     try {
       ms = widget.state.motionMs(220);
-    } catch (_) {}
+    } catch (_) {
+      // silent: motion probe, 220 ms default is safe
+    }
     _c = AnimationController(
       vsync: this,
       duration: Duration(milliseconds: ms),
@@ -430,7 +439,10 @@ class _QueueRowState extends State<_QueueRow>
           widget.state.controller.engine
               .removeAt(widget.itemIndex);
           widget.state.poke();
-        } catch (_) {}
+        } catch (e, st) {
+          widget.state.crash
+              .log('queue remove failed', e, st);
+        }
       });
       // Safety net: if the reverse never completes (disposed mid
       // reorder), still perform the identical removal — once.
@@ -442,14 +454,20 @@ class _QueueRowState extends State<_QueueRow>
           widget.state.controller.engine
               .removeAt(widget.itemIndex);
           widget.state.poke();
-        } catch (_) {}
+        } catch (e, st) {
+          widget.state.crash
+              .log('queue remove failed', e, st);
+        }
       });
-    } catch (_) {
+    } catch (e, st) {
+      widget.state.crash.log('queue remove failed', e, st);
       try {
         widget.state.controller.engine
             .removeAt(widget.itemIndex);
         widget.state.poke();
-      } catch (_) {}
+      } catch (_) {
+        // silent: engine fallback failed too, already logged above
+      }
     }
   }
 
@@ -475,7 +493,10 @@ class _QueueRowState extends State<_QueueRow>
       onTap: () {
         try {
           state.controller.playAt(itemIndex);
-        } catch (_) {}
+        } catch (e, st) {
+          state.crash.log('queue play failed', e, st);
+          showCrescaToast(context, 'Could not play — Retry');
+        }
       },
       child: Padding(
         padding: const EdgeInsets.fromLTRB(
@@ -586,6 +607,7 @@ class _SuggestedNextState extends State<_SuggestedNext> {
       _dismissed.clear();
       _future = _load(seed!);
     } catch (_) {
+      // silent: suggestion kick only, empty suggestions below
       _future = Future.value(const <YtTrack>[]);
     }
   }
@@ -598,6 +620,7 @@ class _SuggestedNextState extends State<_SuggestedNext> {
             .autoplayFor(seed, max: 20)
             .timeout(const Duration(seconds: 15));
       } catch (_) {
+        // silent: background autoplay fetch, empty pool shows nothing
         pool = const [];
       }
       if (pool.isEmpty) return const [];
@@ -605,7 +628,9 @@ class _SuggestedNextState extends State<_SuggestedNext> {
       try {
         queueIds =
             widget.engine.snapshot().map((e) => e.id).toSet();
-      } catch (_) {}
+      } catch (_) {
+        // silent: snapshot probe, ranker treats queue as empty
+      }
       Map<String, double> affinities = const {};
       try {
         affinities = affinityFor(
@@ -613,19 +638,24 @@ class _SuggestedNextState extends State<_SuggestedNext> {
           recent: widget.state.library.recent,
         );
       } catch (_) {
+        // silent: affinity probe, ranker falls back to pool order
         affinities = const {};
       }
       Map<String, int> skips = const {};
       try {
         skips = Map.of(widget.engine.skipCounts);
-      } catch (_) {}
+      } catch (_) {
+        // silent: skip-count probe, ranker ignores skips
+      }
       Set<String> relatedIds = const {};
       try {
         // Graph head floats: first half of the autoplay pool keeps the
         // repo order signal; the ranker re-scores everything anyway.
         relatedIds =
             pool.take(10).map((e) => e.id).toSet();
-      } catch (_) {}
+      } catch (_) {
+        // silent: related-id probe, ranker proceeds without the signal
+      }
       return rankSuggestions(
         seed: seed,
         pool: pool,
@@ -636,6 +666,7 @@ class _SuggestedNextState extends State<_SuggestedNext> {
         max: 5,
       );
     } catch (_) {
+      // silent: background suggestion rank, empty suggestions below
       return const [];
     }
   }
@@ -643,7 +674,9 @@ class _SuggestedNextState extends State<_SuggestedNext> {
   void _added(YtTrack t) {
     try {
       if (mounted) setState(() => _dismissed.add(t.id));
-    } catch (_) {}
+    } catch (_) {
+      // silent: dismiss-mark only, row already added to the queue
+    }
   }
 
   @override
@@ -677,7 +710,9 @@ class _SuggestedNextState extends State<_SuggestedNext> {
               visible.add(t);
               if (visible.length >= 5) break;
             }
-          } catch (_) {}
+          } catch (_) {
+            // silent: suggestion filter probe, section hides below
+          }
           if (visible.isEmpty) {
             return const SizedBox.shrink();
           }
@@ -726,6 +761,7 @@ class _SuggestedNextState extends State<_SuggestedNext> {
             ],
           );
         } catch (_) {
+          // silent: suggestion section render, hides on bad snapshot
           return const SizedBox.shrink();
         }
       },
@@ -765,7 +801,9 @@ class _SuggestionRowState extends State<_SuggestionRow>
     int ms = 220;
     try {
       ms = widget.state.motionMs(220);
-    } catch (_) {}
+    } catch (_) {
+      // silent: motion probe, 220 ms default is safe
+    }
     _c = AnimationController(
       vsync: this,
       duration: Duration(milliseconds: ms),
@@ -795,17 +833,17 @@ class _SuggestionRowState extends State<_SuggestionRow>
             widget.engine
                 .addToQueue(widget.track);
             widget.state.poke();
-            try {
-              ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                      content:
-                          Text('Added to queue')));
-            } catch (_) {}
+            if (mounted) showCrescaToast(context, 'Added to queue');
           }
-        } catch (_) {}
+        } catch (e, st) {
+          widget.state.crash
+              .log('suggestion add failed', e, st);
+        }
         try {
           widget.onGone(widget.track);
-        } catch (_) {}
+        } catch (_) {
+          // silent: dismiss-mark callback, row already added
+        }
       });
       Future<void>.delayed(
           Duration(milliseconds: waitMs + 120), () {
@@ -818,12 +856,18 @@ class _SuggestionRowState extends State<_SuggestionRow>
                 .addToQueue(widget.track);
             widget.state.poke();
           }
-        } catch (_) {}
+        } catch (e, st) {
+          widget.state.crash
+              .log('suggestion add failed', e, st);
+        }
         try {
           widget.onGone(widget.track);
-        } catch (_) {}
+        } catch (_) {
+          // silent: dismiss-mark callback, row already added
+        }
       });
-    } catch (_) {
+    } catch (e, st) {
+      widget.state.crash.log('suggestion add failed', e, st);
       try {
         if (!widget.engine
             .containsId(widget.track.id)) {
@@ -831,7 +875,9 @@ class _SuggestionRowState extends State<_SuggestionRow>
           widget.state.poke();
         }
         widget.onGone(widget.track);
-      } catch (_) {}
+      } catch (_) {
+        // silent: engine fallback failed too, already logged above
+      }
     }
   }
 
@@ -924,5 +970,9 @@ Future<void> showQueueRowMenu(BuildContext context,
     List<YtTrack> queue) async {
   try {
     await showTrackMenu(context, state, track, queue);
-  } catch (_) {}
+  } catch (e, st) {
+    // Log only: showTrackMenu already toasts its own failures, so a
+    // second toast here would double-announce.
+    state.crash.log('open track menu failed', e, st);
+  }
 }

@@ -18,13 +18,16 @@ import '../../core/motion.dart' show motionMs;
 import '../app.dart';
 import '../design.dart';
 import '../state.dart';
+import 'cresca_toast.dart';
 
 Future<void> openSessionSheet(BuildContext context) async {
   try {
     bool motionOn = true;
     try {
       motionOn = AppScope.of(context).motionOn;
-    } catch (_) {}
+    } catch (_) {
+      // silent: motion probe, animation default (on) is safe
+    }
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -40,7 +43,10 @@ Future<void> openSessionSheet(BuildContext context) async {
         ),
       ),
     );
-  } catch (_) {}
+  } catch (e, st) {
+    await logUserFailure(context, 'open sign-in failed', e, st);
+    await showCrescaToast(context, 'Could not open sign-in — Retry');
+  }
 }
 
 class SessionSheet extends StatefulWidget {
@@ -71,7 +77,9 @@ class _SessionSheetState extends State<SessionSheet> {
           ))
           ..loadRequest(Uri.parse(musicUrl));
         if (mounted) setState(() => _web = c);
-      } catch (_) {}
+      } catch (_) {
+        // silent: WebView init only; login hint covers the retry path
+      }
     });
   }
 
@@ -84,7 +92,9 @@ class _SessionSheetState extends State<SessionSheet> {
         final res = await _web?.runJavaScriptReturningResult(
             'document.cookie');
         raw = res?.toString() ?? '';
-      } catch (_) {}
+      } catch (_) {
+        // silent: jar read fallback, empty header surfaces via login hint
+      }
       final prev = state.ytSession.visitorData;
       final cap = captureCookies(raw, prev);
       await state.ytSession.saveSession(cap.cookies, cap.visitorData);
@@ -98,6 +108,7 @@ class _SessionSheetState extends State<SessionSheet> {
         setState(() => _loginFailed = true);
       }
     } catch (_) {
+      // Surfaced via the inline "No session detected" hint, not a toast.
       if (mounted) setState(() => _loginFailed = true);
     } finally {
       if (mounted) setState(() => _capturing = false);
@@ -109,9 +120,19 @@ class _SessionSheetState extends State<SessionSheet> {
       await state.logoutYouTube();
       try {
         await WebViewCookieManager().clearCookies();
-      } catch (_) {}
+      } catch (_) {
+        // silent: WebView jar clear only, encrypted session already wiped
+      }
+      if (!mounted) return;
+      await showCrescaToast(context, 'Signed out');
       if (mounted) Navigator.pop(context);
-    } catch (_) {}
+    } catch (e, st) {
+      // No pop on fail: the sheet stays so retry stays possible.
+      await state.crash.log('logout wipe failed', e, st);
+      if (mounted) {
+        await showCrescaToast(context, 'Sign-out failed — Retry');
+      }
+    }
   }
 
   @override

@@ -153,6 +153,10 @@ class AppState extends ChangeNotifier {
   /// Pending update (banner source, H9/Y4).
   AppUpdate? pendingUpdate;
   bool updateChecking = false;
+
+  /// Last manual/auto check failed with no usable release (U8: drives
+  /// the 'Update check failed — Retry' banner row copy in Profile).
+  bool updateCheckFailed = false;
   double updateProgress = -1;
 
   /// Appearance: system / light / dark (L4).
@@ -578,18 +582,34 @@ class AppState extends ChangeNotifier {
       try {
         podcastService = PodcastService(
             visitorData: ytSession.visitorData);
-      } catch (_) {}
+      } catch (_) {
+        // silent: podcast client rebuild only, retries on next use
+      }
       notifyListeners();
-    } catch (_) {}
+    } catch (_) {
+      // silent: listener notify only, session values already pushed
+    }
   }
 
   /// YouTube logout: wipes the encrypted session (the sheet clears the
-  /// WebView cookies) and drops session-bound caches.
+  /// WebView cookies) plus session-bound state: PO-token (no
+  /// X-Goog-EOM-Visitor-Id survives logout) and taste seeds. Failures
+  /// are logged; the session API itself is never-throw by design.
   Future<void> logoutYouTube() async {
     try {
       await ytSession.logout();
+      await ytSession.clearPoToken();
+      try {
+        final seeds = File('${filesDir.path}/yt_seeds.json');
+        if (await seeds.exists()) await seeds.delete();
+      } catch (_) {
+        // silent: taste-seed cache only, rebuilt on next login
+      }
       syncSessionToRepo();
-    } catch (_) {}
+    } catch (e, st) {
+      crash.log('logout wipe failed', e, st);
+      rethrow;
+    }
   }
 
   /// Taste seeds pull after login (liked + history, persisted for
@@ -601,19 +621,25 @@ class AppState extends ChangeNotifier {
       final seeds = [...liked, ...history].take(100).toList();
       if (seeds.isEmpty) return;
       final f = File('${filesDir.path}/yt_seeds.json');
-      await atomicWrite(
-          f,
-          jsonEncode([
-            for (final t in seeds)
-              {
-                'id': t.id,
-                'title': t.title,
-                'artist': t.artist,
-                'thumb': t.thumbUrl,
-                'watch': t.watchUrl,
-              },
-          ]));
-    } catch (_) {}
+      try {
+        await atomicWrite(
+            f,
+            jsonEncode([
+              for (final t in seeds)
+                {
+                  'id': t.id,
+                  'title': t.title,
+                  'artist': t.artist,
+                  'thumb': t.thumbUrl,
+                  'watch': t.watchUrl,
+                },
+            ]));
+      } catch (_) {
+        // silent: background taste-seed cache, rebuilt on next login
+      }
+    } catch (_) {
+      // silent: background taste-seed pull, login flow unaffected
+    }
   }
 
   /// Best-effort public Music dir (device-Music downloads switch).
@@ -627,10 +653,13 @@ class AppState extends ChangeNotifier {
         final d = Directory(p);
         try {
           if (d.existsSync()) return d;
-        } catch (_) {}
+        } catch (_) {
+          // silent: candidate probe only, next path tried
+        }
       }
       return Directory('/storage/emulated/0/Music');
     } catch (_) {
+      // silent: path probe only, null falls back to in-app storage
       return null;
     }
   }
@@ -640,7 +669,9 @@ class AppState extends ChangeNotifier {
       downloads.location = value == 'device' ? 'device' : 'app';
       await prefs?.setString('dl_location', downloads.location);
       notifyListeners();
-    } catch (_) {}
+    } catch (_) {
+      // silent: setting persist only, in-memory value already applied
+    }
   }
 
   /// Row-menu Download: resolves the stream URL once, then enqueues a
@@ -656,7 +687,8 @@ class AppState extends ChangeNotifier {
       }
       final ok = await downloads.enqueue(t, url);
       return ok ? 'Download started' : 'Download failed to start';
-    } catch (_) {
+    } catch (e, st) {
+      crash.log('download enqueue failed', e, st);
       return 'Download failed to start';
     }
   }
@@ -666,7 +698,9 @@ class AppState extends ChangeNotifier {
       motionOn = on;
       prefs?.setBool(motionPrefKey, on);
       notifyListeners();
-    } catch (_) {}
+    } catch (_) {
+      // silent: setting persist only, in-memory value already applied
+    }
   }
 
   /// Engine: Fast (InnerTube, default) vs Stable (extractor only).
@@ -677,7 +711,9 @@ class AppState extends ChangeNotifier {
       repo.session.useInnerTube = fast;
       await prefs?.setBool('engine_fast', fast);
       notifyListeners();
-    } catch (_) {}
+    } catch (_) {
+      // silent: setting persist only, in-memory value already applied
+    }
   }
 
   Future<void> setAppearance(String value) async {
@@ -686,7 +722,9 @@ class AppState extends ChangeNotifier {
           value == 'light' || value == 'dark' ? value : 'system';
       await prefs?.setString('appearance', appearance);
       notifyListeners();
-    } catch (_) {}
+    } catch (_) {
+      // silent: setting persist only, in-memory value already applied
+    }
   }
 
   /// Clears network caches (home/search/trending snapshots + stream
@@ -752,6 +790,7 @@ class AppState extends ChangeNotifier {
     try {
       updateChecking = true;
       updateProgress = -1;
+      updateCheckFailed = false;
       notifyListeners();
       final now = DateTime.now().millisecondsSinceEpoch;
       final last = prefs?.getInt('update_last_check') ?? 0;
@@ -759,8 +798,14 @@ class AppState extends ChangeNotifier {
       final rel = await updates.latest();
       try {
         await prefs?.setInt('update_last_check', now);
-      } catch (_) {}
-      if (rel == null) return 'Check failed — try again later';
+      } catch (_) {
+        // silent: throttle persistence only, check result unaffected
+      }
+      if (rel == null) {
+        updateCheckFailed = true;
+        notifyListeners();
+        return 'Update check failed — Retry';
+      }
       final current = await updates.currentVersion();
       if (!isNewerTag(rel.tag, current)) {
         pendingUpdate = null;
@@ -778,19 +823,33 @@ class AppState extends ChangeNotifier {
               final next = {...raw, tag}.toList();
               await prefs?.setStringList(
                   'update_notified_tags', next);
-            } catch (_) {}
+            } catch (_) {
+              // silent: notified-tag persistence only, banner unaffected
+            }
           },
         );
-      } catch (_) {}
+      } catch (e, st) {
+        // Notification is best-effort; the banner still shows the update.
+        crash.log('update notify failed', e, st);
+      }
       notifyListeners();
       return 'Cresca Music ${rel.tag} available';
-    } catch (_) {
-      return 'Check failed — try again later';
+    } catch (e, st) {
+      updateCheckFailed = true;
+      crash.log('update check failed', e, st);
+      try {
+        notifyListeners();
+      } catch (_) {
+        // silent: listener notify only, failure flag already set
+      }
+      return 'Update check failed — Retry';
     } finally {
       updateChecking = false;
       try {
         notifyListeners();
-      } catch (_) {}
+      } catch (_) {
+        // silent: listener notify only, nothing to surface
+      }
     }
   }
 
@@ -801,9 +860,13 @@ class AppState extends ChangeNotifier {
           const Duration(seconds: 10), () async {
         try {
           await checkForUpdates();
-        } catch (_) {}
+        } catch (_) {
+          // silent: background auto-check, surfaced on next manual check
+        }
       }));
-    } catch (_) {}
+    } catch (_) {
+      // silent: timer scheduling only, manual check path unaffected
+    }
   }
 
   /// Local path of the downloaded update APK (when present).
@@ -814,6 +877,7 @@ class AppState extends ChangeNotifier {
       final f = File('${filesDir.path}/Cresca/${u.apkName}');
       return f.existsSync() ? f.path : null;
     } catch (_) {
+      // silent: path probe only, null means "not downloaded"
       return null;
     }
   }
@@ -829,7 +893,9 @@ class AppState extends ChangeNotifier {
           try {
             await launchUrl(Uri.parse(u.pageUrl),
                 mode: LaunchMode.externalApplication);
-          } catch (_) {}
+          } catch (_) {
+            // silent: external browser only, banner stays for retry
+          }
           return 'Opened release page';
         }
         return 'No APK asset for this release';
@@ -842,13 +908,16 @@ class AppState extends ChangeNotifier {
           try {
             updateProgress = p;
             notifyListeners();
-          } catch (_) {}
+          } catch (_) {
+            // silent: progress paint only, download continues
+          }
         },
       );
       updateProgress = -1;
       notifyListeners();
       return ok ? 'Downloading update…' : 'Download failed to start';
-    } catch (_) {
+    } catch (e, st) {
+      crash.log('update download failed', e, st);
       return 'Download failed to start';
     }
   }
@@ -859,8 +928,9 @@ class AppState extends ChangeNotifier {
       if (path == null) return 'APK not downloaded yet';
       final ok = await updates.installApk(path);
       return ok ? 'Opening installer…' : 'Allow installs, then retry';
-    } catch (_) {
-      return 'Install failed';
+    } catch (e, st) {
+      crash.log('update install failed', e, st);
+      return 'Install failed — Retry';
     }
   }
 
@@ -870,14 +940,18 @@ class AppState extends ChangeNotifier {
       if (url.isEmpty) return;
       await launchUrl(Uri.parse(url),
           mode: LaunchMode.externalApplication);
-    } catch (_) {}
+    } catch (e, st) {
+      crash.log('open release page failed', e, st);
+    }
   }
 
   void dismissUpdate() {
     try {
       pendingUpdate = null;
       notifyListeners();
-    } catch (_) {}
+    } catch (_) {
+      // silent: listener notify only, dismiss already applied
+    }
   }
 
   // ---------- JAM (Phase 4, F1–F10 façade) ----------
@@ -2086,13 +2160,13 @@ class AppState extends ChangeNotifier {
   bool get jamPlaybackBlocked =>
       jam.connected && !jam.isHost && !jam.guestAllowed;
 
-  Future<void> actPlay(List<YtTrack> context, int index,
+  Future<bool> actPlay(List<YtTrack> context, int index,
       {String? origin}) async {
     try {
       if (jamPlaybackBlocked) {
         jam.statusLine = 'Only the host controls the JAM';
         notifyListeners();
-        return;
+        return true;
       }
       if (origin != null && origin.isNotEmpty) {
         playOrigin = origin;
@@ -2105,34 +2179,46 @@ class AppState extends ChangeNotifier {
       }
       unawaited(precacheAroundPlay());
       notifyListeners();
-    } catch (_) {}
+      return true;
+    } catch (e, st) {
+      crash.log('play failed', e, st);
+      return false;
+    }
   }
 
-  Future<void> actPlayNext(YtTrack t) async {
+  Future<bool> actPlayNext(YtTrack t) async {
     try {
       if (jamPlaybackBlocked) {
         // Wishes welcome: queue-top rides the room's add path.
         unawaited(jam.guestQueueAdd(t));
         jam.statusLine = 'Only the host controls the JAM';
         notifyListeners();
-        return;
+        return true;
       }
       controller.engine.playNext(t);
       notifyListeners();
-    } catch (_) {}
+      return true;
+    } catch (e, st) {
+      crash.log('play-next failed', e, st);
+      return false;
+    }
   }
 
-  Future<void> actAddToQueue(YtTrack t) async {
+  Future<bool> actAddToQueue(YtTrack t) async {
     try {
       if (jamPlaybackBlocked) {
         unawaited(jam.guestQueueAdd(t));
         jam.statusLine = 'Song sent to the host for approval';
         notifyListeners();
-        return;
+        return true;
       }
       controller.engine.addToQueue(t);
       notifyListeners();
-    } catch (_) {}
+      return true;
+    } catch (e, st) {
+      crash.log('add to queue failed', e, st);
+      return false;
+    }
   }
 
   Future<void> actToggleLike(YtTrack t) async {
@@ -2141,8 +2227,12 @@ class AppState extends ChangeNotifier {
       notifyListeners();
       try {
         await controller.handler.broadcastState();
-      } catch (_) {}
-    } catch (_) {}
+      } catch (_) {
+        // silent: media-session broadcast only, library state applied
+      }
+    } catch (e, st) {
+      crash.log('toggle like failed', e, st);
+    }
   }
 
   Future<String?> actShare(YtTrack t) async {
@@ -2150,7 +2240,8 @@ class AppState extends ChangeNotifier {
       final text = '${t.title} — ${t.displayArtist()}\n${t.watchUrl}';
       await SharePlus.instance.share(ShareParams(text: text));
       return null;
-    } catch (e) {
+    } catch (e, st) {
+      crash.log('share failed', e, st);
       return e.toString();
     }
   }
@@ -2160,7 +2251,9 @@ class AppState extends ChangeNotifier {
       final uri = Uri.tryParse(t.watchUrl);
       if (uri == null) return;
       await launchUrl(uri, mode: LaunchMode.externalApplication);
-    } catch (_) {}
+    } catch (e, st) {
+      crash.log('open in YouTube failed', e, st);
+    }
   }
 
   String _json(Map<String, dynamic> root) {

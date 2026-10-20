@@ -14,6 +14,7 @@ import '../../core/motion.dart' as motion;
 import '../../core/queue.dart';
 import '../../core/track.dart';
 import '../state.dart';
+import 'cresca_toast.dart';
 import 'jam_sheet.dart';
 import 'player_sheet.dart';
 
@@ -56,7 +57,10 @@ Future<void> showTrackMenu(BuildContext context, AppState state,
         ),
       ),
     );
-  } catch (_) {}
+  } catch (e, st) {
+    await logUserFailure(context, 'open track menu failed', e, st);
+    await showCrescaToast(context, 'Could not open menu — Retry');
+  }
 }
 
 /// Overflow sheet: the remaining actions with identical callbacks.
@@ -72,7 +76,7 @@ Future<void> _showTrackMenuOverflow(
         message: Text(track.displayArtist(),
             maxLines: 1, overflow: TextOverflow.ellipsis),
         actions: [
-          _actShare(sheet, state, track, motionOn, 0),
+          _actShare(sheet, context, state, track, motionOn, 0),
           _actStartRadio(sheet, state, track, motionOn, 1),
           _actOpenYouTube(sheet, state, track, motionOn, 2),
           _actShuffle(sheet, context, state, motionOn, 3),
@@ -86,7 +90,11 @@ Future<void> _showTrackMenuOverflow(
         ),
       ),
     );
-  } catch (_) {}
+  } catch (e, st) {
+    await logUserFailure(
+        context, 'open track overflow failed', e, st);
+    await showCrescaToast(context, 'Could not open menu — Retry');
+  }
 }
 
 CupertinoActionSheetAction _actPlay(
@@ -98,10 +106,13 @@ CupertinoActionSheetAction _actPlay(
     bool motionOn,
     int index) {
   return CupertinoActionSheetAction(
-    onPressed: () {
+    onPressed: () async {
       Navigator.pop(sheet);
-      state.actPlay(contextQueue,
+      final ok = await state.actPlay(contextQueue,
           contextQueue.indexWhere((e) => e.id == track.id));
+      if (!ok && context.mounted) {
+        await showCrescaToast(context, 'Could not play — Retry');
+      }
     },
     child: _m(const Text('Play'), index, motionOn),
   );
@@ -115,7 +126,7 @@ CupertinoActionSheetAction _actPlayNext(
     bool motionOn,
     int index) {
   return CupertinoActionSheetAction(
-    onPressed: () {
+    onPressed: () async {
       Navigator.pop(sheet);
       // No dupes: relocating an existing row is announced distinctly
       // so "Will play next" always means a fresh insert.
@@ -130,18 +141,33 @@ CupertinoActionSheetAction _actPlayNext(
                 peek < engine.items.length) {
               peekId = engine.items[peek].id;
             }
-          } catch (_) {}
+          } catch (_) {
+            // silent: peek probe only, falls through to default insert
+          }
           if (peekId == track.id) {
             _toast(context, 'Already up next');
             return;
           }
-          state.actPlayNext(track);
-          _toast(context, 'Moved to play next');
+          if (!await state.actPlayNext(track) && context.mounted) {
+            await showCrescaToast(
+                context, 'Could not play next — Retry');
+          } else {
+            _toast(context, 'Moved to play next');
+          }
           return;
         }
-      } catch (_) {}
-      state.actPlayNext(track);
-      _toast(context, 'Will play next');
+      } catch (e, st) {
+        // Probe failed but the insert below still runs; log only.
+        state.crash.log('play-next probe failed', e, st);
+      }
+      if (!await state.actPlayNext(track)) {
+        if (context.mounted) {
+          await showCrescaToast(
+              context, 'Could not play next — Retry');
+        }
+      } else {
+        _toast(context, 'Will play next');
+      }
     },
     child: _m(const Text('Play next'), index, motionOn),
   );
@@ -155,7 +181,7 @@ CupertinoActionSheetAction _actAddToQueue(
     bool motionOn,
     int index) {
   return CupertinoActionSheetAction(
-    onPressed: () {
+    onPressed: () async {
       Navigator.pop(sheet);
       // No dupes: a second tap announces instead of duplicating.
       try {
@@ -163,9 +189,17 @@ CupertinoActionSheetAction _actAddToQueue(
           _toast(context, 'Already in queue');
           return;
         }
-      } catch (_) {}
-      state.actAddToQueue(track);
-      _toast(context, 'Added to queue');
+      } catch (_) {
+        // silent: contains probe only, falls through to default add
+      }
+      if (!await state.actAddToQueue(track)) {
+        if (context.mounted) {
+          await showCrescaToast(
+              context, "Couldn't add to queue — Retry");
+        }
+      } else {
+        _toast(context, 'Added to queue');
+      }
     },
     child: _m(const Text('Add to queue'), index, motionOn),
   );
@@ -200,7 +234,13 @@ CupertinoActionSheetAction _actDownload(
       try {
         final msg = await state.actDownload(track);
         if (context.mounted) _toast(context, msg);
-      } catch (_) {}
+      } catch (e, st) {
+        await state.crash.log('download enqueue failed', e, st);
+        if (context.mounted) {
+          await showCrescaToast(
+              context, 'Download failed to start — Retry');
+        }
+      }
     },
     child: _m(
         Text(state.downloads.isDownloaded(track.id)
@@ -228,12 +268,19 @@ CupertinoActionSheetAction _actLike(
 }
 
 CupertinoActionSheetAction _actShare(
-    BuildContext sheet, AppState state, YtTrack track, bool motionOn,
+    BuildContext sheet,
+    BuildContext context,
+    AppState state,
+    YtTrack track,
+    bool motionOn,
     int index) {
   return CupertinoActionSheetAction(
-    onPressed: () {
+    onPressed: () async {
       Navigator.pop(sheet);
-      state.actShare(track);
+      final err = await state.actShare(track);
+      if (err != null && context.mounted) {
+        await showCrescaToast(context, "Couldn't share — try again");
+      }
     },
     child: _m(const Text('Share'), index, motionOn),
   );
@@ -266,7 +313,7 @@ CupertinoActionSheetAction _actOpenYouTube(
 CupertinoActionSheetAction _actShuffle(BuildContext sheet,
     BuildContext context, AppState state, bool motionOn, int index) {
   return CupertinoActionSheetAction(
-    onPressed: () {
+    onPressed: () async {
       try {
         final engine = state.controller.engine;
         final m = engine.cycleShuffle();
@@ -288,7 +335,13 @@ CupertinoActionSheetAction _actShuffle(BuildContext sheet,
           _toast(context,
               'Shuffle: ${m == shuffleOff ? 'off' : m == shuffleSmart ? 'smart' : 'on'}');
         }
-      } catch (_) {}
+      } catch (e, st) {
+        state.crash.log('shuffle toggle failed', e, st);
+        if (context.mounted) {
+          await showCrescaToast(
+              context, 'Could not change shuffle — Retry');
+        }
+      }
     },
     child: _m(
         Text(
@@ -301,7 +354,7 @@ CupertinoActionSheetAction _actShuffle(BuildContext sheet,
 CupertinoActionSheetAction _actRepeat(BuildContext sheet,
     BuildContext context, AppState state, bool motionOn, int index) {
   return CupertinoActionSheetAction(
-    onPressed: () {
+    onPressed: () async {
       try {
         final engine = state.controller.engine;
         engine.cycleRepeat();
@@ -310,7 +363,13 @@ CupertinoActionSheetAction _actRepeat(BuildContext sheet,
           _toast(context,
               'Repeat: ${engine.repeatMode == repeatOff ? 'off' : engine.repeatMode == repeatAll ? 'all' : 'one'}');
         }
-      } catch (_) {}
+      } catch (e, st) {
+        state.crash.log('repeat toggle failed', e, st);
+        if (context.mounted) {
+          await showCrescaToast(
+              context, 'Could not change repeat — Retry');
+        }
+      }
     },
     child: _m(
         Text(
@@ -332,7 +391,13 @@ CupertinoActionSheetAction _actVideo(
       Navigator.pop(sheet);
       try {
         await openPlayerSheet(context, video: true);
-      } catch (_) {}
+      } catch (e, st) {
+        await logUserFailure(context, 'open video failed', e, st);
+        if (context.mounted) {
+          await showCrescaToast(
+              context, 'Could not open player — Retry');
+        }
+      }
     },
     child: _m(const Text('Video'), index, motionOn),
   );
@@ -370,7 +435,13 @@ Future<void> showPlaylistPicker(
                     await state.library.createPlaylist(name);
                 await state.library.addToPlaylist(p.id, track);
                 if (context.mounted) _toast(context, 'Saved');
-              } catch (_) {}
+              } catch (e, st) {
+                await state.crash.log('playlist create failed', e, st);
+                if (context.mounted) {
+                  await showCrescaToast(
+                      context, "Couldn't save — Retry");
+                }
+              }
             },
             child: _m(const Text('New playlist'), 0, motionOn),
           ),
@@ -381,7 +452,13 @@ Future<void> showPlaylistPicker(
                 try {
                   await state.library.addToPlaylist(p.id, track);
                   if (context.mounted) _toast(context, 'Saved');
-                } catch (_) {}
+                } catch (e, st) {
+                  await state.crash.log('playlist add failed', e, st);
+                  if (context.mounted) {
+                    await showCrescaToast(
+                        context, "Couldn't save — Retry");
+                  }
+                }
               },
               child: _m(
                   Text('${p.name} (${p.tracks.length})'),
@@ -395,7 +472,11 @@ Future<void> showPlaylistPicker(
         ),
       ),
     );
-  } catch (_) {}
+  } catch (e, st) {
+    await logUserFailure(
+        context, 'open playlist picker failed', e, st);
+    await showCrescaToast(context, 'Could not open menu — Retry');
+  }
 }
 
 Future<String?> _askName(BuildContext context) async {
@@ -450,6 +531,7 @@ Future<String?> _askName(BuildContext context) async {
     final t = (name ?? '').trim();
     return t.isEmpty ? null : t;
   } catch (_) {
+    // silent: name prompt only; null cancels the create, picker retries
     return null;
   }
 }
@@ -458,15 +540,13 @@ bool _isIOS(BuildContext context) {
   try {
     return Theme.of(context).platform == TargetPlatform.iOS;
   } catch (_) {
+    // silent: platform probe, Material fallback is correct default
     return false;
   }
 }
 
 void _toast(BuildContext context, String message) {
-  try {
-    ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text(message)));
-  } catch (_) {}
+  showCrescaToast(context, message);
 }
 
 /// Menu entrance helper: one-shot fade + 8px rise per action, 180ms

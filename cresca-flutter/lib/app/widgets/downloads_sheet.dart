@@ -11,6 +11,7 @@ import '../app.dart';
 import '../design.dart';
 import '../downloads.dart';
 import '../state.dart';
+import 'cresca_toast.dart';
 import 'track_row.dart';
 
 Future<void> openDownloadsSheet(BuildContext context) async {
@@ -18,7 +19,9 @@ Future<void> openDownloadsSheet(BuildContext context) async {
     bool motionOn = true;
     try {
       motionOn = AppScope.of(context).motionOn;
-    } catch (_) {}
+    } catch (_) {
+      // silent: motion probe, animation default (on) is safe
+    }
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -34,7 +37,10 @@ Future<void> openDownloadsSheet(BuildContext context) async {
         ),
       ),
     );
-  } catch (_) {}
+  } catch (e, st) {
+    await logUserFailure(context, 'open downloads failed', e, st);
+    await showCrescaToast(context, 'Could not open downloads — Retry');
+  }
 }
 
 class DownloadsSheet extends StatefulWidget {
@@ -77,18 +83,31 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
       DownloadEntry? entry;
       try {
         entry = state.downloads.rows[track.id];
-      } catch (_) {}
+      } catch (_) {
+        // silent: row snapshot probe, restore proceeds without it
+      }
       trashed = _TrashedDownload(
           path: file.path, bytes: bytes, entry: entry);
       _trash[track.id] = trashed;
-    } catch (_) {}
+    } catch (e, st) {
+      await state.crash.log('download stash failed', e, st);
+    }
     try {
       await state.downloads.delete(track.id);
-    } catch (_) {}
+    } catch (e, st) {
+      await state.crash.log('download delete failed', e, st);
+      if (context.mounted) {
+        await showCrescaToast(
+            context, "Couldn't delete download — Retry");
+      }
+      return;
+    }
     try {
       SemanticsService.sendAnnouncement(
           View.of(context), 'Deleted ${track.title}', direction);
-    } catch (_) {}
+    } catch (_) {
+      // silent: screen-reader announcement only, Undo bar still shows
+    }
     try {
       messenger.clearSnackBars();
       messenger
@@ -109,7 +128,10 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
         // Grace period over — drop the stash.
         _trash.remove(track.id);
       });
-    } catch (_) {}
+    } catch (e, st) {
+      await state.crash
+          .log('download undo bar failed', e, st);
+    }
   }
 
   Future<void> _restore(BuildContext context, AppState state,
@@ -120,30 +142,37 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
       final f = File(trashed.path);
       try {
         await f.parent.create(recursive: true);
-      } catch (_) {}
+      } catch (_) {
+        // silent: dir probe, write below recreates or fails loudly
+      }
       await f.writeAsBytes(trashed.bytes, flush: true);
       if (trashed.entry != null) {
         try {
           state.downloads.rows[trackId] = trashed.entry!;
-        } catch (_) {}
+        } catch (_) {
+          // silent: row snapshot probe, file restore already done
+        }
       }
       try {
         state.downloads.onChanged?.call();
-      } catch (_) {}
+      } catch (_) {
+        // silent: change notify only, file restore already done
+      }
       try {
         SemanticsService.sendAnnouncement(View.of(context),
             'Restored $title', Directionality.of(context));
-      } catch (_) {}
-      try {
-        ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Restored $title')));
-      } catch (_) {}
-    } catch (_) {
-      try {
-        ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-                content: Text('Could not restore download')));
-      } catch (_) {}
+      } catch (_) {
+        // silent: screen-reader announcement only
+      }
+      if (context.mounted) {
+        await showCrescaToast(context, 'Restored $title');
+      }
+    } catch (e, st) {
+      await state.crash.log('download restore failed', e, st);
+      if (context.mounted) {
+        await showCrescaToast(
+            context, 'Could not restore download — Retry');
+      }
     }
   }
 
@@ -346,7 +375,12 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
                     onTap: () {
                       try {
                         state.controller.playQueue([track], 0);
-                      } catch (_) {}
+                      } catch (e, st) {
+                        state.crash.log(
+                            'offline play failed', e, st);
+                        showCrescaToast(
+                            context, 'Could not play — Retry');
+                      }
                     },
                   ),
                   ),

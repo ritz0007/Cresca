@@ -10,6 +10,7 @@ import 'package:flutter/material.dart';
 
 import '../../core/track.dart';
 import '../app.dart';
+import 'cresca_toast.dart';
 import 'track_menu.dart';
 
 /// One-shot cascade entrance: fade + 12px rise, 220ms, 40ms stagger.
@@ -61,7 +62,9 @@ class _StaggerEntranceState extends State<StaggerEntrance> {
       bool on = true;
       try {
         on = AppScope.of(context).motionOn;
-      } catch (_) {}
+      } catch (_) {
+        // silent: motion probe, animation default (on) is safe
+      }
       if (!mounted) return;
       if (!on) {
         setState(() => _in = true);
@@ -85,7 +88,9 @@ class _StaggerEntranceState extends State<StaggerEntrance> {
     bool on = true;
     try {
       on = AppScope.of(context).motionOn;
-    } catch (_) {}
+    } catch (_) {
+      // silent: motion probe, animation default (on) is safe
+    }
     // Long-tail bypass: no controllers/timers/implicit animations
     // past the cap — the row paints once and rests.
     if (!on || widget.index >= StaggerEntrance.maxItems) {
@@ -129,7 +134,9 @@ class _PressScaleState extends State<_PressScale> {
     bool on = true;
     try {
       on = AppScope.of(context).motionOn;
-    } catch (_) {}
+    } catch (_) {
+      // silent: motion probe, animation default (on) is safe
+    }
     if (!on) return widget.child;
     final d = Duration(milliseconds: AppScope.of(context).motionMs(120));
     return Listener(
@@ -182,7 +189,9 @@ class TrackRow extends StatelessWidget {
           try {
             currentId = state.controller.engine.current?.id;
             playing = state.controller.player.playing;
-          } catch (_) {}
+          } catch (_) {
+            // silent: engine probe, row renders non-current state
+          }
           final isCurrent = currentId != null && currentId == track.id;
           // Row sits on the theme surface: title/subtitle derive
           // from onSurface / onSurfaceVariant. Green stays only on
@@ -254,10 +263,14 @@ class TrackRow extends StatelessWidget {
                   ),
                 ),
                 onTap: onTap ??
-                    () {
-                      try {
-                        state.actPlay(contextQueue, index, origin: origin);
-                      } catch (_) {}
+                    () async {
+                      if (!await state.actPlay(contextQueue, index,
+                          origin: origin)) {
+                        if (context.mounted) {
+                          await showCrescaToast(context,
+                              'Could not play — Retry');
+                        }
+                      }
                     },
               ),
             ),

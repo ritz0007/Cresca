@@ -12,6 +12,7 @@ import '../../audio/system_volume.dart';
 import '../app.dart';
 import '../design.dart';
 import 'audio_pipeline_sheet.dart';
+import 'cresca_toast.dart';
 import 'jam_sheet.dart';
 
 Future<void> openAudioOutputSheet(BuildContext context) async {
@@ -19,7 +20,9 @@ Future<void> openAudioOutputSheet(BuildContext context) async {
     bool motionOn = true;
     try {
       motionOn = AppScope.of(context).motionOn;
-    } catch (_) {}
+    } catch (_) {
+      // silent: motion probe, animation default (on) is safe
+    }
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -38,7 +41,10 @@ Future<void> openAudioOutputSheet(BuildContext context) async {
         ),
       ),
     );
-  } catch (_) {}
+  } catch (e, st) {
+    await logUserFailure(context, 'open audio output failed', e, st);
+    await showCrescaToast(context, 'Could not open audio output — Retry');
+  }
 }
 
 class _AudioOutputSheet extends StatelessWidget {
@@ -304,6 +310,7 @@ class _VolumeCardState extends State<_VolumeCard> {
     try {
       yield await SystemVolume.level();
     } catch (_) {
+      // silent: level probe, full-volume default, watch stream corrects
       yield 1.0;
     }
     yield* SystemVolume.watch();
@@ -378,7 +385,12 @@ class _VolumeCardState extends State<_VolumeCard> {
                             try {
                               SystemVolume.setLevel(
                                   nv);
-                            } catch (_) {}
+                            } catch (_) {
+                              // silent: fire-and-forget platform call,
+                              // no AppState here to log with; the
+                              // level stream re-emits the true value
+                              // so the thumb self-corrects
+                            }
                           }
                         : null,
                   ),

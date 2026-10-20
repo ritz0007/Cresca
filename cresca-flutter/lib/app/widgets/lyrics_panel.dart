@@ -19,6 +19,7 @@ import '../../data/lyrics.dart';
 import '../../data/translate.dart';
 import '../app.dart';
 import '../design.dart';
+import 'cresca_toast.dart';
 
 /// Opaque stand-in for the black88 toast/panel surface, for contrast
 /// math ([textOn]/[subtextOn] need an opaque background color).
@@ -80,10 +81,14 @@ class _LyricsSectionState extends State<LyricsSection> {
   void dispose() {
     try {
       _http?.close();
-    } catch (_) {}
+    } catch (_) {
+      // silent: client close only, dispose continues
+    }
     try {
       _explode?.close();
-    } catch (_) {}
+    } catch (_) {
+      // silent: extractor close only, dispose continues
+    }
     super.dispose();
   }
 
@@ -102,6 +107,7 @@ class _LyricsSectionState extends State<LyricsSection> {
       if (res.statusCode < 200 || res.statusCode >= 300) return null;
       return res.body;
     } catch (_) {
+      // silent: caption leg, null falls through to the next lyrics leg
       return null;
     }
   }
@@ -138,6 +144,7 @@ class _LyricsSectionState extends State<LyricsSection> {
                 ? decoded.cast<String, dynamic>()
                 : null;
           } catch (_) {
+            // silent: player-post leg, null falls through to next leg
             return null;
           }
         },
@@ -172,10 +179,13 @@ class _LyricsSectionState extends State<LyricsSection> {
           if (lines.length >= 3) {
             return LyricsSynced(lines, LyricSource.youtubeCaptions);
           }
-        } catch (_) {}
+        } catch (_) {
+          // silent: one caption track failed, next track tried
+        }
       }
       return const LyricsNotFound();
     } catch (_) {
+      // silent: NewPipe leg, NotFound falls through to LRCLIB leg
       return const LyricsNotFound();
     }
   }
@@ -188,7 +198,9 @@ class _LyricsSectionState extends State<LyricsSection> {
         if (mounted) setState(() => _state = const LyricsNotFound());
         return;
       }
-    } catch (_) {}
+    } catch (_) {
+      // silent: episode probe, fetch cascade decides by content
+    }
     setState(() => _state = const LyricsLoading());
     widget.onLines?.call(const []);
     if (!force) {
@@ -222,8 +234,11 @@ class _LyricsSectionState extends State<LyricsSection> {
       _publish(res);
       try {
         AppScope.of(context).lyricsMemo[widget.track.id] = res;
-      } catch (_) {}
+      } catch (_) {
+        // silent: memo write only, panel state already updated
+      }
     } catch (_) {
+      // silent: load cascade, NotFound state renders the empty face
       if (mounted) setState(() => _state = const LyricsNotFound());
     }
   }
@@ -235,7 +250,9 @@ class _LyricsSectionState extends State<LyricsSection> {
       } else {
         widget.onLines?.call(const []);
       }
-    } catch (_) {}
+    } catch (_) {
+      // silent: preview callback only, karaoke state already updated
+    }
   }
 
   /// "Change" retry (attribution row): clears BOTH memos for this track
@@ -252,13 +269,19 @@ class _LyricsSectionState extends State<LyricsSection> {
       final s = _state;
       if (s is LyricsSynced) before = s.source;
       if (s is LyricsPlain) before = s.source;
-    } catch (_) {}
+    } catch (_) {
+      // silent: state read probe, 'none' compares as changed
+    }
     try {
       AppScope.of(context).lyricsMemo.remove(widget.track.id);
-    } catch (_) {}
+    } catch (_) {
+      // silent: memo clear best-effort, LRU clear below still forces refetch
+    }
     try {
       clearLyricsMemo();
-    } catch (_) {}
+    } catch (_) {
+      // silent: LRU clear best-effort, force flag still bypasses session memo
+    }
     await _load(true);
     if (!mounted) return;
     final s = _state;
@@ -403,13 +426,17 @@ class _SyncedBodyState extends State<_SyncedBody> {
     var v = 0;
     try {
       v = lyricOffsetMs(widget.track.id);
-    } catch (_) {}
+    } catch (_) {
+      // silent: offset read probe, 0 keeps current timing
+    }
     try {
       final saved = AppScope.of(context)
           .prefs
           ?.getInt(lyricOffsetPrefKey(widget.track.id));
       if (saved != null) v = setLyricOffsetMs(widget.track.id, saved);
-    } catch (_) {}
+    } catch (_) {
+      // silent: prefs read probe, memory value stands
+    }
     if (!mounted) return;
     if (v != _offsetMs) setState(() => _offsetMs = v);
   }
@@ -421,7 +448,9 @@ class _SyncedBodyState extends State<_SyncedBody> {
       await AppScope.of(context)
           .prefs
           ?.setInt(lyricOffsetPrefKey(widget.track.id), v);
-    } catch (_) {}
+    } catch (_) {
+      // silent: offset persist only, in-memory timing already applied
+    }
   }
 
   /// Rebuilds display lines from [alt] text, keeping the original
@@ -509,7 +538,9 @@ class _SyncedBodyState extends State<_SyncedBody> {
       }
       try {
         _hinglishLines ??= _remap(roman);
-      } catch (_) {}
+      } catch (_) {
+        // silent: romanize memo probe, rebuild retries below
+      }
       if (mounted) setState(() => _mode = m);
       return;
     }
@@ -537,7 +568,9 @@ class _SyncedBodyState extends State<_SyncedBody> {
             break;
           }
         }
-      } catch (_) {}
+      } catch (_) {
+        // silent: compare probe, 'same' keeps the offline notice path
+      }
       if (same) {
         _LyricTools.toast(
             context, 'Translation unavailable offline');
@@ -553,8 +586,9 @@ class _SyncedBodyState extends State<_SyncedBody> {
         _englishLines = _remap(out);
         _mode = m;
       });
-    } catch (_) {
+    } catch (e, st) {
       if (!mounted) return;
+      await logUserFailure(context, 'lyrics translate failed', e, st);
       _LyricTools.toast(
           context, 'Translation unavailable offline');
       setState(() {
@@ -577,11 +611,15 @@ class _SyncedBodyState extends State<_SyncedBody> {
           WidgetsBinding.instance.addPostFrameCallback((_) {
             try {
               cb(disp);
-            } catch (_) {}
+            } catch (_) {
+              // silent: preview callback only, karaoke display unaffected
+            }
           });
         }
       }
-    } catch (_) {}
+    } catch (_) {
+      // silent: publish guard, next build republishes on change
+    }
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -634,35 +672,8 @@ class _LyricTools extends StatelessWidget {
       required this.onOffset});
 
   static void toast(BuildContext context, String msg) {
-    try {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        behavior: SnackBarBehavior.floating,
-        backgroundColor: Colors.black.withValues(alpha: 0.88),
-        shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(14)),
-        content: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: 26,
-              height: 26,
-              decoration: const BoxDecoration(
-                shape: BoxShape.circle,
-                color: Color(0xFFFA243C),
-              ),
-              child: Icon(Icons.graphic_eq,
-                  color: textOn(crescaRed), size: 15),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Text(msg,
-                  style: TextStyle(
-                      color: textOn(_panelBg), fontSize: 13)),
-            ),
-          ],
-        ),
-      ));
-    } catch (_) {}
+    // U8: single shared style/placement above the bottom chrome.
+    showCrescaToast(context, msg);
   }
 
   @override
@@ -790,7 +801,9 @@ class _LyricTools extends StatelessWidget {
                         -lyricOffsetMaxMs, lyricOffsetMaxMs);
                     onOffset(v);
                     setSheet(() {});
-                  } catch (_) {}
+                  } catch (_) {
+                    // silent: timing stepper, pure int math + setState
+                  }
                 },
                 child: AnimatedContainer(
                   duration: Duration(milliseconds: pillMs),
@@ -878,7 +891,9 @@ class _LyricTools extends StatelessWidget {
                             v = 0;
                             onOffset(0);
                             setSheet(() {});
-                          } catch (_) {}
+                          } catch (_) {
+                            // silent: timing reset, pure int + setState
+                          }
                         },
                   child: Text('Reset',
                       style: TextStyle(
@@ -1025,7 +1040,9 @@ class _KaraokeViewState extends State<_KaraokeView> {
         live.add('lyr-${l.startMs}-$n');
       }
       _keys.removeWhere((k, _) => !live.contains(k));
-    } catch (_) {}
+    } catch (_) {
+      // silent: key-prune probe, stale keys harmless (GlobalKey cache)
+    }
   }
 
   String _stemFor(int i) {
@@ -1047,6 +1064,7 @@ class _KaraokeViewState extends State<_KaraokeView> {
     try {
       return _keys.putIfAbsent(_stemFor(i), () => GlobalKey());
     } catch (_) {
+      // silent: key-cache probe, index fallback below is identical
       return _keys.putIfAbsent('lyr-idx-$i', () => GlobalKey());
     }
   }
@@ -1070,7 +1088,9 @@ class _KaraokeViewState extends State<_KaraokeView> {
           alignment: 0.4,
           duration: Duration(milliseconds: _rollMs),
           curve: Curves.easeInOut);
-    } catch (_) {}
+    } catch (_) {
+      // silent: karaoke auto-scroll probe, next lyric tick retries
+    }
   }
 
   @override
@@ -1082,7 +1102,9 @@ class _KaraokeViewState extends State<_KaraokeView> {
               n.dragDetails != null) {
             _lastManual = DateTime.now();
           }
-        } catch (_) {}
+        } catch (_) {
+          // silent: scroll notification probe, auto-scroll unaffected
+        }
         return false;
       },
       child: Container(
@@ -1117,7 +1139,9 @@ class _KaraokeViewState extends State<_KaraokeView> {
             // post-frame auto-scroll (avoids context reads off-build).
             try {
               _rollMs = state.motionMs(lyricRollMs);
-            } catch (_) {}
+            } catch (_) {
+              // silent: motion probe, cached duration stands
+            }
             var cur = 0;
             final off = widget.offsetMs;
             for (var i = 0; i < widget.lines.length; i++) {
@@ -1165,19 +1189,28 @@ class _KaraokeViewState extends State<_KaraokeView> {
                   scaler = MediaQuery.textScalerOf(context)
                       .scale(1.0)
                       .clamp(1.0, 1.3);
-                } catch (_) {}
+                } catch (_) {
+                  // silent: text-scaler probe, unscaled type is safe
+                }
                 return GestureDetector(
                   key: _keyFor(i),
                   behavior: HitTestBehavior.opaque,
-                  onTap: () {
+                  onTap: () async {
                     try {
                       // Offset applies on top: seek lands on the
                       // shifted (heard) moment, timings preserved.
-                      state.controller.player.seek(Duration(
+                      await state.controller.player.seek(Duration(
                           milliseconds: effectiveLyricMs(
                               line.startMs,
                               widget.offsetMs)));
-                    } catch (_) {}
+                    } catch (e, st) {
+                      await state.crash
+                          .log('lyric seek failed', e, st);
+                      if (mounted) {
+                        await showCrescaToast(
+                            context, 'Could not seek — Retry');
+                      }
+                    }
                   },
                   // Karaoke highlight crossfade (AnimatedContainer,
                   // 280ms) + active-line roll (AnimatedSwitcher with

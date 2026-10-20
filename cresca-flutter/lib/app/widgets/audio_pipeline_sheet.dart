@@ -20,6 +20,7 @@ import '../../core/track.dart';
 import '../app.dart';
 import '../design.dart';
 import '../state.dart';
+import 'cresca_toast.dart';
 
 /// Solid dialog background for the pipeline card. All text in this
 /// sheet derives from textOn/subtextOn against this color (never
@@ -52,7 +53,11 @@ Future<void> openAudioPipelineSheet(
         ),
       ),
     );
-  } catch (_) {}
+  } catch (e, st) {
+    await logUserFailure(context, 'open audio pipeline failed', e, st);
+    await showCrescaToast(
+        context, 'Could not open audio pipeline — Retry');
+  }
 }
 
 class _PipelineCard extends StatefulWidget {
@@ -91,12 +96,16 @@ class _PipelineCardState extends State<_PipelineCard> {
     try {
       final prefsOn = _fx.enabled;
       if (mounted) setState(() => _eqOn = prefsOn);
-    } catch (_) {}
+    } catch (_) {
+      // silent: EQ pref probe, switch keeps its default until attach
+    }
     int? current;
     try {
       current = state.controller.player
           .androidAudioSessionId;
-    } catch (_) {}
+    } catch (_) {
+      // silent: session probe, attach retries on the id stream below
+    }
     await _attach(current);
     try {
       _sessionSub = state.controller.player
@@ -109,9 +118,13 @@ class _PipelineCardState extends State<_PipelineCard> {
               mounted) {
             _attach(sid);
           }
-        } catch (_) {}
+        } catch (_) {
+          // silent: session listener probe, next id event retries
+        }
       });
-    } catch (_) {}
+    } catch (_) {
+      // silent: session stream subscribe only, one-shot attach above ran
+    }
   }
 
   Future<void> _attach(int? sid) async {
@@ -122,7 +135,9 @@ class _PipelineCardState extends State<_PipelineCard> {
     });
     try {
       await _fx.attach(sid ?? 0);
-    } catch (_) {}
+    } catch (_) {
+      // silent: effect attach best-effort, sheet reports device default
+    }
     if (!mounted) return;
     setState(() {
       _attaching = false;
@@ -134,7 +149,9 @@ class _PipelineCardState extends State<_PipelineCard> {
   void dispose() {
     try {
       _sessionSub?.cancel();
-    } catch (_) {}
+    } catch (_) {
+      // silent: subscription cancel only, dispose continues
+    }
     super.dispose();
   }
 
@@ -146,7 +163,9 @@ class _PipelineCardState extends State<_PipelineCard> {
     AppState? state;
     try {
       state = AppScope.of(context);
-    } catch (_) {}
+    } catch (_) {
+      // silent: scope probe, sheet renders device defaults without it
+    }
     return Padding(
       padding:
           const EdgeInsets.fromLTRB(20, 20, 20, 12),
@@ -262,7 +281,9 @@ class _PipelineCardState extends State<_PipelineCard> {
                 onPressed: () {
                   try {
                     Navigator.of(context).pop();
-                  } catch (_) {}
+                  } catch (_) {
+                    // silent: dialog dismiss only, nothing to surface
+                  }
                 },
                 child: Text('Done',
                     style: TextStyle(

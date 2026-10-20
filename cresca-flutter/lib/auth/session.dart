@@ -79,7 +79,9 @@ class YtSession {
       cookies = await _store.read(key: _kCookies) ?? '';
       visitorData = await _store.read(key: _kVisitor) ?? '';
       poToken = await _store.read(key: _kPoToken) ?? '';
-    } catch (_) {}
+    } catch (_) {
+      // silent: storage read only, empty session means signed out
+    }
   }
 
   bool get isLoggedIn => cookiesLoggedIn(cookies);
@@ -90,14 +92,18 @@ class YtSession {
       visitorData = visitor;
       await _store.write(key: _kCookies, value: rawCookies);
       await _store.write(key: _kVisitor, value: visitor);
-    } catch (_) {}
+    } catch (_) {
+      // silent: best-effort persist, in-memory session already applied
+    }
   }
 
   Future<void> savePoToken(String token) async {
     try {
       poToken = token;
       await _store.write(key: _kPoToken, value: token);
-    } catch (_) {}
+    } catch (_) {
+      // silent: best-effort persist, in-memory token already applied
+    }
   }
 
   /// Logout wipes the encrypted session (WebView cookies cleared by
@@ -108,7 +114,9 @@ class YtSession {
       visitorData = '';
       await _store.delete(key: _kCookies);
       await _store.delete(key: _kVisitor);
-    } catch (_) {}
+    } catch (_) {
+      // silent: best-effort wipe, in-memory session already cleared
+    }
   }
 
   /// Clears the cached PO-token (BotGuard short-lived; native keeps it
@@ -117,7 +125,9 @@ class YtSession {
     try {
       poToken = '';
       await _store.delete(key: _kPoToken);
-    } catch (_) {}
+    } catch (_) {
+      // silent: best-effort wipe, in-memory token already cleared
+    }
   }
 }
 
@@ -185,6 +195,8 @@ Map<String, String> filteredHeaders(
     }
     out['User-Agent'] = userAgent;
     if (cookie.trim().isNotEmpty) out['Cookie'] = cookie;
-  } catch (_) {}
+  } catch (_) {
+    // silent: header-map probe, caller falls back to minimal headers
+  }
   return out;
 }

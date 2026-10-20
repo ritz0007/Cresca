@@ -10,6 +10,7 @@ import '../../core/track.dart';
 import '../app.dart';
 import '../library.dart';
 import '../state.dart';
+import '../widgets/cresca_toast.dart';
 import '../widgets/track_row.dart';
 import 'library_screen.dart' show MosaicArt;
 
@@ -18,7 +19,13 @@ Future<void> openPlaylistScreen(
   try {
     await Navigator.of(context).push(MaterialPageRoute(
         builder: (_) => PlaylistScreen(playlistId: playlistId)));
-  } catch (_) {}
+  } catch (e, st) {
+    await logUserFailure(context, 'open playlist failed', e, st);
+    if (context.mounted) {
+      await showCrescaToast(
+          context, 'Could not open playlist — Retry');
+    }
+  }
 }
 
 class PlaylistScreen extends StatefulWidget {
@@ -38,6 +45,7 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
       return state.library.playlists
           .firstWhere((p) => p.id == widget.playlistId);
     } catch (_) {
+      // silent: lookup miss, empty state renders below
       return null;
     }
   }
@@ -70,7 +78,9 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
             if (pool.any((e) => e.id == h.id)) continue;
             pool.add(h);
           }
-        } catch (_) {}
+        } catch (_) {
+          // silent: one related leg failed, next track tried
+        }
         if (pool.length >= 24) break;
       }
       // Repository new-release scoring (round-robin per artist).
@@ -83,7 +93,9 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
             if (pool.any((e) => e.id == h.id)) continue;
             pool.add(h);
           }
-        } catch (_) {}
+        } catch (_) {
+          // silent: new-release leg failed, artist search feeds below
+        }
       }
       // Artist-search fallback (always runs; feeds thin graphs too).
       for (final a in artists) {
@@ -94,7 +106,9 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
             if (pool.any((e) => e.id == h.id)) continue;
             pool.add(h);
           }
-        } catch (_) {}
+        } catch (_) {
+          // silent: one artist search failed, next artist tried
+        }
       }
       final inPlaylist = p.tracks.map((e) => e.id).toSet();
       var clean = songsOnlyTracks(pool)
@@ -108,9 +122,13 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
             relatedIds: relatedIds,
           );
         }
-      } catch (_) {}
+      } catch (_) {
+        // silent: rank probe, unranked pool order stands
+      }
       if (mounted) setState(() => _suggested = clean.take(12).toList());
-    } catch (_) {}
+    } catch (_) {
+      // silent: suggestion build, section hides on empty pool
+    }
     if (mounted) setState(() => _suggesting = false);
   }
 
@@ -162,7 +180,12 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
       if (name == null) return;
       await state.library.renamePlaylist(p.id, name);
       if (mounted) setState(() {});
-    } catch (_) {}
+    } catch (e, st) {
+      await state.crash.log('playlist rename failed', e, st);
+      if (context.mounted) {
+        await showCrescaToast(context, "Couldn't rename — Retry");
+      }
+    }
   }
 
   Future<void> _delete(
@@ -205,13 +228,19 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
       if (yes != true) return;
       await state.library.deletePlaylist(p.id);
       if (mounted) Navigator.pop(context);
-    } catch (_) {}
+    } catch (e, st) {
+      await state.crash.log('playlist delete failed', e, st);
+      if (context.mounted) {
+        await showCrescaToast(context, "Couldn't delete — Retry");
+      }
+    }
   }
 
   bool _isIOS(BuildContext context) {
     try {
       return Theme.of(context).platform == TargetPlatform.iOS;
     } catch (_) {
+      // silent: platform probe, Material fallback is correct default
       return false;
     }
   }
@@ -313,8 +342,16 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
                                           const Text('Play'),
                                       onPressed: p.tracks.isEmpty
                                           ? null
-                                          : () => state.actPlay(
-                                              p.tracks, 0),
+                                          : () async {
+                                              if (!await state.actPlay(
+                                                  p.tracks, 0)) {
+                                                if (context.mounted) {
+                                                  await showCrescaToast(
+                                                      context,
+                                                      'Could not play — Retry');
+                                                }
+                                              }
+                                            },
                                     ),
                                     const SizedBox(width: 8),
                                     OutlinedButton.icon(
@@ -324,19 +361,25 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
                                           'Shuffle'),
                                       onPressed: p.tracks.isEmpty
                                           ? null
-                                          : () {
+                                          : () async {
                                               final order =
                                                   List<int>.generate(
                                                       p.tracks.length,
                                                       (i) => i)
                                                 ..shuffle();
-                                              state.actPlay(
+                                              if (!await state.actPlay(
                                                   [
                                                     for (final i
                                                         in order)
                                                       p.tracks[i]
                                                   ],
-                                                  0);
+                                                  0)) {
+                                                if (context.mounted) {
+                                                  await showCrescaToast(
+                                                      context,
+                                                      'Could not play — Retry');
+                                                }
+                                              }
                                             },
                                     ),
                                   ],
@@ -364,14 +407,24 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
                           try {
                             await state.library.removeFromPlaylist(
                                 p.id, removed.id);
-                          } catch (_) {}
+                          } catch (e, st) {
+                            await state.crash.log(
+                                'playlist remove failed', e, st);
+                            if (context.mounted) {
+                              await showCrescaToast(context,
+                                  "Couldn't remove — Retry");
+                            }
+                            return;
+                          }
                           if (!context.mounted) return;
                           try {
                             SemanticsService.sendAnnouncement(
                                 View.of(context),
                                 'Removed ${removed.title}. Undo available.',
                                 TextDirection.ltr);
-                          } catch (_) {}
+                          } catch (_) {
+                            // silent: screen-reader announcement only
+                          }
                           if (!context.mounted) return;
                           ScaffoldMessenger.of(context)
                               .showSnackBar(
@@ -398,8 +451,21 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
                                           at.clamp(0,
                                               p.tracks.length),
                                           removed);
-                                    } catch (_) {}
-                                  } catch (_) {}
+                                    } catch (_) {
+                                      // silent: order fix-up only,
+                                      // restore already persisted
+                                    }
+                                  } catch (e, st) {
+                                    await state.crash.log(
+                                        'playlist undo failed',
+                                        e,
+                                        st);
+                                    if (context.mounted) {
+                                      await showCrescaToast(
+                                          context,
+                                          'Could not restore — Retry');
+                                    }
+                                  }
                                   if (mounted) {
                                     setState(() {});
                                   }
