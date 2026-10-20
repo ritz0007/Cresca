@@ -17,10 +17,12 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
+import '../../core/search_guard.dart';
 import '../../core/track.dart';
 import '../app.dart';
 import '../state.dart';
 import '../widgets/player_sheet.dart';
+import '../widgets/state_widgets.dart';
 import '../widgets/track_row.dart';
 
 class SearchScreen extends StatefulWidget {
@@ -41,6 +43,11 @@ class _SearchScreenState extends State<SearchScreen> {
   bool _loading = false;
   String _query = '';
   bool _focused = false;
+
+  /// Last transport failure (the query that failed). Rows are never
+  /// cleared on error: stale rows stay visible under an inline banner,
+  /// and the full ErrorRetry shows only when the cache is empty.
+  String _searchError = '';
 
   /// Stale-query guard: every [_run] bumps [_gen]; late arrivals whose
   /// generation mismatches are dropped. The repo has no cancel token,
@@ -85,6 +92,20 @@ class _SearchScreenState extends State<SearchScreen> {
   void _onChanged(String value, AppState state) {
     try {
       _debounce?.cancel();
+      // Invalidate in-flight runs upstream of debounce: every keystroke
+      // retires the previous generation, so only the latest query may
+      // paint (the text check in _run covers the pre-fire window).
+      _gen++;
+      // Stale lane guard: the previous query's artists stay painted
+      // while the new query loads — drop them on every keystroke
+      // (the fresh lane rebuilds in _run). A new keystroke also
+      // retires any previous transport error.
+      if ((_artists.isNotEmpty || _searchError.isNotEmpty) && mounted) {
+        setState(() {
+          _artists = [];
+          _searchError = '';
+        });
+      }
       // Instant cached results first (S1): session-mem paints
       // synchronously (zero async gap), then disk snapshots refresh.
       try {
@@ -123,9 +144,11 @@ class _SearchScreenState extends State<SearchScreen> {
         if (mounted) {
           setState(() {
             _rows = [];
+            _cachedFirst = [];
             _artists = [];
             _loading = false;
             _query = '';
+            _searchError = '';
           });
         }
         return;
@@ -165,16 +188,50 @@ class _SearchScreenState extends State<SearchScreen> {
       // The channel lane only needs the query; its track-derived
       // fallback is rebuilt locally below, so no rows are passed up
       // front and nothing is lost.
+      //
+      // searchNow rethrows transport errors (single caller): a failure
+      // keeps the stale rows and raises _searchError — error reads as
+      // "couldn't load", never as empty.
+      List<YtTrack> rawHits;
+      // Futures are constructed before the guarded await so both lanes
+      // fly together; transport failure is caught below.
       final hitsF = state.searchNow(q);
       final artistsF = state.artistsFor(q, const <YtTrack>[]);
-      final rawHits = await hitsF;
-      if (!mounted || g != _gen || _text.text.trim() != q) return;
+      try {
+        rawHits = await hitsF;
+        if (!mounted ||
+            !searchGenPaintable(
+                gen: g,
+                currentGen: _gen,
+                fieldText: _text.text.trim(),
+                query: q)) {
+          return;
+        }
+      } catch (e, st) {
+        try {
+          unawaited(state.crash.log('search failed: $q', e, st));
+        } catch (_) {}
+        // Never clear on error: stale rows stay, banner/Retry raises.
+        if (!mounted || g != _gen) return;
+        setState(() {
+          _loading = false;
+          _searchError = q;
+        });
+        return;
+      }
       final hits = _songsOnly(rawHits);
       var artists = <YtArtist>[];
       try {
         artists = await artistsF;
       } catch (_) {}
-      if (!mounted || g != _gen || _text.text.trim() != q) return;
+      if (!mounted ||
+          !searchGenPaintable(
+              gen: g,
+              currentGen: _gen,
+              fieldText: _text.text.trim(),
+              query: q)) {
+        return;
+      }
       if (artists.isEmpty) artists = _artistsFromTracks(hits);
       _rememberMem(q, hits);
       if (!mounted || g != _gen) return;
@@ -182,6 +239,7 @@ class _SearchScreenState extends State<SearchScreen> {
         _rows = hits;
         _artists = artists;
         _loading = false;
+        _searchError = '';
       });
       if (kDebugMode) {
         debugPrint('[search] query="$q" network '
@@ -269,21 +327,26 @@ class _SearchScreenState extends State<SearchScreen> {
   Widget build(BuildContext context) {
     final state = AppScope.of(context);
     final scheme = Theme.of(context).colorScheme;
-    final shown = _rows.isEmpty ? _cachedFirst : _rows;
+    final shown =
+        searchShownRows(query: _query, rows: _rows, cached: _cachedFirst);
     final switchMs = state.motionMs(180);
     // Keyboard inset: the scrollable list pads by viewInsets.bottom so
     // the keyboard never covers the tail rows.
     final kb = MediaQuery.of(context).viewInsets.bottom;
     // Body phase drives the crossfade: idle → loading (skeleton) →
-    // results → empty. Keyed child so AnimatedSwitcher blends states.
+    // results → empty. Transport failure with an empty cache is its
+    // own 'error' phase (full ErrorRetry); failure over stale rows
+    // keeps 'results' with an inline banner on top.
+    final bool failed = _searchError.isNotEmpty && shown.isEmpty;
     final String phase;
-    if (_loading && shown.isEmpty) {
+    if (_loading && shown.isEmpty && !failed) {
       phase = 'loading';
     } else if (shown.isEmpty) {
-      phase = _query.isEmpty ? 'idle' : 'empty';
+      phase = _query.isEmpty ? 'idle' : (failed ? 'error' : 'empty');
     } else {
       phase = 'results';
     }
+    final bool staleBanner = _searchError.isNotEmpty && shown.isNotEmpty;
     return Scaffold(
       appBar: AppBar(
         // iOS search field (CupertinoSearchTextField carries its own
@@ -351,54 +414,33 @@ class _SearchScreenState extends State<SearchScreen> {
           if (_suggestions.isNotEmpty && _text.text.trim().isNotEmpty)
             ConstrainedBox(
               constraints: const BoxConstraints(maxHeight: 192),
-              child: ListView.builder(
-                shrinkWrap: true,
+              // Plain Column, not a nested scrollable list inside the page
+              // scroll (U6 de-nest).
+              child: SingleChildScrollView(
                 padding:
                     const EdgeInsets.symmetric(horizontal: 12),
-                itemCount: _suggestions.length > 4
-                    ? 4
-                    : _suggestions.length,
-                itemBuilder: (_, i) {
-                  final s = _suggestions[i];
-                  return Semantics(
-                    button: true,
-                    label: 'Search for $s',
-                    child: InkWell(
-                      borderRadius: BorderRadius.circular(8),
-                      onTap: () {
-                        _text.text = s;
-                        _text.selection = TextSelection.collapsed(
-                            offset: s.length);
-                        setState(() => _suggestions = []);
-                        _run(s, state);
-                      },
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 4, vertical: 10),
-                        child: Row(
-                          children: [
-                            Icon(Icons.search,
-                                size: 20,
-                                color: scheme.onSurfaceVariant),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              child: Text(s,
-                                  maxLines: 1,
-                                  overflow:
-                                      TextOverflow.ellipsis,
-                                  style: TextStyle(
-                                      color:
-                                          scheme.onSurface)),
-                            ),
-                            Icon(Icons.north_west,
-                                size: 18,
-                                color: scheme.onSurfaceVariant),
-                          ],
-                        ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    for (var i = 0;
+                        i <
+                            (_suggestions.length > 4
+                                ? 4
+                                : _suggestions.length);
+                        i++)
+                      _SuggestionRow(
+                        text: _suggestions[i],
+                        onTap: () {
+                          final s = _suggestions[i];
+                          _text.text = s;
+                          _text.selection = TextSelection.collapsed(
+                              offset: s.length);
+                          setState(() => _suggestions = []);
+                          _run(s, state);
+                        },
                       ),
-                    ),
-                  );
-                },
+                  ],
+                ),
               ),
             ),
           if (_artists.isNotEmpty)
@@ -412,7 +454,11 @@ class _SearchScreenState extends State<SearchScreen> {
                 itemCount: _artists.length,
                 itemBuilder: (_, i) {
                   final a = _artists[i];
-                  return GestureDetector(
+                  // U6: artist rows carry a TalkBack label (U10 verifies).
+                  return Semantics(
+                    button: true,
+                    label: 'Artist ${a.name}',
+                    child: GestureDetector(
                     onTap: () {
                       // Tapping an artist opens its page (was: re-ran a
                       // "<name> songs" text search, so the tap never
@@ -491,16 +537,30 @@ class _SearchScreenState extends State<SearchScreen> {
                         ),
                       ),
                     ),
+                    ),
                   );
                 },
               ),
             ),
           Expanded(
-            child: AnimatedSwitcher(
-              duration: Duration(milliseconds: switchMs),
-              transitionBuilder: (child, anim) =>
-                  FadeTransition(opacity: anim, child: child),
-              child: _phaseBody(phase, shown, state, kb, context),
+            child: Column(
+              children: [
+                // Inline banner over stale rows after a failed refresh;
+                // full ErrorRetry (error phase) when the cache is empty.
+                if (staleBanner)
+                  InlineRetryBanner(
+                    onRetry: () => _run(_text.text, state),
+                  ),
+                Expanded(
+                  child: AnimatedSwitcher(
+                    duration: Duration(milliseconds: switchMs),
+                    transitionBuilder: (child, anim) =>
+                        FadeTransition(opacity: anim, child: child),
+                    child:
+                        _phaseBody(phase, shown, state, kb, context),
+                  ),
+                ),
+              ],
             ),
           ),
         ],
@@ -510,7 +570,7 @@ class _SearchScreenState extends State<SearchScreen> {
 
   Widget _phaseBody(String phase, List<YtTrack> shown, AppState state,
       double kb, BuildContext context) {
-    // Live measured chrome clearance (210 fallback pre-measure) plus
+    // Live measured chrome clearance (estimator fallback pre-measure) plus
     // the keyboard inset so the tail rows clear both.
     final clearance = BottomChromeScope.clearanceOf(context);
     switch (phase) {
@@ -521,17 +581,31 @@ class _SearchScreenState extends State<SearchScreen> {
           itemCount: 8,
           itemBuilder: (_, _) => const TrackSkeleton(),
         );
+      case 'error':
+        // Transport failure, cache empty: deck copy names the scope,
+        // Retry re-runs the field text. Never conflated with empty.
+        return ErrorRetry(
+          key: ValueKey('search-error-$_query'),
+          message: "Couldn't load search for '$_query' — check connection",
+          onRetry: () => _run(_text.text, state),
+        );
       case 'empty':
-        return _SearchEmpty(
+        // True empty always echoes the query; one action clears it.
+        return EmptyState(
           key: ValueKey('search-empty-$_query'),
           icon: Icons.music_off_outlined,
-          text: 'No results — try another query',
+          title: "No results for '$_query'",
+          actionLabel: 'Clear',
+          onAction: () {
+            _text.clear();
+            _run('', state);
+          },
         );
       case 'idle':
-        return const _SearchEmpty(
+        return const EmptyState(
           key: ValueKey('search-idle'),
           icon: Icons.search_outlined,
-          text: 'Search for songs and artists',
+          title: 'Search for songs and artists',
         );
       case 'results':
       default:
@@ -554,62 +628,45 @@ class _SearchScreenState extends State<SearchScreen> {
   }
 }
 
-/// Gentle empty-state: fade + scale 0.97→1 in, one-shot, static when
-/// motion is off. Transform/opacity only.
-class _SearchEmpty extends StatefulWidget {
-  final IconData icon;
+/// One tappable query-completion row (extracted so the suggestion lane
+/// is a plain Column, not a nested scrollable). Never throws.
+class _SuggestionRow extends StatelessWidget {
   final String text;
-  const _SearchEmpty({super.key, required this.icon, required this.text});
-
-  @override
-  State<_SearchEmpty> createState() => _SearchEmptyState();
-}
-
-class _SearchEmptyState extends State<_SearchEmpty> {
-  bool _in = false;
-
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) setState(() => _in = true);
-    });
-  }
+  final VoidCallback onTap;
+  const _SuggestionRow({required this.text, required this.onTap});
 
   @override
   Widget build(BuildContext context) {
-    bool on = true;
-    int ms = 220;
-    try {
-      final s = AppScope.of(context);
-      on = s.motionOn;
-      ms = s.motionMs(220);
-    } catch (_) {}
-    final body = Center(
-      child: Padding(
-        padding: const EdgeInsets.all(32),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(widget.icon,
-                size: 56,
-                color: Theme.of(context)
-                    .colorScheme
-                    .onSurfaceVariant),
-            const SizedBox(height: 12),
-            Text(widget.text, textAlign: TextAlign.center),
-          ],
+    final scheme = Theme.of(context).colorScheme;
+    return Semantics(
+      button: true,
+      label: 'Search for $text',
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: () {
+          try {
+            onTap();
+          } catch (_) {}
+        },
+        child: Padding(
+          padding:
+              const EdgeInsets.symmetric(horizontal: 4, vertical: 10),
+          child: Row(
+            children: [
+              Icon(Icons.search,
+                  size: 20, color: scheme.onSurfaceVariant),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(text,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(color: scheme.onSurface)),
+              ),
+              Icon(Icons.north_west,
+                  size: 18, color: scheme.onSurfaceVariant),
+            ],
+          ),
         ),
-      ),
-    );
-    if (!on) return body;
-    return AnimatedOpacity(
-      duration: Duration(milliseconds: ms),
-      opacity: _in ? 1 : 0,
-      child: AnimatedScale(
-        duration: Duration(milliseconds: ms),
-        scale: _in ? 1.0 : 0.97,
-        child: body,
       ),
     );
   }

@@ -115,7 +115,8 @@ void main() {
           isNull);
       expect(songCacheFile('home_top'), 'yt_home_top.json');
       expect(searchCacheTtlMs, 30 * 60 * 1000);
-      expect(trendingCacheTtlMs, 7 * 24 * 60 * 60 * 1000);
+      // Charts go stale after 1 day (was 7): reopen shows new songs.
+      expect(trendingCacheTtlMs, 24 * 60 * 60 * 1000);
     });
 
     test('empty id rows + empty lists load null', () {

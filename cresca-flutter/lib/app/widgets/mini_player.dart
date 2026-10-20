@@ -31,13 +31,24 @@ class _MiniBodyHost extends StatefulWidget {
   State<_MiniBodyHost> createState() => _MiniPlayerState();
 }
 
-class _MiniPlayerState extends State<_MiniBodyHost>
-    with SingleTickerProviderStateMixin {
-  double _dx = 0;
-  bool _peekLeft = false;
-  bool _peekRight = false;
+class _MiniPlayerState extends State<_MiniBodyHost> {
+  // Swipe offset: ValueNotifier so finger ticks rebuild only the offset
+  // transform (via ValueListenableBuilder), never the whole mini player.
+  // Peek chevrons derive from the same value — no extra setState.
+  final ValueNotifier<double> _dx = ValueNotifier(0);
   bool _pressed = false;
   YtTrack? _lastTrack;
+  // Guards the exit-collapse timer so a rebuild storm schedules one,
+  // not one per build.
+  bool _collapseScheduled = false;
+
+  @override
+  void dispose() {
+    try {
+      _dx.dispose();
+    } catch (_) {}
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -70,17 +81,25 @@ class _MiniPlayerState extends State<_MiniBodyHost>
     if (!hasTrack) {
       // Collapse the slot after the exit fade finishes so an empty
       // queue leaves no invisible gap (re-entry cancels via _lastTrack
-      // being repopulated above).
-      Future<void>.delayed(
-          Duration(milliseconds: enterMs + 60), () {
-        if (!mounted) return;
-        try {
-          if (widget.state.controller.engine.current == null &&
-              _lastTrack != null) {
-            setState(() => _lastTrack = null);
-          }
-        } catch (_) {}
-      });
+      // being repopulated above). One timer max: this runs in build.
+      if (!_collapseScheduled) {
+        _collapseScheduled = true;
+        final wait = enterMs + 60;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          Future<void>.delayed(Duration(milliseconds: wait), () {
+            if (!mounted) return;
+            try {
+              if (widget.state.controller.engine.current == null &&
+                  _lastTrack != null) {
+                setState(() => _lastTrack = null);
+              }
+            } catch (_) {}
+            _collapseScheduled = false;
+          });
+        });
+      }
+    } else {
+      _collapseScheduled = false;
     }
     // Swipe gestures live on the whole card; the expand tap lives
     // only on the art+title region so the IconButtons below sit
@@ -96,28 +115,24 @@ class _MiniPlayerState extends State<_MiniBodyHost>
         } catch (_) {}
       },
       onHorizontalDragUpdate: (d) {
+        // Direct 1:1 tracking: notifier rebuilds only the translate +
+        // peek chevrons below, never the whole card.
         try {
-          setState(() {
-            _dx = (_dx + d.delta.dx).clamp(-96.0, 96.0);
-            _peekLeft = _dx < -24;
-            _peekRight = _dx > 24;
-          });
+          _dx.value =
+              (_dx.value + d.delta.dx).clamp(-96.0, 96.0);
         } catch (_) {}
       },
       onHorizontalDragEnd: (d) {
         try {
           final v = d.primaryVelocity ?? 0;
-          if (_dx < -48 || v < -400) {
+          final dx = _dx.value;
+          if (dx < -48 || v < -400) {
             state.controller.next();
-          } else if (_dx > 48 || v > 400) {
+          } else if (dx > 48 || v > 400) {
             state.controller.previous();
           }
-          // Glide + snap-back.
-          setState(() {
-            _dx = 0;
-            _peekLeft = false;
-            _peekRight = false;
-          });
+          // Snap-back is immediate: no glide tween chasing the finger.
+          _dx.value = 0;
         } catch (_) {}
       },
       // Entrance/exit: 12px slide + fade (~220ms, transform/opacity
@@ -139,32 +154,36 @@ class _MiniPlayerState extends State<_MiniBodyHost>
                   // Bottom gutter is 0 here: it sits directly above the floating
                   // tab bar (own 10dp gutter), so the two read as one chrome unit.
                   padding: const EdgeInsets.fromLTRB(12, 4, 12, 0),
-                  child: AnimatedContainer(
-                    duration:
-                        Duration(milliseconds: state.motionMs(180)),
-                    transform: Matrix4.translationValues(_dx, 0, 0),
-                    // Tap press-scale 0.94 / 120ms (transform only).
-                    child: AnimatedScale(
-                      duration: Duration(
-                          milliseconds: state.motionMs(pressMs)),
-                      curve: Curves.easeOut,
-                      scale: _pressed ? pressedScale : 1.0,
-                      child: Glass(
-                        radius: 16,
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Padding(
-                              padding: const EdgeInsets.fromLTRB(
-                                  4, 6, 4, 6),
-                              child: Row(
-                              children: [
-                                if (_peekRight)
-                                  const Padding(
-                                    padding: EdgeInsets.only(left: 4),
-                                    child: Icon(Icons.chevron_left,
-                                        size: 18),
-                                  ),
+                  // Direct transform tracking: only this subtree rebuilds
+                  // per finger tick; no tween chases the swipe.
+                  child: ValueListenableBuilder<double>(
+                    valueListenable: _dx,
+                    builder: (_, dx, _) => Transform.translate(
+                      offset: Offset(dx, 0),
+                      // No AnimatedContainer here: its implicit 180ms tween
+                      // lagged behind the finger during swipe.
+                      // Tap press-scale 0.94 / 120ms (transform only).
+                      child: AnimatedScale(
+                        duration: Duration(
+                            milliseconds: state.motionMs(pressMs)),
+                        curve: Curves.easeOut,
+                        scale: _pressed ? pressedScale : 1.0,
+                        child: Glass(
+                          radius: 16,
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Padding(
+                                padding: const EdgeInsets.fromLTRB(
+                                    4, 6, 4, 6),
+                                child: Row(
+                                children: [
+                                  if (dx > 24)
+                                    const Padding(
+                                      padding: EdgeInsets.only(left: 4),
+                                      child: Icon(Icons.chevron_left,
+                                          size: 18),
+                                    ),
                                 Expanded(
                                   child: Semantics(
                                     button: true,
@@ -240,12 +259,16 @@ class _MiniPlayerState extends State<_MiniBodyHost>
                                 final playing =
                                     snap.data?.playing ??
                                     state.controller.player.playing;
-                                final loading =
-                                    snap.data?.processingState ==
-                                        ProcessingState.loading ||
-                                    snap.data?.processingState ==
-                                        ProcessingState.buffering ||
-                                    state.controller.resolving;
+                                // Spinner only while silent: rebuffering-
+                                // but-audible keeps the pause button
+                                // (tappable) instead of a stuck spinner —
+                                // same gate as the player transport.
+                                final loading = !playing &&
+                                    (snap.data?.processingState ==
+                                            ProcessingState.loading ||
+                                        snap.data?.processingState ==
+                                            ProcessingState.buffering ||
+                                        state.controller.resolving);
                                 if (loading) {
                                   return Row(
                                     mainAxisSize:
@@ -366,7 +389,7 @@ class _MiniPlayerState extends State<_MiniBodyHost>
                     ],
                   ),
                 ),
-                    if (_peekLeft)
+                    if (dx < -24)
                       const Padding(
                         padding: EdgeInsets.only(right: 4),
                         child: Icon(Icons.chevron_right, size: 18),
@@ -391,6 +414,7 @@ class _MiniPlayerState extends State<_MiniBodyHost>
         ),
       ),
     ),
+  ),
   ),
   ),
   ),
@@ -458,18 +482,14 @@ class _Progress extends StatelessWidget {
         final f = total.inMilliseconds <= 0
             ? 0.0
             : (pos.inMilliseconds / total.inMilliseconds).clamp(0.0, 1.0);
-        // Smooth the bar between position ticks (no setState storms:
-        // the stream drives rebuilds, TweenAnimationBuilder eases the
-        // painted value between them; transform/opacity-free paint).
-        return TweenAnimationBuilder<double>(
-          duration: Duration(milliseconds: state.motionMs(200)),
-          curve: Curves.linear,
-          tween: Tween<double>(begin: 0, end: f),
-          builder: (_, value, _) => ExcludeSemantics(
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(2),
-              child: LinearProgressIndicator(
-              value: value,
+        // Direct value: the old TweenAnimationBuilder restarted from 0
+        // on every position tick (begin: 0), so the bar lagged and
+        // flickered instead of tracking playback.
+        return ExcludeSemantics(
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(2),
+            child: LinearProgressIndicator(
+            value: f,
               minHeight: 2.5,
               backgroundColor: Theme.of(context)
                   .colorScheme
@@ -481,83 +501,10 @@ class _Progress extends StatelessWidget {
                     .onSurface
                     .withValues(alpha: 0.9),
               ),
-              ),
             ),
           ),
         );
       },
     );
   }
-}
-
-/// Equalizer bars while sounding (visual only — no haptics anywhere).
-class _EqBars extends StatefulWidget {
-  final bool running;
-  const _EqBars({required this.running});
-
-  @override
-  State<_EqBars> createState() => _EqBarsState();
-}
-
-class _EqBarsState extends State<_EqBars> with SingleTickerProviderStateMixin {
-  late final AnimationController _c;
-
-  @override
-  void initState() {
-    super.initState();
-    _c = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 700),
-    )..repeat(reverse: true);
-  }
-
-  @override
-  void dispose() {
-    _c.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    bool motionOn = true;
-    try {
-      motionOn = AppScope.of(context).motionOn;
-    } catch (_) {}
-    // Kill-switch: freeze on static bars instead of repeating.
-    if (!widget.running || !motionOn) {
-      try {
-        if (_c.isAnimating) _c.stop();
-      } catch (_) {}
-      return const SizedBox(width: 18, height: 18);
-    }
-    try {
-      if (!_c.isAnimating) {
-        _c.repeat(reverse: true);
-      }
-    } catch (_) {}
-    final color = Theme.of(context).colorScheme.primary;
-    return AnimatedBuilder(
-      animation: _c,
-      builder: (_, _) => SizedBox(
-        width: 18,
-        height: 18,
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-          crossAxisAlignment: CrossAxisAlignment.end,
-          children: [
-            _bar(color, 4 + 10 * _c.value),
-            _bar(color, 4 + 10 * (1 - _c.value)),
-            _bar(color, 4 + 10 * ((_c.value + 0.3) % 1)),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _bar(Color color, double h) => Container(
-    width: 3,
-    height: h,
-    color: color,
-    margin: const EdgeInsets.only(bottom: 2),
-  );
 }

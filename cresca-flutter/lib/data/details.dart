@@ -102,6 +102,31 @@ class DetailsStore {
   final Map<String, VideoDetails> memo = {};
   VideoDetails? current;
 
+  /// Memo budget: 200 videoIds, LRU (oldest evicted first).
+  static const int memoCap = 200;
+
+  VideoDetails? _memoGet(String key) {
+    try {
+      final hit = memo.remove(key);
+      if (hit == null) return null;
+      memo[key] = hit; // refresh recency
+      return hit;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  void _memoPut(String key, VideoDetails d) {
+    try {
+      if (key.isEmpty) return;
+      memo.remove(key);
+      memo[key] = d;
+      while (memo.length > memoCap) {
+        memo.remove(memo.keys.first);
+      }
+    } catch (_) {}
+  }
+
   YoutubeExplode _explode() {
     final e = _yt;
     if (e != null) return e;
@@ -121,28 +146,20 @@ class DetailsStore {
 
   Future<VideoDetails?> load(String watchUrl) async {
     try {
-      final hit = memo[watchUrl];
+      // Canonical key: videoId only (deep-link / restored-queue URL forms
+      // share one row, so repeat opens skip the extractor).
+      final key = extractVideoId(watchUrl) ?? watchUrl;
+      final hit = _memoGet(key);
       if (hit != null) {
         current = hit;
         return hit;
       }
-      // Bundle memo is keyed by videoId (rememberMeta at resolve):
-      // zero requests after playback, even for deep links / restored
-      // queues whose watchUrl form differs.
-      try {
-        final vid = extractVideoId(watchUrl);
-        final byId = vid != null ? memo[vid] : null;
-        if (byId != null) {
-          current = byId;
-          return byId;
-        }
-      } catch (_) {}
       final v = await _explode()
           .videos
           .get(watchUrl)
           .timeout(const Duration(seconds: 30));
       final d = detailsFromVideo(v);
-      if (d != null) memo[watchUrl] = d;
+      if (d != null) _memoPut(key, d);
       current = d;
       return d;
     } catch (_) {
@@ -156,7 +173,7 @@ class DetailsStore {
   void rememberMeta(String videoId, sk.TrackMeta meta) {
     try {
       if (videoId.isEmpty || !meta.hasDetails) return;
-      memo[videoId] = detailsFromMeta(meta);
+      _memoPut(videoId, detailsFromMeta(meta));
     } catch (_) {}
   }
 }

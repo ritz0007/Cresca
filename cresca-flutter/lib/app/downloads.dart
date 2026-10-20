@@ -29,38 +29,47 @@ const int downloadRowsCap = 2000;
 /// Human file name: "Artist - Title". Falls back to the id.
 String downloadFileName(YtTrack t) {
   try {
+    final id = t.id.isEmpty ? 'track' : t.id;
     final base = '${t.artist.trim()} - ${t.title.trim()}'.trim();
-    final clean = sanitizeFileName(base == '-' ? t.id : base);
+    final clean = sanitizeFileName(base == '-' ? id : base, fallback: id);
+    // All-stripped bases leave only the ' - ' joiner: same collision as
+    // empty, so fall back to the id too.
+    if (clean == '-' || clean.isEmpty) return '$id$downloadExt';
     return '$clean$downloadExt';
   } catch (_) {
     return '${t.id}$downloadExt';
   }
 }
 
-String sanitizeFileName(String name) {
+/// Keeps Unicode letters/numbers plus ' _-()&'; strips filesystem-hostile
+/// punctuation. Returns [fallback] when nothing survives so unrelated
+/// tracks never share one filename (listAll/delete collision).
+String sanitizeFileName(String name, {String fallback = 'track'}) {
   try {
     final buf = StringBuffer();
     for (final c in name.runes) {
       final ch = String.fromCharCode(c);
-      if ((ch.compareTo('A') >= 0 && ch.compareTo('Z') <= 0) ||
-          (ch.compareTo('a') >= 0 && ch.compareTo('z') <= 0) ||
-          (ch.compareTo('0') >= 0 && ch.compareTo('9') <= 0) ||
-          ch == ' ' ||
+      if (ch == ' ' ||
           ch == '_' ||
           ch == '-' ||
           ch == '(' ||
           ch == ')' ||
-          ch == '&') {
+          ch == '&' ||
+          _fileNameKeep.hasMatch(ch)) {
         buf.write(ch);
       }
     }
     var s = buf.toString().trim();
-    if (s.length > 80) s = s.substring(0, 80).trim();
-    return s.isEmpty ? 'track' : s;
+    if (s.runes.length > 80) {
+      s = String.fromCharCodes(s.runes.take(80)).trim();
+    }
+    return s.isEmpty ? fallback : s;
   } catch (_) {
-    return 'track';
+    return fallback;
   }
 }
+
+final _fileNameKeep = RegExp(r'[\p{L}\p{N}\p{M}]', unicode: true);
 
 class DownloadEntry {
   final String trackId;
@@ -133,8 +142,6 @@ class DownloadStore {
   String location = 'app';
   void Function()? onChanged;
 
-  StreamSubscription<TaskUpdate>? _sub;
-
   DownloadStore(this.appDir, {this.publicDir, http.Client? httpClient})
       : httpClient = httpClient ?? http.Client();
 
@@ -170,7 +177,6 @@ class DownloadStore {
       } catch (_) {}
       _enforceCap();
       await _sweepPartials();
-      await _listen();
       // Orphan-row prune (files deleted outside the app) stays off the
       // load hot path: it re-saves when it drops rows, so run it in the
       // background without blocking callers of load().
@@ -241,37 +247,6 @@ class DownloadStore {
           } catch (_) {}
         }
       }
-    } catch (_) {}
-  }
-
-  Future<void> _listen() async {
-    try {
-      await _sub?.cancel();
-    } catch (_) {}
-    try {
-      _sub = FileDownloader()
-          .updates
-          .listen(_onUpdate, onError: (_) {});
-    } catch (_) {}
-  }
-
-  void _onUpdate(TaskUpdate u) {
-    try {
-      if (u is TaskProgressUpdate) {
-        progress[u.task.taskId] =
-            (u.progress * 100).clamp(0.0, 100.0);
-      } else if (u is TaskStatusUpdate) {
-        status[u.task.taskId] = u.status;
-        if (u.status == TaskStatus.complete ||
-            u.status == TaskStatus.failed ||
-            u.status == TaskStatus.notFound ||
-            u.status == TaskStatus.canceled) {
-          progress.remove(u.task.taskId);
-        }
-      }
-      try {
-        onChanged?.call();
-      } catch (_) {}
     } catch (_) {}
   }
 
@@ -465,18 +440,13 @@ class DownloadStore {
       try {
         progress.remove(taskId);
       } catch (_) {}
-      if (!ok) {
-        try {
+      try {
+        if (!ok) {
           status[taskId] = TaskStatus.failed;
           if (await tmp.exists()) await tmp.delete();
           onChanged?.call();
-        } catch (_) {}
-        try {
-          _active.remove(track.id);
-        } catch (_) {}
-        return false;
-      }
-      try {
+          return false;
+        }
         // Validate + publish atomically: zero-byte output is a
         // failed fetch, not a download.
         final len = await tmp.length();
@@ -644,9 +614,6 @@ class DownloadStore {
   }
 
   void dispose() {
-    try {
-      _sub?.cancel();
-    } catch (_) {}
     try {
       httpClient.close();
     } catch (_) {}

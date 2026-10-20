@@ -21,8 +21,12 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
+import 'package:cresca_app/core/track.dart' show extractVideoId;
+import 'package:cresca_app/data/cache.dart' show UrlCache, urlMemTtlMs;
+import 'package:cresca_app/data/innertube.dart'
+    show TubeClient, parseSts, tubeHeaders, tubeUrl;
+import 'package:cresca_app/data/resolve.dart' show playerBody;
 import 'package:cresca_app/data/streamkit/bundle.dart';
-import 'package:cresca_app/data/streamkit/client.dart';
 
 /// Per-leg player timeout (also bounds the whole parallel race).
 const Duration playerLegTimeout = Duration(seconds: 8);
@@ -43,20 +47,6 @@ const int prefetchWindow = 2;
 
 /// Resolve retry budget (native retriesLeft = 3 per track).
 const int resolveMaxAttempts = 3;
-
-/// Browser-consistent headers for extractor scrape paths (watch page sts
-/// + decipher context). The bundled default UA trips bot gating; a
-/// current desktop-Chrome profile + consent cookie keeps scrapes alive.
-Map<String, String> scrapeHeaders() => const {
-      'user-agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-          '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-      'cookie': 'CONSENT=YES+cb',
-      'accept':
-          'text/html,application/xhtml+xml,application/xml;q=0.9,'
-          'image/avif,image/webp,image/apng,*/*;q=0.8',
-      'accept-language': 'en-US,en;q=0.9',
-    };
 
 class _ScrapeClient extends YoutubeHttpClient {
   @override
@@ -302,16 +292,11 @@ class FastResolver {
       final res = await httpClient
           .get(
             Uri.parse('https://www.youtube.com/watch?v=$videoId&app=desktop'),
-            headers: const {
-              'User-Agent':
-                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                  'AppleWebKit/537.36 (KHTML, like Gecko) '
-                  'Chrome/126.0.0.0 Safari/537.36',
-            },
+            headers: scrapeHeaders(),
           )
           .timeout(const Duration(seconds: 8));
       if (res.statusCode < 200 || res.statusCode >= 300) return 0;
-      final sts = parseSignatureTimestamp(res.body);
+      final sts = parseSts(res.body);
       if (sts > 0) _sts = sts;
       return sts;
     } catch (_) {
@@ -949,7 +934,7 @@ class FastResolver {
       final now = nowMs ?? DateTime.now().millisecondsSinceEpoch;
       final dead = <String>[];
       for (final e in urlCache.rows.entries) {
-        if (now - e.value.atMs > UrlCache.memTtlMs) dead.add(e.key);
+        if (now - e.value.atMs > urlMemTtlMs) dead.add(e.key);
       }
       for (final k in dead) {
         urlCache.drop(k);

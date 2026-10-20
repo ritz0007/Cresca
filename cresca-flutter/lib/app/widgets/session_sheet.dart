@@ -18,13 +18,16 @@ import '../../core/motion.dart' show motionMs;
 import '../app.dart';
 import '../design.dart';
 import '../state.dart';
+import 'cresca_toast.dart';
 
 Future<void> openSessionSheet(BuildContext context) async {
   try {
     bool motionOn = true;
     try {
       motionOn = AppScope.of(context).motionOn;
-    } catch (_) {}
+    } catch (_) {
+      // silent: motion probe, animation default (on) is safe
+    }
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -40,7 +43,10 @@ Future<void> openSessionSheet(BuildContext context) async {
         ),
       ),
     );
-  } catch (_) {}
+  } catch (e, st) {
+    await logUserFailure(context, 'open sign-in failed', e, st);
+    await showCrescaToast(context, 'Could not open sign-in — Retry');
+  }
 }
 
 class SessionSheet extends StatefulWidget {
@@ -79,12 +85,26 @@ class _SessionSheetState extends State<SessionSheet> {
     if (_capturing) return;
     setState(() => _capturing = true);
     try {
-      String raw = '';
+      // CookieManager (native side) reads HttpOnly cookies too —
+      // document.cookie misses SID/SAPISID entirely.
+      var raw = '';
       try {
-        final res = await _web?.runJavaScriptReturningResult(
-            'document.cookie');
-        raw = res?.toString() ?? '';
-      } catch (_) {}
+        final jar = await WebViewCookieManager()
+            .getCookies(domain: Uri.parse(musicUrl));
+        final map = <String, String>{};
+        for (final c in jar) {
+          try {
+            if (c.name.trim().isNotEmpty) {
+              map[c.name.trim()] = c.value;
+            }
+          } catch (_) {
+            // silent: one bad cookie skipped, jar read continues
+          }
+        }
+        raw = cookieHeaderFromJar(map);
+      } catch (_) {
+        // silent: jar read fallback, empty header surfaces via login hint
+      }
       final prev = state.ytSession.visitorData;
       final cap = captureCookies(raw, prev);
       await state.ytSession.saveSession(cap.cookies, cap.visitorData);
@@ -98,6 +118,7 @@ class _SessionSheetState extends State<SessionSheet> {
         setState(() => _loginFailed = true);
       }
     } catch (_) {
+      // Surfaced via the inline "No session detected" hint, not a toast.
       if (mounted) setState(() => _loginFailed = true);
     } finally {
       if (mounted) setState(() => _capturing = false);
@@ -109,9 +130,19 @@ class _SessionSheetState extends State<SessionSheet> {
       await state.logoutYouTube();
       try {
         await WebViewCookieManager().clearCookies();
-      } catch (_) {}
+      } catch (_) {
+        // silent: WebView jar clear only, encrypted session already wiped
+      }
+      if (!mounted) return;
+      await showCrescaToast(context, 'Signed out');
       if (mounted) Navigator.pop(context);
-    } catch (_) {}
+    } catch (e, st) {
+      // No pop on fail: the sheet stays so retry stays possible.
+      await state.crash.log('logout wipe failed', e, st);
+      if (mounted) {
+        await showCrescaToast(context, 'Sign-out failed — Retry');
+      }
+    }
   }
 
   @override
@@ -136,23 +167,8 @@ class _SessionSheetState extends State<SessionSheet> {
             child: CustomScrollView(
               controller: widget.scroll,
               slivers: [
-                SliverToBoxAdapter(
-                  child: Center(
-                    child: Container(
-                      margin:
-                          const EdgeInsets.only(top: 8),
-                      width: 40,
-                      height: 4,
-                      decoration: BoxDecoration(
-                        color: Theme.of(context)
-                            .colorScheme
-                            .onSurfaceVariant
-                            .withValues(alpha: 0.5),
-                        borderRadius:
-                            BorderRadius.circular(2),
-                      ),
-                    ),
-                  ),
+                const SliverToBoxAdapter(
+                  child: SheetGrabHandle(),
                 ),
                 SliverToBoxAdapter(
                   child: Padding(
@@ -249,7 +265,7 @@ class _SignInForm extends StatelessWidget {
             child: webCtl == null
                 ? Center(
                     key: const ValueKey('web-loading'),
-                    child: _DelayedSpinner(
+                    child: DelayedSpinner(
                         size: 20, motionOn: motionOn))
                 : ClipRRect(
                     key: const ValueKey('web-ready'),
@@ -336,57 +352,6 @@ class _SignedIn extends StatelessWidget {
         ),
         const SizedBox(height: 24),
       ],
-    );
-  }
-}
-
-/// Spinner that reserves its slot from frame one (no size jump) and
-/// fades in only after 300 ms (no flicker on fast loads). Motion-off
-/// shows it immediately (1 ms via [motionMs]).
-class _DelayedSpinner extends StatefulWidget {
-  final double size;
-  final bool motionOn;
-  const _DelayedSpinner({this.size = 20, this.motionOn = true});
-
-  @override
-  State<_DelayedSpinner> createState() => _DelayedSpinnerState();
-}
-
-class _DelayedSpinnerState extends State<_DelayedSpinner> {
-  bool _show = false;
-
-  @override
-  void initState() {
-    super.initState();
-    if (!widget.motionOn) {
-      _show = true;
-      return;
-    }
-    Future<void>.delayed(const Duration(milliseconds: 300), () {
-      if (mounted) setState(() => _show = true);
-    });
-  }
-
-  @override
-  void didUpdateWidget(covariant _DelayedSpinner old) {
-    super.didUpdateWidget(old);
-    if (widget.motionOn != old.motionOn && !widget.motionOn) {
-      setState(() => _show = true);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(
-      width: widget.size,
-      height: widget.size,
-      child: AnimatedOpacity(
-        opacity: _show ? 1.0 : 0.0,
-        duration: Duration(
-            milliseconds: motionMs(widget.motionOn, 180)),
-        curve: Curves.easeOut,
-        child: _show ? const IosSpinner() : null,
-      ),
     );
   }
 }

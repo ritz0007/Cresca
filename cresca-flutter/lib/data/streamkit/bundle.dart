@@ -9,6 +9,20 @@
 // protocol with canned fixtures. Every function is total: it returns an
 // empty value instead of throwing.
 
+/// Browser-consistent headers for extractor scrape paths (watch page sts
+/// + decipher context). The bundled default UA trips bot gating; a
+/// current desktop-Chrome profile + consent cookie keeps scrapes alive.
+Map<String, String> scrapeHeaders() => const {
+      'user-agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+          '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+      'cookie': 'CONSENT=YES+cb',
+      'accept':
+          'text/html,application/xhtml+xml,application/xml;q=0.9,'
+          'image/avif,image/webp,image/apng,*/*;q=0.8',
+      'accept-language': 'en-US,en;q=0.9',
+    };
+
 /// Metadata for one track. Likes are NOT in player responses (-1 =
 /// unknown); the About panel backfills them via the extractor only when
 /// the user opens it.
@@ -433,107 +447,6 @@ class BundleMisses {
     try {
       deadAtMs.remove(videoId);
     } catch (_) {}
-  }
-}
-
-/// Stream-URL memory entry.
-class UrlRow {
-  final String url;
-  final int atMs;
-  const UrlRow(this.url, this.atMs);
-}
-
-/// Stream-URL cache: 5h memory fronted by a 6h disk snapshot.
-/// Schema: {savedAt, items: {watchUrl: {u, t}}}.
-class UrlCache {
-  static const int memTtlMs = 5 * 60 * 60 * 1000;
-  static const int diskTtlMs = 6 * 60 * 60 * 1000;
-  static const int diskWriteFloorMs = 30 * 1000;
-
-  /// Memory budget: 500 rows max (each ~100B → ~50KB). Oldest-inserted
-  /// evicted past cap so a long session never grows unbounded.
-  static const int memCap = 500;
-
-  final Map<String, UrlRow> rows = {};
-  int lastDiskSaveMs = 0;
-
-  String? getFresh(String watchUrl, int nowMs) {
-    try {
-      final hit = rows[watchUrl];
-      if (hit == null) return null;
-      if (nowMs - hit.atMs > memTtlMs) {
-        rows.remove(watchUrl);
-        return null;
-      }
-      return hit.url;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  void remember(String watchUrl, String url, int nowMs) {
-    try {
-      rows[watchUrl] = UrlRow(url, nowMs);
-      while (rows.length > memCap) {
-        rows.remove(rows.keys.first);
-      }
-    } catch (_) {}
-  }
-
-  void drop(String watchUrl) {
-    try {
-      rows.remove(watchUrl);
-    } catch (_) {}
-  }
-
-  /// Snapshot for disk. Skips already-stale rows at write time. Returns
-  /// null when inside the <=1-write/30s floor (caller skips IO).
-  /// Schema v2: {v: 2, savedAt, items}. Never throws.
-  Map<String, dynamic>? snapshotForDisk(int nowMs) {
-    try {
-      if (nowMs - lastDiskSaveMs < diskWriteFloorMs) return null;
-      lastDiskSaveMs = nowMs;
-      final items = <String, dynamic>{};
-      for (final e in rows.entries) {
-        if (nowMs - e.value.atMs > diskTtlMs) continue;
-        items[e.key] = {'u': e.value.url, 't': e.value.atMs};
-      }
-      return {'v': bundleSnapshotVersion, 'savedAt': nowMs, 'items': items};
-    } catch (_) {
-      return null;
-    }
-  }
-
-  /// Restore from a disk snapshot. Stale/blank rows dropped, existing
-  /// memory rows win. Accepts v1 (no 'v') + v2+ (migrate on read, never
-  /// crash on old/future snapshots). Returns the restored row count.
-  int restoreFromDisk(Map<String, dynamic> root, int nowMs) {
-    var n = 0;
-    try {
-      final items = root['items'];
-      if (items is! Map) return 0;
-      for (final e in items.entries) {
-        try {
-          final k = e.key.toString();
-          final o = e.value;
-          if (o is! Map) continue;
-          final t = _asInt(o['t'], 0);
-          if (nowMs - t > diskTtlMs) continue;
-          final u = (o['u'] ?? '').toString();
-          if (u.isEmpty) continue;
-          if (!rows.containsKey(k)) {
-            rows[k] = UrlRow(u, t);
-            n++;
-          }
-        } catch (_) {}
-      }
-      try {
-        while (rows.length > memCap) {
-          rows.remove(rows.keys.first);
-        }
-      } catch (_) {}
-    } catch (_) {}
-    return n;
   }
 }
 

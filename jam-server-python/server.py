@@ -17,9 +17,8 @@ JAM sheet (Player -> JAM) as the server address.
 import asyncio
 import json
 import os
-import random
+import secrets
 import socket
-import string
 import time
 
 try:
@@ -52,6 +51,11 @@ try:
         try:
             # A WebSocket handshake is also plain HTTP on "/" — never eat it.
             if request.headers.get("upgrade", "").lower() == "websocket":
+                if not origin_allowed(request.headers.get("origin", "")):
+                    return Response(403, "Forbidden",
+                                    Headers([("Content-Type",
+                                              "text/plain")]),
+                                    b"forbidden")
                 return None
         except Exception:
             pass
@@ -70,6 +74,9 @@ except ImportError:  # older websockets releases
     async def health_check(path, headers):
         try:
             if headers.get("upgrade", "").lower() == "websocket":
+                if not origin_allowed(headers.get("origin", "")):
+                    return (403, [("Content-Type", "text/plain")],
+                            b"forbidden")
                 return None
         except Exception:
             pass
@@ -91,6 +98,13 @@ CREATE_PER_MIN = cfg_int("JAM_CREATE_PER_MIN", 5)
 JOIN_PER_MIN = cfg_int("JAM_JOIN_PER_MIN", 20)  # reconnect-storm guard/IP/min
 MAX_MSG = 8 * 1024
 MAX_BUF_BYTES = 64 * 1024  # backpressure: skip laggy sockets
+MAX_POS_MS = 24 * 3600 * 1000
+MAX_SOCKETS = cfg_int("JAM_MAX_SOCKETS", 1500)
+MAX_PER_IP = cfg_int("JAM_MAX_PER_IP", 30)
+HANDSHAKE_S = cfg_int("JAM_HANDSHAKE_S", 10)
+ALLOWED_ORIGINS = [s.strip() for s in
+                   os.environ.get("JAM_ALLOWED_ORIGINS", "").split(",")
+                   if s.strip()]
 PROTO_V = 2
 SERVER_CAPS = ["clock2", "ease", "opid", "qgen", "ecodes", "handoff"]
 MIN_STATE_MS = 0.8      # host state floor (seconds)
@@ -102,12 +116,27 @@ CODE_A = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
 
 def make_code():
-    return "".join(random.choice(CODE_A) for _ in range(6))
+    return "".join(secrets.choice(CODE_A) for _ in range(6))
 
 
 def uid():
-    return "".join(random.choice(string.ascii_lowercase + string.digits)
-                   for _ in range(8))
+    return secrets.token_hex(4)
+
+
+def clamp_pos(v):
+    try:
+        n = int(v)
+    except Exception:
+        return 0
+    return min(max(n, 0), MAX_POS_MS)
+
+
+def clean_url(v, n):
+    try:
+        s = str(v if v is not None else "")[:n]
+    except Exception:
+        return ""
+    return s if s.startswith("https://") else ""
 
 
 def clean_str(v, n):
@@ -128,8 +157,8 @@ def clean_track(t):
         "id": tid,
         "title": clean_str(t.get("title"), 120),
         "artist": clean_str(t.get("artist"), 80),
-        "thumb": clean_str(t.get("thumb"), 300),
-        "url": clean_str(t.get("url"), 300),
+        "thumb": clean_url(t.get("thumb"), 300),
+        "url": clean_url(t.get("url"), 300),
     }
 
 
@@ -175,7 +204,7 @@ class Room:
         self.cur_id = ""
         self.state_gen = 0
         self.queue_gen = 0
-        self.seen_ops = set()
+        self.seen_ops = {}  # FIFO ordered dict: op -> None (replay guard)
         self.members = {}  # websocket -> {"id":..., "name":...}
 
 
@@ -209,15 +238,39 @@ def note_op(room, op):
     # Idempotent op relay: True = first sight (relay), False = replay.
     try:
         if not op:
-            return True  # legacy frame without op id: always relay
+            return False  # op required: no empty-op bypass
         if op in room.seen_ops:
             return False
-        room.seen_ops.add(op)
+        room.seen_ops[op] = None
         if len(room.seen_ops) > 500:
-            room.seen_ops.pop()
+            room.seen_ops.pop(next(iter(room.seen_ops)))  # FIFO evict
         return True
     except Exception:
         return True
+
+
+def origin_allowed(origin):
+    if not ALLOWED_ORIGINS:
+        return True
+    if not origin:
+        return True  # native/mobile sockets send no Origin
+    return origin in ALLOWED_ORIGINS
+
+
+def buffered_bytes(ws):
+    try:
+        t = getattr(ws, "transport", None)
+        if t is not None:
+            try:
+                return t.get_write_buffer_size()
+            except Exception:
+                pass
+        return int(getattr(ws, "buffered_amount", 0) or 0)
+    except Exception:
+        return 0
+
+
+conn_by_ip = {}  # ip -> live socket count
 
 
 def member_list(room):
@@ -238,8 +291,8 @@ async def broadcast(room, obj, except_ws=None):
             continue
         try:
             # Backpressure guard: skip laggy sockets (they re-sync via
-            # sync_req); never buffer into a wedged connection.
-            if getattr(ws, "buffered_amount", 0) > MAX_BUF_BYTES:
+            # sync_req); transport buffer is the real signal here.
+            if buffered_bytes(ws) > MAX_BUF_BYTES:
                 continue
         except Exception:
             pass
@@ -369,15 +422,11 @@ async def handle(ws, msg, state):
         track = clean_track(msg.get("track"))
         if track is None:
             return
-        try:
-            pos = max(0, int(msg.get("pos", 0)))
-        except Exception:
-            pos = 0
         # `st` is the SERVER clock: the one shared timebase the room
         # measures against, so phone-clock skew can't drift the music.
         # `gen` is the authoritative state generation (guests drop stale).
         room.state_gen += 1
-        room.now = {"track": track, "pos": pos,
+        room.now = {"track": track, "pos": clamp_pos(msg.get("pos", 0)),
                     "playing": msg.get("playing") is True,
                     "at": int(now * 1000), "st": int(now * 1000)}
         await broadcast(room, {"type": "state", "state": room.now,
@@ -421,6 +470,9 @@ async def handle(ws, msg, state):
         if me["id"] == room.host_id:
             return  # host adds locally
         op = clean_str(msg.get("op", msg.get("opId", "")), 32)
+        if not op:
+            await err(ws, "BAD_OP", "missing op")
+            return
         if not note_op(room, op):
             return  # replay: ack-and-drop (idempotent)
         hw = host_ws(room)
@@ -428,7 +480,7 @@ async def handle(ws, msg, state):
             await err(ws, "HOST_AWAY", "host is away")
             return
         await send(hw, {"type": "add", "track": track, "by": me["name"],
-                        **({"op": op} if op else {})})
+                        "op": op})
 
     elif mtype == "control":
         # Guest transport wish (next/prev/play/pause/seek/play_at).
@@ -439,24 +491,24 @@ async def handle(ws, msg, state):
             return
         action = clean_str(msg.get("action"), 16)
         if not room.allow_guests and action in ("next", "prev",
-                                                "play_at", "seek"):
+                                                "play_at", "seek",
+                                                "play", "pause"):
             await err(ws, "NO_CONTROL", "only the host controls playback")
             return
         op = clean_str(msg.get("op", msg.get("opId", "")), 32)
+        if not op:
+            await err(ws, "BAD_OP", "missing op")
+            return
         if not note_op(room, op):
             return  # replay: ack-and-drop (idempotent)
         hw = host_ws(room)
         if hw is None:
             await err(ws, "HOST_AWAY", "host is away")
             return
-        try:
-            pos = max(0, int(msg.get("pos", 0)))
-        except Exception:
-            pos = 0
         await send(hw, {"type": "control", "action": action,
                         "id": clean_str(msg.get("id"), 16),
-                        "pos": pos, "by": me["name"],
-                        **({"op": op} if op else {})})
+                        "pos": clamp_pos(msg.get("pos", 0)),
+                        "by": me["name"], "op": op})
 
     elif mtype == "allow":
         me = state["me"]
@@ -523,8 +575,31 @@ async def on_conn(ws):
         ip = ws.remote_address[0] if ws.remote_address else "x"
     except Exception:
         ip = "x"
+    n = conn_by_ip.get(ip, 0) + 1
+    conn_by_ip[ip] = n
+    try:
+        total = sum(conn_by_ip.values())
+        if total > MAX_SOCKETS or n > MAX_PER_IP:
+            try:
+                await ws.close(code=1013, reason="server busy")
+            except Exception:
+                pass
+            return
+    except Exception:
+        pass
     state = {"room": None, "me": None, "ip": ip,
              "last_state": 0.0, "last_queue": 0.0}
+    async def handshake_guard():
+        try:
+            await asyncio.sleep(HANDSHAKE_S)
+            if state["room"] is None:
+                try:
+                    await ws.close(code=4408, reason="handshake timeout")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    guard = asyncio.get_running_loop().create_task(handshake_guard())
     try:
         async for raw in ws:
             try:
@@ -544,6 +619,18 @@ async def on_conn(ws):
     except Exception:
         pass
     finally:
+        try:
+            guard.cancel()
+        except Exception:
+            pass
+        try:
+            left = conn_by_ip.get(ip, 1) - 1
+            if left <= 0:
+                conn_by_ip.pop(ip, None)
+            else:
+                conn_by_ip[ip] = left
+        except Exception:
+            pass
         try:
             if state["room"] is not None:
                 me = state.get("me")

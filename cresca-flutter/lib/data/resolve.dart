@@ -298,6 +298,16 @@ class StreamResolver {
     } catch (_) {}
   }
 
+  /// Manual-retry escape hatch (Retry / Next-quality buttons): lifts the
+  /// 5m negative fast-fail so the next resolve hits network, not memo.
+  /// Without this a retry within 5m of a total miss instantly re-fails.
+  /// Never throws.
+  void clearVideoMiss(String watchUrl) {
+    try {
+      _videoDeadAt.remove(watchUrl);
+    } catch (_) {}
+  }
+
   YoutubeExplode _explode() {
     final yt = _yt;
     if (yt != null) return yt;
@@ -344,10 +354,7 @@ class StreamResolver {
           .get(
             Uri.parse(
                 'https://www.youtube.com/watch?v=$videoId&app=desktop'),
-            headers: const {
-              'User-Agent':
-                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-            },
+            headers: sk.scrapeHeaders(),
           )
           .timeout(const Duration(seconds: 12));
       if (res.statusCode < 200 || res.statusCode >= 300) return 0;

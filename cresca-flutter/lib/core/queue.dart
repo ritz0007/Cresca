@@ -302,6 +302,38 @@ class QueueEngine {
     return currentIndex;
   }
 
+  /// Undo companion for [removeAt]: re-inserts [track] at [index] and
+  /// restores the exact pre-removal play order. No-ops (false) when the
+  /// queue changed shape meanwhile (length mismatch) or the track is
+  /// already back (engine no-dupe rule). The sounding track never yanks:
+  /// [currentIndex] is re-pinned by track id after the insert, so
+  /// whatever is playing keeps playing (a restored sounding row rejoins
+  /// as upcoming). Never throws.
+  bool restoreRemoved({
+    required int index,
+    required YtTrack track,
+    required List<int> prevOrder,
+  }) {
+    try {
+      if (index < 0 || index > items.length) return false;
+      if (prevOrder.length != items.length + 1) return false;
+      if (track.id.isEmpty || containsId(track.id)) return false;
+      final soundingId =
+          (currentIndex >= 0 && currentIndex < items.length)
+              ? items[currentIndex].id
+              : null;
+      items.insert(index, track);
+      applyOrder(prevOrder);
+      if (soundingId != null) {
+        final idx = items.indexWhere((e) => e.id == soundingId);
+        if (idx >= 0) currentIndex = idx;
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   NextResult next() {
     if (items.isEmpty || currentIndex == -1) {
       return NextResult(NextStep.none);

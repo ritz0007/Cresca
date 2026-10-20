@@ -48,7 +48,7 @@ const int urlDiskTtlMs = 6 * 60 * 60 * 1000;
 const int urlDiskWriteFloorMs = 30 * 1000;
 const int homeCacheTtlMs = 12 * 60 * 60 * 1000;
 const int searchCacheTtlMs = 30 * 60 * 1000;
-const int trendingCacheTtlMs = 7 * 24 * 60 * 60 * 1000;
+const int trendingCacheTtlMs = 24 * 60 * 60 * 1000;
 
 /// Snapshot schema version. v1 = {savedAt, items} (no 'v' key, legacy
 /// native + old app writes). v2 adds 'v': 2. Readers accept v1 (migrate

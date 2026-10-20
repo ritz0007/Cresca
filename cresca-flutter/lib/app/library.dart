@@ -802,9 +802,36 @@ class LibraryStore {
     try {
       final idx = playlists.indexWhere((e) => e.id == id);
       if (idx < 0 || trackId.isEmpty) return;
-      final before = playlists[idx].tracks.length;
-      playlists[idx].tracks.removeWhere((t) => t.id == trackId);
-      if (playlists[idx].tracks.length == before) return;
+      // Single occurrence only: swipe-delete of one dupe row must not
+      // wipe its twins (index-based removeTrackAt for exact rows).
+      final at = playlists[idx].tracks.indexWhere((t) => t.id == trackId);
+      if (at < 0) return;
+      playlists[idx].tracks.removeAt(at);
+      await atomicWrite(_playlistsFile, playlistsToJson(playlists));
+    } catch (_) {}
+  }
+
+  /// Removes the single row at [index] (swipe-delete path, dupe-safe).
+  /// Returns false when the playlist or index is unknown.
+  Future<bool> removeTrackAt(String id, int index) async {
+    try {
+      final idx = playlists.indexWhere((e) => e.id == id);
+      if (idx < 0) return false;
+      final tracks = playlists[idx].tracks;
+      if (index < 0 || index >= tracks.length) return false;
+      tracks.removeAt(index);
+      await atomicWrite(_playlistsFile, playlistsToJson(playlists));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Persists the current in-memory order (Undo re-insert path: the
+  /// move is in-memory only until this write lands, or a kill loses
+  /// it). Never throws.
+  Future<void> persistPlaylists() async {
+    try {
       await atomicWrite(_playlistsFile, playlistsToJson(playlists));
     } catch (_) {}
   }

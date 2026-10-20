@@ -39,6 +39,7 @@ class MainActivity : AudioServiceActivity() {
         private const val VOL_EVENTS = "cresca.system_volume/events"
         private const val NOTIF_CHANNEL = "com.cresca.playback.live"
         private const val NOTIF_ID = 0xC8E5CA
+        private const val DEVICE_CHANNEL = "cresca.device"
     }
 
     private var liveTitle = "Cresca Music"
@@ -109,6 +110,24 @@ class MainActivity : AudioServiceActivity() {
                 Log.w(TAG, "channel failed", e)
                 try {
                     result.success(false)
+                } catch (_: Exception) {
+                }
+            }
+        }
+        // Device ABI (updates): Build.SUPPORTED_ABIS for APK picking.
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger, DEVICE_CHANNEL
+        ).setMethodCallHandler { call, result ->
+            try {
+                when (call.method) {
+                    "getSupportedAbis" ->
+                        result.success(Build.SUPPORTED_ABIS.toList())
+                    else -> result.notImplemented()
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "device failed", e)
+                try {
+                    result.success(listOf("universal"))
                 } catch (_: Exception) {
                 }
             }

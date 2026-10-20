@@ -132,8 +132,8 @@ class _BootSplash extends StatelessWidget {
             children: [
               Image.asset(
                 dark
-                    ? 'assets/logo_dark.png'
-                    : 'assets/logo_light.png',
+                    ? 'assets/logo_light.png'
+                    : 'assets/logo_dark.png',
                 width: 120,
                 height: 120,
                 fit: BoxFit.contain,

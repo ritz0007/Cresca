@@ -11,24 +11,62 @@ const String musicUrl = 'https://music.youtube.com';
 /// Stock WebView UA minus the embedded-browser token. Device-consistent
 /// UA (version + hints match a real browser); fallback when the
 /// platform default is unavailable.
+const String fallbackLoginUserAgent =
+    'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36';
+
 String loginUserAgent(String defaultUa) {
   try {
     var ua = defaultUa.trim();
-    if (ua.isEmpty) {
-      return 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 '
-          '(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36';
-    }
+    if (ua.isEmpty) return fallbackLoginUserAgent;
     ua = ua.replaceAll('; wv', '');
     return ua;
   } catch (_) {
-    return defaultUa;
+    return fallbackLoginUserAgent;
   }
 }
 
-/// True when a cookie header carries a login session.
+/// True when a cookie header carries a login session (exact cookie names:
+/// SID-substrings like SSID/RESID must NOT match). Pure; never throws.
 bool cookiesLoggedIn(String cookies) {
   try {
-    return cookies.contains('SAPISID') || cookies.contains('SID');
+    for (final part in cookies.split(';')) {
+      final p = part.trim();
+      if (p.isEmpty) continue;
+      final eq = p.indexOf('=');
+      final name = (eq < 0 ? p : p.substring(0, eq)).trim();
+      if (name == 'SAPISID' || name == 'SID') return true;
+    }
+    return false;
+  } catch (_) {
+    return false;
+  }
+}
+
+/// CookieManager jar (native side, HttpOnly included) → `Cookie` header.
+/// Pure; never throws.
+String cookieHeaderFromJar(Map<String, String> jar) {
+  try {
+    final parts = <String>[];
+    jar.forEach((k, v) {
+      final name = k.trim();
+      if (name.isNotEmpty) parts.add('$name=${v.trim()}');
+    });
+    return parts.join('; ');
+  } catch (_) {
+    return '';
+  }
+}
+
+/// True when a CookieManager jar carries a login session (exact cookie
+/// names — the jar-native twin of [cookiesLoggedIn]). Pure; never throws.
+bool jarLoggedIn(Map<String, String> jar) {
+  try {
+    for (final k in jar.keys) {
+      final name = k.trim();
+      if (name == 'SAPISID' || name == 'SID') return true;
+    }
+    return false;
   } catch (_) {
     return false;
   }
@@ -100,14 +138,17 @@ class YtSession {
     } catch (_) {}
   }
 
-  /// Logout wipes the encrypted session (WebView cookies cleared by
-  /// the sheet via WebViewCookieManager).
+  /// Logout wipes the encrypted session (the sheet clears the
+  /// WebView cookies) including the short-lived PO-token so no
+  /// X-Goog-EOM-Visitor-Id survives it.
   Future<void> logout() async {
     try {
       cookies = '';
       visitorData = '';
+      poToken = '';
       await _store.delete(key: _kCookies);
       await _store.delete(key: _kVisitor);
+      await _store.delete(key: _kPoToken);
     } catch (_) {}
   }
 
@@ -118,22 +159,6 @@ class YtSession {
       poToken = '';
       await _store.delete(key: _kPoToken);
     } catch (_) {}
-  }
-}
-
-/// Mandatory-login gate for InnerTube fetches (native
-/// YtSessionManager.MANDATORY_LOGIN_FOR_INNERTUBE, default false so
-/// logged-out users keep working via fallback while proven).
-const bool mandatoryLoginForInnerTube = false;
-
-/// True when fetches may proceed: always in scaffold mode, else only
-/// when a login session is present. Never throws.
-bool canFetchInnerTube(String cookies) {
-  try {
-    if (!mandatoryLoginForInnerTube) return true;
-    return cookiesLoggedIn(cookies);
-  } catch (_) {
-    return false;
   }
 }
 

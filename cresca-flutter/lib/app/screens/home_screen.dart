@@ -19,6 +19,10 @@ import '../widgets/track_row.dart';
 import 'podcast_screen.dart';
 import 'see_all.dart';
 
+// Hoisted: headerTitle rebuilt every rail every frame — never regcompile.
+final _railPrefixRe = RegExp(r'^__[a-z]+__');
+final _railWordRe = RegExp(r'[^a-zA-Z0-9]+');
+
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
 
@@ -50,6 +54,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _onScroll() {
     try {
+      if (!mounted) return;
       _maybePrefetch(AppScope.of(context));
     } catch (_) {}
   }
@@ -79,6 +84,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    _scroll.removeListener(_onScroll);
     _scroll.dispose();
     super.dispose();
   }
@@ -223,7 +229,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     child:
                         _SignInCard(state: state)),
                 SliverToBoxAdapter(
-                  child: _Dissolve(
+                  child: Dissolve(
                     opacity: dissolve,
                     ms: dissolveMs,
                     child: StaggerEntrance(
@@ -238,7 +244,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 // hero Play/Shuffle card was deleted — rails flow up).
                 if (state.topPicks.isNotEmpty)
                   SliverToBoxAdapter(
-                    child: _Dissolve(
+                    child: Dissolve(
                       opacity: dissolve,
                       ms: dissolveMs,
                       child: StaggerEntrance(
@@ -249,7 +255,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     ),
                   ),
                 SliverToBoxAdapter(
-                  child: _Dissolve(
+                  child: Dissolve(
                     opacity: dissolve,
                     ms: dissolveMs,
                     child: StaggerEntrance(
@@ -262,7 +268,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     ri < state.rails.length;
                     ri++)
                   SliverToBoxAdapter(
-                    child: _Dissolve(
+                    child: Dissolve(
                       opacity: dissolve,
                       ms: dissolveMs,
                       child: StaggerEntrance(
@@ -284,7 +290,7 @@ class _HomeScreenState extends State<HomeScreen> {
               ],
               // Bottom chrome (mini player + pill) is app-shell; the
               // list scrolls under the glass (Spotify parity). Live
-              // clearance from the measured chrome (falls back to 210
+              // clearance from the measured chrome (estimator fallback
               // pre-measurement so unmigrated frames stay safe).
               SliverPadding(
                   padding: EdgeInsets.only(
@@ -676,7 +682,7 @@ class _UpdateBanner extends StatelessWidget {
                                   msg.isNotEmpty) {
                                 ScaffoldMessenger.of(context)
                                     .showSnackBar(SnackBar(
-                                        content: Text(msg)));
+                                        content: Semantics(liveRegion: true, child: Text(msg))));
                               }
                             }
                           } catch (_) {}
@@ -757,9 +763,10 @@ class _TopPicks extends StatelessWidget {
     // cached/mixed lists can still carry cards — never render those.
     final tracks = songsOnlyTracks(this.tracks);
     if (tracks.isEmpty) return const SizedBox.shrink();
-    // 2-row horizontal grid (2x2 look, slides right for more): up
-    // to 12 songs; the pool re-ranks per visit + pull-to-refresh.
-    final shown = tracks.take(12).toList();
+    // 2-row horizontal grid (slides right for more): up to 20 songs;
+    // the pool re-ranks per visit + pull-to-refresh with the shown set
+    // down-weighted, so revisits surface new songs.
+    final shown = tracks.take(20).toList();
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 12, 0, 0),
       child: Column(
@@ -937,9 +944,9 @@ class _Rail extends StatelessWidget {
     try {
       final q = (section.query as String).trim();
       if (q.startsWith('__related__')) return 'Related Mix';
-      final core = q.replaceAll(RegExp(r'^__[a-z]+__'), '');
+      final core = q.replaceAll(_railPrefixRe, '');
       final words = core
-          .split(RegExp(r'[^a-zA-Z0-9]+'))
+          .split(_railWordRe)
           .where((w) => w.isNotEmpty)
           .map((w) => w[0].toUpperCase() + w.substring(1))
           .join(' ')
@@ -1174,25 +1181,6 @@ class _DiscoveryTail extends StatelessWidget {
       );
     }
     return const SizedBox.shrink();
-  }
-}
-
-/// Refresh dissolve: opacity-only fade behind the native spinner.
-/// Duration is pre-collapsed via motionMs by the caller.
-class _Dissolve extends StatelessWidget {
-  final double opacity;
-  final int ms;
-  final Widget child;
-  const _Dissolve(
-      {required this.opacity, required this.ms, required this.child});
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedOpacity(
-      duration: Duration(milliseconds: ms),
-      opacity: opacity,
-      child: child,
-    );
   }
 }
 

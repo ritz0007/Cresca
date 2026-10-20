@@ -11,7 +11,6 @@
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
 import 'package:cresca_app/data/streamkit/bundle.dart';
-import 'package:cresca_app/data/streamkit/resolver.dart' show scrapeHeaders;
 
 class VideoDetails {
   final int views;

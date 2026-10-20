@@ -14,7 +14,7 @@
 //   FloatingTabBar cross-fades selection and carries a subtle bar-wide
 //   press scale. The chrome Column is measured post-frame and published
 //   via BottomChromeScope, so lists consume the live clearance instead
-//   of the legacy 210dp constant. No edits to design.dart.
+//   of the estimator. No edits to design.dart.
 // - Splash: logo scale-in 0.92→1.0 (400ms easeOutBack, never clipped)
 //   + tagline fade (250ms delay, 600ms), minimum 1200ms brand hold,
 //   then fade-out once AppState.homeStatus leaves loading (8s
@@ -61,9 +61,9 @@ class AppScope extends InheritedWidget {
 /// fade and the shell AnimatedSwitcher use this 150ms minimum instead.
 const int _splashMinFadeMs = 150;
 
-/// Measured bottom-chrome clearance (P1 fix).
+/// Measured bottom-chrome clearance (U1 foundation).
 ///
-/// Screens used to hard-code `bottom: 210` for list clearance. That
+/// Screens used to hard-code a magic bottom constant for list clearance. That
 /// constant drifts from the real chrome (MiniPlayer presence +
 /// FloatingTabBar height + system inset all vary). The shell measures
 /// the chrome Column post-frame (see [_CrescaAppState]) and publishes
@@ -76,13 +76,10 @@ const int _splashMinFadeMs = 150;
 /// ```
 ///
 /// Until the first measurement lands, [clearance] falls back to
-/// [legacyClearance] (210 — the old constant), so unmigrated screens
-/// keep their current safe padding.
+/// [estimate] (inset + tab bar + optional MiniPlayer), so the first
+/// frame never overlaps. The old magic constant is deleted — do not
+/// reintroduce magic numbers.
 class BottomChromeScope extends InheritedWidget {
-  /// Legacy magic constant screens used (`bottom: 210`). Kept as the
-  /// pre-measurement fallback so nothing overlaps mid-migration.
-  static const double legacyClearance = 210.0;
-
   /// Base estimates used by [estimate] (insets added on top).
   static const double tabBarBase = 76.0;
   static const double miniPlayerBase = 68.0;
@@ -109,9 +106,11 @@ class BottomChromeScope extends InheritedWidget {
           {required double bottomInset, required bool hasTrack}) =>
       bottomInset + tabBarBase + (hasTrack ? miniPlayerBase : 0.0);
 
-  /// Live clearance: measured height once known, else [legacyClearance].
-  double get clearance =>
-      chromeHeight > 0 ? chromeHeight : legacyClearance;
+  /// Live clearance: measured height once known, else [estimate]
+  /// (inset + bar + optional MiniPlayer) so the first frame is safe.
+  double get clearance => chromeHeight > 0
+      ? chromeHeight
+      : estimate(bottomInset: bottomInset, hasTrack: hasTrack);
 
   static BottomChromeScope? maybeOf(BuildContext context) =>
       context.dependOnInheritedWidgetOfExactType<BottomChromeScope>();
@@ -122,10 +121,13 @@ class BottomChromeScope extends InheritedWidget {
     return scope;
   }
 
-  /// Drop-in for the old `bottom: 210`: measured chrome when available,
-  /// [legacyClearance] otherwise. Never throws (safe pre-migration).
+  /// Drop-in clearance: measured chrome when available, [estimate]
+  /// otherwise. Never throws (safe when no scope is found — the
+  /// fallback assumes a track is loaded so the pad errs on the safe
+  /// side instead of overlapping).
   static double clearanceOf(BuildContext context) =>
-      maybeOf(context)?.clearance ?? legacyClearance;
+      maybeOf(context)?.clearance ??
+      estimate(bottomInset: 0, hasTrack: true);
 
   @override
   bool updateShouldNotify(BottomChromeScope old) =>
@@ -147,7 +149,7 @@ class _CrescaAppState extends State<CrescaApp> {
   int _lastSearchTap = 0;
   bool _splash = true;
   // P1: measured bottom-chrome height (MiniPlayer + tab bar + inset),
-  // published via BottomChromeScope so lists stop using `bottom: 210`.
+  // published via BottomChromeScope so lists consume live clearance.
   double _chromeHeight = 0.0;
   final GlobalKey _chromeKey = GlobalKey();
   // P2: messenger key lets _onTab (no BuildContext) show the one-time
@@ -222,14 +224,20 @@ class _CrescaAppState extends State<CrescaApp> {
         widget.state.visitHome();
       } catch (_) {}
     }
+    // Same for Trending arrivals: charts visibly rotate every visit.
+    if (i == 1 && _tab != 1) {
+      try {
+        widget.state.visitTrending();
+      } catch (_) {}
+    }
     setState(() => _tab = i);
   }
 
   void _showSearchHint() {
     try {
       _messengerKey.currentState?.showSnackBar(
-        const SnackBar(
-          content: Text('Tip: tap Search again to focus the search field'),
+        SnackBar(
+          content: Semantics(liveRegion: true, child: Text('Tip: tap Search again to focus the search field')),
           // Content display timeout, not animation — kept readable even
           // with motion off.
           duration: Duration(seconds: 2),
@@ -287,7 +295,7 @@ class _CrescaAppState extends State<CrescaApp> {
         darkTheme: crescaTheme(Brightness.dark),
         // P1: BottomChromeScope sits above the tab bodies (Builder grabs
         // MaterialApp's MediaQuery) so lists read live chrome clearance
-        // instead of the legacy 210dp constant. Rebuilds with _onState
+        // instead of a magic constant. Rebuilds with _onState
         // keep hasTrack fresh as tracks load/clear.
         home: Builder(builder: (shellCtx) {
           final shellInset = MediaQuery.of(shellCtx).padding.bottom;

@@ -18,6 +18,7 @@
  */
 
 const http = require('http');
+const crypto = require('crypto');
 const WebSocket = require('ws');
 
 const PORT = parseInt(process.env.PORT || '3781', 10);
@@ -37,15 +38,30 @@ const JOIN_PER_MIN = 20; // reconnect-storm guard per IP
 const MAX_BUF_BYTES = 64 * 1024; // backpressure: skip laggy sockets
 const PROTO_V = 2;
 const SERVER_CAPS = ['clock2', 'ease', 'opid', 'qgen', 'ecodes', 'handoff'];
+const MAX_POS_MS = 24 * 3600 * 1000;
+const MAX_SOCKETS = parseInt(process.env.JAM_MAX_SOCKETS || '1500', 10);
+const MAX_PER_IP = parseInt(process.env.JAM_MAX_PER_IP || '30', 10);
+const HANDSHAKE_MS = parseInt(process.env.JAM_HANDSHAKE_MS || '10000', 10);
+const ALLOWED_ORIGINS = (process.env.JAM_ALLOWED_ORIGINS || '')
+  .split(',').map((s) => s.trim()).filter(Boolean);
 
 // Room codes skip 0/O/1/I so reading them aloud never confuses anyone.
 const CODE_A = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 function makeCode() {
   let s = '';
-  for (let i = 0; i < 6; i++) s += CODE_A[(Math.random() * CODE_A.length) | 0];
+  for (let i = 0; i < 6; i++) s += CODE_A[crypto.randomInt(CODE_A.length)];
   return s;
 }
-const uid = () => Math.random().toString(36).slice(2, 10);
+const uid = () => crypto.randomBytes(4).toString('hex');
+function clampPos(v) {
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(Math.max(n, 0), MAX_POS_MS);
+}
+function cleanUrl(v, n) {
+  const s = String(v == null ? '' : v).slice(0, n);
+  return s.startsWith('https://') ? s : '';
+}
 
 // rooms: code -> { code, hostId, createdAt, lastActive, emptyAt,
 //                  allowGuests, now, queue, members: Map(ws -> {id,name}),
@@ -119,7 +135,7 @@ function negotiatedHello(code, me, room) {
 /// return false (ack-and-drop). Bounded so memory stays flat.
 function noteOp(room, op) {
   try {
-    if (!op) return true; // legacy frame without op id: always relay
+    if (!op) return false;
     if (!room.seenOps) room.seenOps = new Set();
     if (room.seenOps.has(op)) return false;
     room.seenOps.add(op);
@@ -144,8 +160,8 @@ function cleanTrack(t) {
     id,
     title: s(t.title, 120),
     artist: s(t.artist, 80),
-    thumb: s(t.thumb, 300),
-    url: s(t.url, 300),
+    thumb: cleanUrl(t.thumb, 300),
+    url: cleanUrl(t.url, 300),
   };
 }
 
@@ -189,13 +205,43 @@ const server = http.createServer((req, res) => {
   res.end();
 });
 
-const wss = new WebSocket.Server({ server, maxPayload: MAX_MSG });
+function originAllowed(req) {
+  if (!ALLOWED_ORIGINS.length) return true;
+  try {
+    const o = (req.headers && req.headers.origin) || '';
+    if (!o) return true; // native/mobile sockets send no Origin
+    return ALLOWED_ORIGINS.includes(o);
+  } catch (e) { return true; }
+}
+function ipOf(req) {
+  try { return (req.socket && req.socket.remoteAddress) || 'x'; } catch (e) { return 'x'; }
+}
+const perIpSockets = new Map(); // ip -> count
+
+const wss = new WebSocket.Server({
+  server, maxPayload: MAX_MSG,
+  verifyClient: (info, cb) => {
+    try {
+      if (!originAllowed(info.req)) return cb(false, 403, 'Forbidden');
+      if (wss.clients && wss.clients.size >= MAX_SOCKETS) return cb(false, 503, 'Server busy');
+      const ip = ipOf(info.req);
+      if ((perIpSockets.get(ip) || 0) >= MAX_PER_IP) return cb(false, 429, 'Too many connections');
+    } catch (e) { /* allow */ }
+    cb(true);
+  },
+});
 
 wss.on('connection', (ws, req) => {
   ws.isAlive = true;
+  const cip = ipOf(req);
+  perIpSockets.set(cip, (perIpSockets.get(cip) || 0) + 1);
   ws.on('pong', () => { ws.isAlive = true; });
   let room = null;
   let me = null;
+  const handshakeTimer = setTimeout(() => {
+    try { if (!room && !me) ws.close(4408, 'handshake timeout'); } catch (e) {}
+  }, HANDSHAKE_MS);
+  const clearHandshake = () => { try { clearTimeout(handshakeTimer); } catch (e) {} };
   let lastStateAt = 0;
   let lastQueueAt = 0;
 
@@ -233,6 +279,7 @@ wss.on('connection', (ws, req) => {
         };
         room.members.set(ws, me);
         rooms.set(code, room);
+        clearHandshake();
         send(ws, { type: 'created', code });
         send(ws, negotiatedHello(code, me, room));
         broadcastMembers(room);
@@ -259,6 +306,7 @@ wss.on('connection', (ws, req) => {
         room = r;
         room.members.set(ws, me);
         room.emptyAt = 0;
+        clearHandshake();
         // Fast hello + snapshot: one joined frame (with negotiated caps)
         // then the authoritative state/queue so join latency is a single
         // round trip even on a cold socket.
@@ -286,7 +334,7 @@ wss.on('connection', (ws, req) => {
         room.stateGen = (room.stateGen || 0) + 1;
         room.now = {
           track,
-          pos: Math.max(0, parseInt(m.pos, 10) || 0),
+          pos: clampPos(m.pos),
           playing: m.playing === true,
           at: t,
           st: t,
@@ -330,9 +378,10 @@ wss.on('connection', (ws, req) => {
         if (!track) return;
         if (me.id === room.hostId) return; // host adds locally
         const op = String(m.op || m.opId || '');
+        if (!op) return err(ws, 'BAD_OP', 'missing op');
         if (!noteOp(room, op)) return;
         const hw = hostWs(room);
-        if (hw) send(hw, { type: 'add', track, by: me.name, ...(op ? { op } : {}) });
+        if (hw) send(hw, { type: 'add', track, by: me.name, op });
         else return err(ws, 'HOST_AWAY', 'host is away');
         break;
       }
@@ -343,10 +392,12 @@ wss.on('connection', (ws, req) => {
         if (!room || !me) return;
         if (me.id === room.hostId) return;
         if (!room.allowGuests && (m.action === 'next' || m.action === 'prev' ||
-            m.action === 'play_at' || m.action === 'seek')) {
+            m.action === 'play_at' || m.action === 'seek' ||
+            m.action === 'play' || m.action === 'pause')) {
           return err(ws, 'NO_CONTROL', 'only the host controls playback');
         }
         const op = String(m.op || m.opId || '');
+        if (!op) return err(ws, 'BAD_OP', 'missing op');
         if (!noteOp(room, op)) return;
         const hw = hostWs(room);
         if (!hw) return err(ws, 'HOST_AWAY', 'host is away');
@@ -354,9 +405,9 @@ wss.on('connection', (ws, req) => {
           type: 'control',
           action: String(m.action || '').slice(0, 16),
           id: String(m.id || '').slice(0, 16),
-          pos: Math.max(0, parseInt(m.pos, 10) || 0),
+          pos: clampPos(m.pos),
           by: me.name,
-          ...(op ? { op } : {}),
+          op,
         });
         break;
       }
@@ -410,6 +461,12 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
+    try { clearHandshake(); } catch (e) {}
+    try {
+      const n = (perIpSockets.get(cip) || 1) - 1;
+      if (n <= 0) perIpSockets.delete(cip);
+      else perIpSockets.set(cip, n);
+    } catch (e) {}
     try {
       if (room) {
         const wasHost = me && me.id === room.hostId;

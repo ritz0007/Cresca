@@ -237,10 +237,6 @@ class Glass extends StatelessWidget {
   }
 }
 
-/// iOS frosted tab bar shell [D4]: blur + top hairline, no pill.
-/// (Unused legacy shell kept for reference; the real bar is
-/// FloatingTabBar's full-bleed Apple glass below.)
-
 /// Apple-glass top bar (Regular variant): bounded-bounded blur band
 /// with hairline bottom, title/actions row, top safe area. Use as
 /// `appBar: GlassBar(title: …)` (implements PreferredSizeWidget).
@@ -381,56 +377,6 @@ class GlassSheetSurface extends StatelessWidget {
     // Show-only entrance: slide-up + fade (transform/opacity). The
     // BackdropFilter above keeps a static sigma — never animated.
     return SheetEntrance(motionOn: motionOn, child: surface);
-  }
-}
-
-/// iOS frosted tab bar shell [D4]: blur + top hairline, no pill.
-class FrostedTabBar extends StatelessWidget {
-  final NavigationBar child;
-  const FrostedTabBar({super.key, required this.child});
-
-  @override
-  Widget build(BuildContext context) {
-    final dark =
-        Theme.of(context).brightness == Brightness.dark;
-    return ClipRect(
-      child: Container(
-        decoration: BoxDecoration(
-          color: (dark
-              ? const Color(0xF01C1C1E)
-              : const Color(0xF8FFFFFF)),
-          border: Border(
-            top: BorderSide(
-              color: Theme.of(context)
-                  .colorScheme
-                  .outlineVariant
-                  .withValues(alpha: 0.6),
-              width: 0.5,
-            ),
-          ),
-        ),
-        child: Theme(
-          data: Theme.of(context).copyWith(
-            navigationBarTheme:
-                const NavigationBarThemeData(
-              backgroundColor: Colors.transparent,
-              // No pill: iOS marks selection with tint alone.
-              indicatorColor: Colors.transparent,
-              labelBehavior:
-                  NavigationDestinationLabelBehavior.alwaysShow,
-              // Montserrat runs wide: compact labels keep all five
-              // tabs legible at 1080p.
-              labelTextStyle: WidgetStatePropertyAll(
-                  TextStyle(
-                      fontSize: 10.5,
-                      fontWeight: FontWeight.w600,
-                      letterSpacing: 0.1)),
-            ),
-          ),
-          child: child,
-        ),
-      ),
-    );
   }
 }
 
@@ -728,12 +674,17 @@ class FloatingTabBar extends StatelessWidget {
     // is safe; screens were verified pixel-perfect after each step.
     final selected = dark ? Colors.white : Colors.black;
     final bottomInsetV = bottomInset;
-    // Label style rides the Theme (labelSmall 11 SB) so text scaling
-    // and font-choice stay centralized; selection only recolors.
+    // Label style rides the Theme (labelSmall 11 SB) with a 10.5
+    // compact override (Montserrat runs wide: five tabs stay
+    // legible) so text scaling and font-choice stay centralized;
+    // selection only recolors. softWrap off: labels truncate with
+    // ellipsis instead of clipping at large text scale.
     final labelBase =
-        Theme.of(context).textTheme.labelSmall ??
-            const TextStyle(
-                fontSize: 11, fontWeight: FontWeight.w600);
+        (Theme.of(context).textTheme.labelSmall ??
+                const TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600))
+            .copyWith(fontSize: 10.5);
     // Selection motion: 180 ms tint crossfade (no pill — iOS
     // tint-only rule stays). Transform/opacity only, 60 fps.
     // NOTE (120Hz polish): label fontSize stays fixed (was 10.5↔11 —
@@ -851,6 +802,7 @@ class FloatingTabBar extends StatelessWidget {
                                       : unselected),
                               child: Text(_items[i].$3,
                                   maxLines: 1,
+                                  softWrap: false,
                                   overflow:
                                       TextOverflow.ellipsis),
                             ),
@@ -954,6 +906,137 @@ class _PressScaleState extends State<PressScale> {
         curve: _down ? Curves.easeOut : Curves.easeOutBack,
         child: widget.child,
       ),
+    );
+  }
+}
+
+/// Shared delayed spinner: reserves [size] from frame one (no jump),
+/// fades in only after 300 ms (no flicker on fast loads). Motion-off
+/// shows immediately. Live-region Semantics announces loading once.
+class DelayedSpinner extends StatefulWidget {
+  final double size;
+  final double strokeWidth;
+  final Color? color;
+  final bool motionOn;
+  const DelayedSpinner({
+    super.key,
+    this.size = 20,
+    this.strokeWidth = 2,
+    this.color,
+    this.motionOn = true,
+  });
+
+  @override
+  State<DelayedSpinner> createState() => _DelayedSpinnerState();
+}
+
+class _DelayedSpinnerState extends State<DelayedSpinner> {
+  bool _show = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (!widget.motionOn) {
+      _show = true;
+      return;
+    }
+    Future<void>.delayed(const Duration(milliseconds: 300), () {
+      if (mounted) setState(() => _show = true);
+    });
+  }
+
+  @override
+  void didUpdateWidget(covariant DelayedSpinner old) {
+    super.didUpdateWidget(old);
+    if (widget.motionOn != old.motionOn && !widget.motionOn) {
+      setState(() => _show = true);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: widget.size,
+      height: widget.size,
+      child: AnimatedOpacity(
+        opacity: _show ? 1.0 : 0.0,
+        duration: Duration(
+            milliseconds:
+                motion.motionMs(widget.motionOn, 180)),
+        curve: Curves.easeOut,
+        child: _show
+            ? Semantics(
+                label: 'Loading',
+                liveRegion: true,
+                child: CircularProgressIndicator(
+                  strokeWidth: widget.strokeWidth,
+                  color: widget.color,
+                ),
+              )
+            : null,
+      ),
+    );
+  }
+}
+
+/// Shared sheet drag handle: 40x4 pill in a 48 px touch/semantics
+/// zone. Decoration-only fill at 50% onSurfaceVariant.
+class SheetGrabHandle extends StatelessWidget {
+  const SheetGrabHandle({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      label: 'Drag handle',
+      container: true,
+      child: const SizedBox(
+        width: double.infinity,
+        height: 48,
+        child: Center(
+          child: _GrabPill(),
+        ),
+      ),
+    );
+  }
+}
+
+class _GrabPill extends StatelessWidget {
+  const _GrabPill();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 40,
+      height: 4,
+      decoration: BoxDecoration(
+        color: Theme.of(context)
+            .colorScheme
+            .onSurfaceVariant
+            .withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(2),
+      ),
+    );
+  }
+}
+
+/// Shared refresh dissolve: opacity-only fade behind spinners.
+/// Duration is pre-collapsed via motionMs by the caller.
+class Dissolve extends StatelessWidget {
+  final double opacity;
+  final int ms;
+  final Widget child;
+  const Dissolve(
+      {super.key,
+      required this.opacity,
+      required this.ms,
+      required this.child});
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      duration: Duration(milliseconds: ms),
+      opacity: opacity,
+      child: child,
     );
   }
 }
@@ -1170,16 +1253,17 @@ class _PulseOpacityState extends State<PulseOpacity>
 // guaranteed contrast. All helpers below are pure/static (no
 // animation, no BackdropFilter) and compositor-safe.
 
+/// sRGB linearizer (hoisted: no closure alloc per luminance call).
+double _lin(double v) {
+  v /= 255.0;
+  return v <= 0.03928 ? v / 12.92 : math.pow((v + 0.055) / 1.055, 2.4).toDouble();
+}
+
 /// WCAG relative luminance of [c] (sRGB linearized per WCAG 2.x).
 double _luminance(Color c) {
-  double lin(double v) {
-    v /= 255.0;
-    return v <= 0.03928 ? v / 12.92 : math.pow((v + 0.055) / 1.055, 2.4).toDouble();
-  }
-
-  return 0.2126 * lin(c.r * 255.0) +
-      0.7152 * lin(c.g * 255.0) +
-      0.0722 * lin(c.b * 255.0);
+  return 0.2126 * _lin(c.r * 255.0) +
+      0.7152 * _lin(c.g * 255.0) +
+      0.0722 * _lin(c.b * 255.0);
 }
 
 /// WCAG contrast ratio of foreground [fg] over background [bg]:
@@ -1330,20 +1414,10 @@ class TextScrim extends StatelessWidget {
   }
 }
 
-/// Primary text color on [Glass]/[GlassSheetSurface] material.
-/// Derived from the theme's [ColorScheme.onSurface] (never hardcoded),
-/// which is the AA-verified foreground for translucent surfaces:
-/// white in dark mode, black in light mode.
-Color glassText(bool dark) =>
-    crescaTheme(dark ? Brightness.dark : Brightness.light)
-        .colorScheme
-        .onSurface;
+/// Primary text on glass: onSurface (white/black). Constants — no
+/// per-row ThemeData build.
+Color glassText(bool dark) => dark ? Colors.white : Colors.black;
 
-/// Secondary text color on [Glass]/[GlassSheetSurface] material.
-/// Derived from the theme's [ColorScheme.onSurfaceVariant] (never
-/// hardcoded): spotifySubtext grey in dark mode, system grey in light
-/// mode — both AA-verified against the sheet's near-opaque base stops.
+/// Secondary text on glass: onSurfaceVariant values as constants.
 Color glassSubtext(bool dark) =>
-    crescaTheme(dark ? Brightness.dark : Brightness.light)
-        .colorScheme
-        .onSurfaceVariant;
+    dark ? spotifySubtext : const Color(0xFF6E6E73);

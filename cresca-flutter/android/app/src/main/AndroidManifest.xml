@@ -8,9 +8,19 @@
            Updates cards. Device-Music downloads use scoped
            MediaStore via background_downloader — no legacy
            READ/WRITE_EXTERNAL_STORAGE declared.
-         - usesCleartextTraffic=true: retained for CDN/artwork compat
-           (streams resolve to mixed http(s) hosts); API traffic stays
-           https. Revisit only if all hosts prove https.
+         - usesCleartextTraffic=true: KEEP (U10 host-by-host audit,
+           Oct 2026 — do not flip without re-audit):
+           1. 127.0.0.1 loopback ONLY — just_audio's localhost proxy
+           (streams via the on-device proxy; no LAN/WAN exposure).
+           2. JAM listen-together hosts — default
+           `http://209.126.81.22:13009` (jamServerUrl, overridable via
+           dart-define JAM_SERVER_URL and in-app settings, incl. LAN
+           IPs/hostnames where TLS is impractical); http/https
+           normalize to ws/wss at connect time (jam/client.dart).
+           Everything else is HTTPS-only (verified by grep): YouTube
+           watch/resolve, i.ytimg.com artwork, LRCLIB/lyrics.ovh/
+           KuGou/QQ lyrics, Google Translate, update-check hosts.
+           No WebView mixed-content, no http:// media fallbacks.
          Orientation: portrait is locked in Dart (lockPortrait in
          lib/main.dart, A2) — NOT via android:screenOrientation, so a
          future video-fullscreen route can opt into landscape for its
@@ -22,6 +32,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+    <!-- REQUEST_INSTALL_PACKAGES: in-app updater (lib/app/updates.dart
+         installApk) requests it at runtime before OpenFile.open on the
+         downloaded APK, with a settings deep-link fallback. No silent
+         installs — the system installer always prompts. -->
     <application
         android:label="Cresca Music"
         android:name="${applicationName}"

@@ -28,6 +28,7 @@ const _pipelineBg = Color(0xFF1C1C1E);
 
 Future<void> openAudioPipelineSheet(
     BuildContext context) async {
+  final messenger = ScaffoldMessenger.of(context);
   try {
     final state = AppScope.of(context);
     final track = state.controller.engine.current;
@@ -52,7 +53,13 @@ Future<void> openAudioPipelineSheet(
         ),
       ),
     );
-  } catch (_) {}
+  } catch (_) {
+    try {
+      messenger.showSnackBar(
+          SnackBar(
+              content: Semantics(liveRegion: true, child: Text('Could not open audio pipeline'))));
+    } catch (_) {}
+  }
 }
 
 class _PipelineCard extends StatefulWidget {
@@ -441,7 +448,11 @@ class _BandSlider extends StatelessWidget {
                   color: subtextOn(_pipelineBg),
                   fontSize: 13))),
       Expanded(
-        child: Slider(
+        // TalkBack announces band + dB while dragging (same
+        // source as the visible label).
+        child: Semantics(
+          label: 'Equalizer $label',
+          child: Slider(
           min: info.minMb.toDouble(),
           max: info.maxMb.toDouble(),
           divisions: ((info.maxMb - info.minMb) ~/ 100)
@@ -449,9 +460,13 @@ class _BandSlider extends StatelessWidget {
           value: mb.toDouble().clamp(
               info.minMb.toDouble(),
               info.maxMb.toDouble()),
+          label: '$label ${(mb / 100).toStringAsFixed(1)} dB',
           onChanged: enabled
               ? (v) => fx.setBand(index, v.round())
               : null,
+          semanticFormatterCallback: (v) =>
+              '$label ${(v / 100).toStringAsFixed(1)} dB',
+        ),
         ),
       ),
       SizedBox(
@@ -482,14 +497,21 @@ class _BoostSlider extends StatelessWidget {
                   color: subtextOn(_pipelineBg),
                   fontSize: 13))),
       Expanded(
-        child: Slider(
+        child: Semantics(
+          label: 'Volume boost',
+          child: Slider(
           min: 0,
           max: 1500,
           divisions: 30,
           value: fx.boostMb.toDouble().clamp(0, 1500),
+          label:
+              'Boost +${(fx.boostMb / 100).toStringAsFixed(1)} dB',
           onChanged: enabled
               ? (v) => fx.setBoost(v.round())
               : null,
+          semanticFormatterCallback: (v) =>
+              'Boost +${(v / 100).toStringAsFixed(1)} dB',
+        ),
         ),
       ),
       SizedBox(
@@ -518,7 +540,8 @@ class _EqSkeleton extends StatelessWidget {
         Padding(
           padding: const EdgeInsets.symmetric(vertical: 12),
           child: Row(children: [
-            _DelayedSpinner(motionOn: motionOn),
+            DelayedSpinner(
+                motionOn: motionOn, color: Colors.white),
             const SizedBox(width: 12),
             Text('Probing system effects…',
                 style: TextStyle(
@@ -541,58 +564,6 @@ class _EqSkeleton extends StatelessWidget {
             ),
           ),
       ],
-    );
-  }
-}
-
-/// Pre-sized spinner slot (20dp) that fades in only after 300 ms —
-/// no flicker on fast attaches. Motion-off shows instantly.
-class _DelayedSpinner extends StatefulWidget {
-  final bool motionOn;
-  const _DelayedSpinner({this.motionOn = true});
-
-  @override
-  State<_DelayedSpinner> createState() => _DelayedSpinnerState();
-}
-
-class _DelayedSpinnerState extends State<_DelayedSpinner> {
-  bool _show = false;
-
-  @override
-  void initState() {
-    super.initState();
-    if (!widget.motionOn) {
-      _show = true;
-      return;
-    }
-    Future<void>.delayed(const Duration(milliseconds: 300), () {
-      if (mounted) setState(() => _show = true);
-    });
-  }
-
-  @override
-  void didUpdateWidget(covariant _DelayedSpinner old) {
-    super.didUpdateWidget(old);
-    if (widget.motionOn != old.motionOn && !widget.motionOn) {
-      setState(() => _show = true);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(
-      width: 20,
-      height: 20,
-      child: AnimatedOpacity(
-        opacity: _show ? 1.0 : 0.0,
-        duration: Duration(
-            milliseconds: motionMs(widget.motionOn, 180)),
-        curve: Curves.easeOut,
-        child: _show
-            ? const CircularProgressIndicator(
-                strokeWidth: 2, color: Colors.white)
-            : null,
-      ),
     );
   }
 }

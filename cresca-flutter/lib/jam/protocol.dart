@@ -9,7 +9,10 @@ import 'dart:convert';
 
 /// The JAM box. Internal constant — never surfaced in the UI.
 /// http/https normalize to ws/wss at connect time.
-const String jamServerUrl = 'http://209.126.81.22:13009';
+const String jamServerUrl = String.fromEnvironment(
+  'JAM_SERVER_URL',
+  defaultValue: 'http://209.126.81.22:13009',
+);
 
 const int jamMaxQueue = 60;
 const int jamMaxMembers = 12;
@@ -18,6 +21,7 @@ const int jamMaxRoomsClient = 100;
 const int jamStateFloorMs = 800;
 const int jamQueueFloorMs = 1000;
 const int jamSyncFloorMs = 10 * 1000;
+const int jamMaxPosMs = 24 * 3600 * 1000;
 
 // ---- Advance mode (v2): tight host↔guest sync, version-gated ----
 //
@@ -79,6 +83,13 @@ double jamEaseSpeed(int driftMs) {
 const String jamCodeAlphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
 const String jamDigitsAlphabet = '23456789';
 
+String jamHttpsOrEmpty(String u, int n) {
+  final s = u.length > n ? u.substring(0, n) : u;
+  return s.startsWith('https://') ? s : '';
+}
+
+int jamClampPos(int pos) => pos < 0 ? 0 : (pos > jamMaxPosMs ? jamMaxPosMs : pos);
+
 bool jamValidCode(String code) {
   try {
     final c = code.trim().toUpperCase();
@@ -122,9 +133,8 @@ class JamTrack {
             0, title.length > 120 ? 120 : title.length),
         'artist': artist.substring(
             0, artist.length > 80 ? 80 : artist.length),
-        'thumb':
-            thumb.substring(0, thumb.length > 300 ? 300 : thumb.length),
-        'url': url.substring(0, url.length > 300 ? 300 : url.length),
+        'thumb': jamHttpsOrEmpty(thumb, 300),
+        'url': jamHttpsOrEmpty(url, 300),
       };
 
   static JamTrack? fromJson(Map<String, dynamic> o) {
@@ -375,7 +385,7 @@ class JamProtocol {
         if (gen > 0) 'gen': gen,
         if (opId.isNotEmpty) 'op': opId,
         'track': track.toJson(),
-        'pos': pos < 0 ? 0 : pos,
+        'pos': jamClampPos(pos),
         'playing': playing,
       });
 
@@ -399,7 +409,7 @@ class JamProtocol {
         'type': 'control',
         'action': _cap(action, 16),
         'id': _cap(id, 16),
-        'pos': pos < 0 ? 0 : pos,
+        'pos': jamClampPos(pos),
         if (opId.isNotEmpty) 'op': opId,
       });
 

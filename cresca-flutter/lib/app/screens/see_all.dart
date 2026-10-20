@@ -415,7 +415,7 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
                 physics:
                     const AlwaysScrollableScrollPhysics(),
                 // Bottom chrome is app-shell; live measured clearance
-                // (210 fallback) so the tail row never slides under it.
+                // (estimator fallback) so the tail row never slides under it.
                 padding: EdgeInsets.only(
                     bottom: BottomChromeScope.clearanceOf(context)),
                 itemCount: _tracks.length + 1,

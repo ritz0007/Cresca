@@ -14,6 +14,7 @@ import '../state.dart';
 import 'track_row.dart';
 
 Future<void> openDownloadsSheet(BuildContext context) async {
+  final messenger = ScaffoldMessenger.of(context);
   try {
     bool motionOn = true;
     try {
@@ -34,7 +35,12 @@ Future<void> openDownloadsSheet(BuildContext context) async {
         ),
       ),
     );
-  } catch (_) {}
+  } catch (_) {
+    try {
+      messenger.showSnackBar(
+          SnackBar(content: Semantics(liveRegion: true, child: Text('Could not open downloads'))));
+    } catch (_) {}
+  }
 }
 
 class DownloadsSheet extends StatefulWidget {
@@ -45,15 +51,15 @@ class DownloadsSheet extends StatefulWidget {
   State<DownloadsSheet> createState() => _DownloadsSheetState();
 }
 
-/// Stashed bytes + row for one swiped-away download, held until the
-/// Undo SnackBar expires so a slip restores the exact file.
+/// Stashed files + row for one swiped-away download, held on disk (not
+/// RAM — audio files are tens of MB) until the Undo SnackBar expires so
+/// a slip restores the exact file.
 class _TrashedDownload {
-  final String path;
-  final List<int> bytes;
+  /// (original path, trash path) pairs, one per moved copy.
+  final List<(String, String)> moved;
   final DownloadEntry? entry;
   _TrashedDownload({
-    required this.path,
-    required this.bytes,
+    required this.moved,
     required this.entry,
   });
 }
@@ -61,40 +67,104 @@ class _TrashedDownload {
 class _DownloadsSheetState extends State<DownloadsSheet> {
   final Map<String, _TrashedDownload> _trash = {};
 
-  /// Swipe-delete with Undo: stash the file bytes + row first (the
-  /// store has no restore API), delete, then offer Undo for 5 s.
-  /// Both delete and restore are announced for screen readers.
+  /// Moves [src] to [dst], falling back to copy+delete across volumes.
+  /// Returns true on success. Never throws.
+  Future<bool> _moveFile(File src, String dst) async {
+    try {
+      final d = File(dst);
+      try {
+        await d.parent.create(recursive: true);
+      } catch (_) {}
+      try {
+        await src.rename(dst);
+        return true;
+      } catch (_) {}
+      try {
+        await src.copy(dst);
+        await src.delete();
+        return true;
+      } catch (_) {
+        return false;
+      }
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Deletes every trash file stashed for [trackId] (Undo expired or
+  /// sheet disposed — no disk leak). Never throws.
+  Future<void> _dropTrash(String trackId) async {
+    final trashed = _trash.remove(trackId);
+    if (trashed == null) return;
+    for (final (_, trashPath) in trashed.moved) {
+      try {
+        final f = File(trashPath);
+        if (await f.exists()) await f.delete();
+      } catch (_) {}
+    }
+  }
+
+  @override
+  void dispose() {
+    // Undo window dies with the sheet: drop stashed files, not RAM.
+    try {
+      for (final trackId in _trash.keys.toList()) {
+        unawaited(_dropTrash(trackId));
+      }
+    } catch (_) {}
+    super.dispose();
+  }
+
+  void unawaited(Future<void> f) {}
+
+  /// Swipe-delete with Undo: moves the file(s) aside on disk first (the
+  /// store has no restore API), deletes the row, then offers Undo for
+  /// 5 s. Both delete and restore are announced for screen readers.
   Future<void> _deleteWithUndo(
       BuildContext context, AppState state, int index) async {
     final items = state.downloads.listAll();
     if (index < 0 || index >= items.length) return;
-    final (track, file, _) = items[index];
+    final (track, _, _) = items[index];
     final messenger = ScaffoldMessenger.of(context);
     final direction = Directionality.of(context);
-    _TrashedDownload? trashed;
+    final view = View.of(context);
+    // Move EVERY copy (app + device dirs) aside before the row delete
+    // drops them all — restoring one copy would lose the other.
+    final moved = <(String, String)>[];
     try {
-      final bytes = await file.readAsBytes();
-      DownloadEntry? entry;
-      try {
-        entry = state.downloads.rows[track.id];
-      } catch (_) {}
-      trashed = _TrashedDownload(
-          path: file.path, bytes: bytes, entry: entry);
-      _trash[track.id] = trashed;
+      var n = 0;
+      for (final (t, file, _) in state.downloads.listAll()) {
+        if (t.id != track.id) continue;
+        try {
+          final trashPath =
+              '${file.parent.path}/.trash/${track.id}_${DateTime.now().millisecondsSinceEpoch}_${n++}_${file.path.split(RegExp(r'[/\\]')).last}';
+          if (await _moveFile(file, trashPath)) {
+            moved.add((file.path, trashPath));
+          }
+        } catch (_) {}
+      }
     } catch (_) {}
+    DownloadEntry? entry;
+    try {
+      entry = state.downloads.rows[track.id];
+    } catch (_) {}
+    if (moved.isNotEmpty) {
+      _trash[track.id] =
+          _TrashedDownload(moved: moved, entry: entry);
+    }
     try {
       await state.downloads.delete(track.id);
     } catch (_) {}
     try {
       SemanticsService.sendAnnouncement(
-          View.of(context), 'Deleted ${track.title}', direction);
+          view, 'Deleted ${track.title}', direction);
     } catch (_) {}
     try {
       messenger.clearSnackBars();
       messenger
           .showSnackBar(
             SnackBar(
-              content: Text('Deleted ${track.title}'),
+              content: Semantics(liveRegion: true, child: Text('Deleted ${track.title}')),
               duration: const Duration(seconds: 5),
               action: SnackBarAction(
                 label: 'Undo',
@@ -106,8 +176,8 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
           )
           .closed
           .then((_) {
-        // Grace period over — drop the stash.
-        _trash.remove(track.id);
+        // Grace period over — drop the stash (files too).
+        unawaited(_dropTrash(track.id));
       });
     } catch (_) {}
   }
@@ -116,12 +186,17 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
       String trackId, String title) async {
     final trashed = _trash.remove(trackId);
     if (trashed == null) return;
+    final messenger = ScaffoldMessenger.of(context);
+    final view = View.of(context);
+    final direction = Directionality.of(context);
     try {
-      final f = File(trashed.path);
-      try {
-        await f.parent.create(recursive: true);
-      } catch (_) {}
-      await f.writeAsBytes(trashed.bytes, flush: true);
+      var ok = false;
+      for (final (origPath, trashPath) in trashed.moved) {
+        try {
+          if (await _moveFile(File(trashPath), origPath)) ok = true;
+        } catch (_) {}
+      }
+      if (!ok) throw StateError('no files restored');
       if (trashed.entry != null) {
         try {
           state.downloads.rows[trackId] = trashed.entry!;
@@ -131,18 +206,25 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
         state.downloads.onChanged?.call();
       } catch (_) {}
       try {
-        SemanticsService.sendAnnouncement(View.of(context),
-            'Restored $title', Directionality.of(context));
+        SemanticsService.sendAnnouncement(view,
+            'Restored $title', direction);
       } catch (_) {}
       try {
-        ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Restored $title')));
+        messenger.showSnackBar(
+            SnackBar(content: Semantics(liveRegion: true, child: Text('Restored $title'))));
       } catch (_) {}
     } catch (_) {
+      // Partial move-back: clean the leftovers, report honestly.
+      for (final (_, trashPath) in trashed.moved) {
+        try {
+          final f = File(trashPath);
+          if (await f.exists()) await f.delete();
+        } catch (_) {}
+      }
       try {
-        ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-                content: Text('Could not restore download')));
+        messenger.showSnackBar(
+            SnackBar(
+                content: Semantics(liveRegion: true, child: Text('Could not restore download'))));
       } catch (_) {}
     }
   }
@@ -170,21 +252,8 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
         return CustomScrollView(
           controller: widget.scroll,
           slivers: [
-            SliverToBoxAdapter(
-              child: Center(
-                child: Container(
-                  margin: const EdgeInsets.only(top: 8),
-                  width: 40,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: Theme.of(context)
-                        .colorScheme
-                        .onSurfaceVariant
-                        .withValues(alpha: 0.5),
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-              ),
+            const SliverToBoxAdapter(
+              child: SheetGrabHandle(),
             ),
             SliverAppBar(
               pinned: true,
@@ -193,6 +262,13 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
               title: Text('Downloads',
                   style:
                       TextStyle(color: glassText(dark))),
+              actions: [
+                IconButton(
+                  icon: const Icon(Icons.close),
+                  tooltip: 'Close downloads',
+                  onPressed: () => Navigator.pop(context),
+                ),
+              ],
             ),
             SliverToBoxAdapter(
               child: Padding(

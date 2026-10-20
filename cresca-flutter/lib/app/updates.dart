@@ -9,6 +9,7 @@ import 'dart:convert';
 
 import 'package:background_downloader/background_downloader.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:http/http.dart' as http;
 import 'package:open_file/open_file.dart';
@@ -37,7 +38,7 @@ class AppUpdate {
 }
 
 /// Parses one release object. Null when unusable.
-AppUpdate? parseRelease(Map<String, dynamic> o) {
+AppUpdate? parseRelease(Map<String, dynamic> o, {String deviceAbi = ''}) {
   try {
     if ((o['draft'] == true) || (o['prerelease'] == true)) return null;
     final tag = (o['tag_name'] ?? '').toString().trim();
@@ -59,7 +60,8 @@ AppUpdate? parseRelease(Map<String, dynamic> o) {
             }
           } catch (_) {}
         }
-        final picked = pickApkAsset(names, deviceAbiOverride: '');
+        final picked =
+            pickApkAsset(names, deviceAbiOverride: deviceAbi);
         if (picked != null) {
           apkName = picked.$1;
           apkUrl = picked.$2;
@@ -70,6 +72,66 @@ AppUpdate? parseRelease(Map<String, dynamic> o) {
         tag: tag, pageUrl: pageUrl, apkUrl: apkUrl, apkName: apkName);
   } catch (_) {
     return null;
+  }
+}
+
+/// Device ABI channel (native Build.SUPPORTED_ABIS, see MainActivity).
+const String deviceAbiChannel = 'cresca.device';
+
+/// Throttle gate (pure, tested): manual always checks; auto skips when
+/// the last *successful* check is within [updateIntervalMs]. Failures
+/// stamp `update_last_attempt` only, never this gate.
+bool shouldCheckForUpdates(
+    {required bool manual, required int nowMs, required int lastCheckMs}) {
+  try {
+    if (manual) return true;
+    return nowMs - lastCheckMs >= updateIntervalMs;
+  } catch (_) {
+    return true;
+  }
+}
+
+/// Normalizes a Build.SUPPORTED_ABIS entry to the release-asset slug
+/// (arm64-v8a → arm64, armeabi-v7a → armv7, x86_64 stays).
+String normalizeAbi(String raw) {
+  try {
+    final l = raw.trim().toLowerCase();
+    if (l.contains('arm64') || l == 'aarch64' || l.contains('v8a')) {
+      return 'arm64';
+    }
+    if (l.contains('armeabi') || l.contains('armv7')) return 'armv7';
+    if (l.contains('x86_64')) return 'x86_64';
+    if (l == 'x86') return 'x86';
+    if (l == 'universal' || l.isEmpty) return 'universal';
+    return l;
+  } catch (_) {
+    return 'universal';
+  }
+}
+
+/// Real device ABI via platform channel (SUPPORTED_ABIS[0], normalized);
+/// 'universal' when unknown. Tests inject [channel].
+Future<String> deviceAbi({MethodChannel? channel}) async {
+  try {
+    final ch = channel ?? const MethodChannel(deviceAbiChannel);
+    final v = await ch
+        .invokeMethod('getSupportedAbis')
+        .timeout(const Duration(seconds: 2));
+    final abis = <String>[];
+    if (v is List) {
+      for (final e in v) {
+        abis.add(e.toString());
+      }
+    } else if (v is String && v.isNotEmpty) {
+      abis.add(v);
+    }
+    for (final a in abis) {
+      final s = normalizeAbi(a);
+      if (s.isNotEmpty) return s;
+    }
+    return 'universal';
+  } catch (_) {
+    return 'universal';
   }
 }
 
@@ -98,7 +160,7 @@ String _abi([String override = '']) {
     for (final n in names) {
       if (n.$1.contains('-universal.apk')) return n;
     }
-    return null;
+    return names.first;
   } catch (_) {
     return null;
   }
@@ -196,17 +258,22 @@ class UpdateChecker {
         },
       ).timeout(const Duration(seconds: 15));
       if (res.statusCode < 200 || res.statusCode >= 300) return null;
+      String abi = '';
+      try {
+        abi = await deviceAbi();
+      } catch (_) {}
       final decoded = jsonDecode(res.body);
       if (single) {
         if (decoded is! Map) return null;
-        return parseRelease(decoded.cast<String, dynamic>());
+        return parseRelease(decoded.cast<String, dynamic>(),
+            deviceAbi: abi);
       }
       if (decoded is! List) return null;
       for (final e in decoded) {
         try {
           if (e is! Map) continue;
-          final u =
-              parseRelease(e.cast<String, dynamic>());
+          final u = parseRelease(e.cast<String, dynamic>(),
+              deviceAbi: abi);
           if (u != null) return u;
         } catch (_) {}
       }
@@ -264,6 +331,9 @@ class UpdateChecker {
             } else if (ev is TaskStatusUpdate) {
               if (ev.status == TaskStatus.complete) {
                 onProgress?.call(100);
+                try {
+                  sub?.cancel();
+                } catch (_) {}
               }
             }
           } catch (_) {}

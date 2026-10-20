@@ -6,6 +6,7 @@
 // + repeat labels ride the engine as before.
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../core/queue.dart';
 import '../../core/track.dart';
@@ -16,6 +17,7 @@ import 'track_menu.dart';
 import 'track_row.dart';
 
 Future<void> openQueueSheet(BuildContext context) async {
+  final messenger = ScaffoldMessenger.of(context);
   try {
     await showModalBottomSheet<void>(
       context: context,
@@ -34,7 +36,12 @@ Future<void> openQueueSheet(BuildContext context) async {
         ),
       ),
     );
-  } catch (_) {}
+  } catch (_) {
+    try {
+      messenger.showSnackBar(
+          SnackBar(content: Semantics(liveRegion: true, child: Text('Could not open queue'))));
+    } catch (_) {}
+  }
 }
 
 /// Queue layout language: one gutter, quiet headers, even rows.
@@ -66,17 +73,7 @@ class QueueSheet extends StatelessWidget {
                 crossAxisAlignment:
                     CrossAxisAlignment.start,
                 children: [
-                  Semantics(
-                    label: 'Drag handle',
-                    container: true,
-                    child: const SizedBox(
-                      width: double.infinity,
-                      height: 48,
-                      child: Center(
-                        child: _QueueGrabBar(),
-                      ),
-                    ),
-                  ),
+                  const SheetGrabHandle(),
                   const SizedBox(height: 8),
                   if (cur != null)
                     _MiniHeader(
@@ -85,14 +82,27 @@ class QueueSheet extends StatelessWidget {
                     padding:
                         const EdgeInsets.fromLTRB(
                             _qGutter, 12, _qGutter, 2),
-                    child: Text('Queue',
-                        style: TextStyle(
-                            color: glassText(true),
-                            fontSize: 20,
-                            fontWeight:
-                                FontWeight.w700,
-                            letterSpacing: -0.3,
-                            height: 1.2)),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text('Queue',
+                              style: TextStyle(
+                                  color: glassText(true),
+                                  fontSize: 20,
+                                  fontWeight:
+                                      FontWeight.w700,
+                                  letterSpacing: -0.3,
+                                  height: 1.2)),
+                        ),
+                        IconButton(
+                          icon: Icon(Icons.close,
+                              color: glassSubtext(true)),
+                          tooltip: 'Close queue',
+                          onPressed: () =>
+                              Navigator.pop(context),
+                        ),
+                      ],
+                    ),
                   ),
                   Padding(
                     padding: const EdgeInsets.fromLTRB(
@@ -124,64 +134,108 @@ class QueueSheet extends StatelessWidget {
                 ),
               )
             else
-              SliverToBoxAdapter(
-                child: ReorderableListView.builder(
-                  shrinkWrap: true,
-                  physics:
-                      const NeverScrollableScrollPhysics(),
-                  itemCount: next.length,
-                  // Drag proxy: elevation + subtle scale while dragging
-                  // (transform/opacity only; default handle kept).
-                  proxyDecorator: (child, _, animation) =>
-                      AnimatedBuilder(
-                    animation: animation,
-                    builder: (_, _) => Transform.scale(
-                      scale: 1.0 + 0.04 * animation.value,
-                      child: Opacity(
-                        opacity: 0.85 + 0.15 * animation.value,
-                        child: Material(
-                          type: MaterialType.transparency,
-                          elevation:
-                              6 * animation.value,
-                          borderRadius:
-                              BorderRadius.circular(12),
-                          child: child,
-                        ),
+              SliverReorderableList(
+                itemCount: next.length,
+                // Drag proxy: elevation + subtle scale while dragging
+                // (transform/opacity only; default handle kept).
+                proxyDecorator: (child, _, animation) =>
+                    AnimatedBuilder(
+                  animation: animation,
+                  builder: (_, _) => Transform.scale(
+                    scale: 1.0 + 0.04 * animation.value,
+                    child: Opacity(
+                      opacity: 0.85 + 0.15 * animation.value,
+                      child: Material(
+                        type: MaterialType.transparency,
+                        elevation:
+                            6 * animation.value,
+                        borderRadius:
+                            BorderRadius.circular(12),
+                        child: child,
                       ),
                     ),
                   ),
-                  onReorderItem: (a, b) {
-                    try {
-                      // onReorderItem hands an already-adjusted
-                      // newIndex (removal accounted for).
-                      state.controller.engine
-                          .moveInOrder(
-                              pos + 1 + a, pos + 1 + b);
-                      state.poke();
-                    } catch (_) {}
-                  },
-                  itemBuilder: (_, i) {
-                    final itemIndex = next[i];
-                    final t = (itemIndex >= 0 &&
-                            itemIndex <
-                                engine.items.length)
-                        ? engine.items[itemIndex]
-                        : null;
-                    if (t == null) {
-                      return SizedBox(
-                          key: ValueKey(
-                              'qn-$itemIndex'));
-                    }
-                    return _QueueRow(
-                      key: ValueKey(
-                          'qn-$itemIndex-$i'),
-                      state: state,
-                      engine: engine,
-                      itemIndex: itemIndex,
-                      track: t,
-                    );
-                  },
                 ),
+                onReorderStart: (_) {
+                  // One haptic per grab — never on move ticks.
+                  try {
+                    HapticFeedback.lightImpact();
+                  } catch (_) {}
+                },
+                onReorderItem: (a, b) {
+                  // Snapshot BEFORE mutation: Undo re-commits the exact
+                  // inverse via applyOrder (commit-on-drop stays).
+                  List<int> prevOrder = const [];
+                  try {
+                    prevOrder = state.controller.engine
+                        .playOrder();
+                  } catch (_) {}
+                  YtTrack? moved;
+                  try {
+                    final movedIndex = next[a];
+                    if (movedIndex >= 0 &&
+                        movedIndex <
+                            engine.items.length) {
+                      moved =
+                          engine.items[movedIndex];
+                    }
+                  } catch (_) {}
+                  try {
+                    // onReorderItem hands an already-adjusted
+                    // newIndex (removal accounted for).
+                    state.controller.engine
+                        .moveInOrder(
+                            pos + 1 + a, pos + 1 + b);
+                    state.poke();
+                  } catch (_) {
+                    return;
+                  }
+                  if (moved == null) return;
+                  final movedTitle = moved.title;
+                  try {
+                    ScaffoldMessenger.of(context)
+                      ..hideCurrentSnackBar()
+                      ..showSnackBar(SnackBar(
+                        content: Semantics(liveRegion: true, child: Text('Moved "$movedTitle"')),
+                        duration: const Duration(
+                            seconds: 5),
+                        action: SnackBarAction(
+                          label: 'Undo',
+                          onPressed: () {
+                            try {
+                              state.controller.engine
+                                  .applyOrder(
+                                      prevOrder);
+                              state.poke();
+                            } catch (_) {}
+                          },
+                        ),
+                      ));
+                  } catch (_) {}
+                },
+                itemBuilder: (_, i) {
+                  final itemIndex = next[i];
+                  final t = (itemIndex >= 0 &&
+                          itemIndex <
+                              engine.items.length)
+                      ? engine.items[itemIndex]
+                      : null;
+                  if (t == null) {
+                    return SizedBox(
+                        key: ValueKey(
+                            'qn-$itemIndex'));
+                  }
+                  return _QueueRow(
+                    // Stable track-id key (never positional): reorder
+                    // keeps row state instead of remounting every row.
+                    key: ValueKey('qn-${t.id}'),
+                    state: state,
+                    engine: engine,
+                    itemIndex: itemIndex,
+                    reorderIndex: i,
+                    track: t,
+                  );
+                },
               ),
             // Suggested next: autoplay-ranked, one-tap add. Renders
             // nothing while loading/empty; queue rows above keep their
@@ -380,13 +434,17 @@ class _NowPlayingEqState extends State<_NowPlayingEq>
 class _QueueRow extends StatefulWidget {
   final AppState state;
   final QueueEngine engine;
+  // Engine item index (removal identity) vs sliver position (drag
+  // identity): the key is the track id, so both survive reorder.
   final int itemIndex;
+  final int reorderIndex;
   final YtTrack track;
   const _QueueRow(
       {super.key,
       required this.state,
       required this.engine,
       required this.itemIndex,
+      required this.reorderIndex,
       required this.track});
 
   @override
@@ -420,35 +478,65 @@ class _QueueRowState extends State<_QueueRow>
 
   void _remove() {
     if (_removing) return;
+    // Snapshot BEFORE mutation: Undo re-inserts at this slot and
+    // restores the exact order (see restoreRemoved).
+    final track = widget.track;
+    final at = widget.itemIndex;
+    List<int> prevOrder = const [];
+    try {
+      prevOrder =
+          widget.state.controller.engine.playOrder();
+    } catch (_) {}
+    ScaffoldMessengerState? messenger;
+    try {
+      messenger = ScaffoldMessenger.of(context);
+    } catch (_) {}
+    void finish() {
+      if (_removed) return;
+      _removed = true;
+      try {
+        widget.state.controller.engine.removeAt(at);
+        widget.state.poke();
+      } catch (_) {}
+      final m = messenger;
+      if (m == null) return;
+      try {
+        m
+          ..hideCurrentSnackBar()
+          ..showSnackBar(SnackBar(
+            content: Semantics(liveRegion: true, child: Text('Removed "${track.title}"')),
+            duration: const Duration(seconds: 5),
+            action: SnackBarAction(
+              label: 'Undo',
+              onPressed: () {
+                try {
+                  widget.state.controller.engine
+                      .restoreRemoved(
+                          index: at,
+                          track: track,
+                          prevOrder: prevOrder);
+                  widget.state.poke();
+                } catch (_) {}
+              },
+            ),
+          ));
+      } catch (_) {}
+    }
+
     try {
       final waitMs = widget.state.motionMs(220);
       setState(() => _removing = true);
-      _c.reverse().whenComplete(() {
-        if (_removed) return;
-        _removed = true;
-        try {
-          widget.state.controller.engine
-              .removeAt(widget.itemIndex);
-          widget.state.poke();
-        } catch (_) {}
-      });
+      _c.reverse().whenComplete(finish);
       // Safety net: if the reverse never completes (disposed mid
       // reorder), still perform the identical removal — once.
       Future<void>.delayed(
           Duration(milliseconds: waitMs + 120), () {
         if (!mounted || _removed) return;
-        _removed = true;
-        try {
-          widget.state.controller.engine
-              .removeAt(widget.itemIndex);
-          widget.state.poke();
-        } catch (_) {}
+        finish();
       });
     } catch (_) {
       try {
-        widget.state.controller.engine
-            .removeAt(widget.itemIndex);
-        widget.state.poke();
+        finish();
       } catch (_) {}
     }
   }
@@ -470,7 +558,9 @@ class _QueueRowState extends State<_QueueRow>
             begin: const Offset(0.08, 0),
             end: Offset.zero,
           ).animate(curved),
-          child: GestureDetector(
+          child: ReorderableDelayedDragStartListener(
+            index: widget.reorderIndex,
+            child: GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: () {
         try {
@@ -485,8 +575,17 @@ class _QueueRowState extends State<_QueueRow>
             Padding(
               padding:
                   const EdgeInsets.symmetric(horizontal: 4),
-              child: Icon(Icons.drag_handle,
-                  color: glassSubtext(true), size: 20),
+              child: ReorderableDragStartListener(
+                index: widget.reorderIndex,
+                child: Semantics(
+                  button: true,
+                  label: 'Reorder ${track.title}',
+                  excludeSemantics: true,
+                  child: Icon(Icons.drag_handle,
+                      color: glassSubtext(true),
+                      size: 20),
+                ),
+              ),
             ),
             ClipRRect(
               borderRadius:
@@ -533,6 +632,7 @@ class _QueueRowState extends State<_QueueRow>
           ],
         ),
       ),
+          ),
           ),
         ),
       ),
@@ -797,9 +897,8 @@ class _SuggestionRowState extends State<_SuggestionRow>
             widget.state.poke();
             try {
               ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                      content:
-                          Text('Added to queue')));
+                  SnackBar(
+                      content: Semantics(liveRegion: true, child: Text('Added to queue'))));
             } catch (_) {}
           }
         } catch (_) {}
@@ -902,20 +1001,6 @@ class _SuggestionRowState extends State<_SuggestionRow>
         ),
       ),
     );
-  }
-}
-
-/// Sheet grab bar: 40x4 pill in a 48px touch/semantics zone.
-class _QueueGrabBar extends StatelessWidget {
-  const _QueueGrabBar();
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-        width: 40,
-        height: 4,
-        decoration: BoxDecoration(
-            color: Colors.white54,
-            borderRadius: BorderRadius.circular(2)));
   }
 }
 

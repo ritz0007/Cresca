@@ -15,7 +15,7 @@ void main() {
   });
 
   group('apk pick', () {
-    test('exact ABI wins, else universal, else null', () {
+    test('exact ABI wins, else universal, else first', () {
       final names = [
         ('cresca-arm64.apk', 'u-arm64'),
         ('cresca-universal.apk', 'u-uni'),
@@ -53,6 +53,76 @@ void main() {
       expect(u.tag, 'v1.5.1');
       expect(u.apkUrl, 'https://apk');
       expect(u.pageUrl, 'https://rel');
+    });
+  });
+
+  group('throttle', () {
+    test('manual always checks; auto gated on last success', () {
+      expect(
+          shouldCheckForUpdates(
+              manual: true, nowMs: 1000, lastCheckMs: 999),
+          isTrue);
+      expect(
+          shouldCheckForUpdates(
+              manual: false,
+              nowMs: updateIntervalMs,
+              lastCheckMs: 0),
+          isTrue);
+      expect(
+          shouldCheckForUpdates(
+              manual: false, nowMs: 1000, lastCheckMs: 1000),
+          isFalse);
+      expect(
+          shouldCheckForUpdates(
+              manual: false,
+              nowMs: 1000 + updateIntervalMs,
+              lastCheckMs: 1000),
+          isTrue);
+      expect(
+          shouldCheckForUpdates(
+              manual: false,
+              nowMs: 1000 + updateIntervalMs - 1,
+              lastCheckMs: 1000),
+          isFalse);
+    });
+  });
+
+  group('abi', () {
+    test('normalizes SUPPORTED_ABIS entries to asset slugs', () {
+      expect(normalizeAbi('arm64-v8a'), 'arm64');
+      expect(normalizeAbi('armeabi-v7a'), 'armv7');
+      expect(normalizeAbi('x86_64'), 'x86_64');
+      expect(normalizeAbi(''), 'universal');
+    });
+
+    test('no exact/universal falls back to first asset', () {
+      final names = [
+        ('cresca-arm64.apk', 'u-arm64'),
+        ('cresca-x86_64.apk', 'u-x86'),
+      ];
+      expect(pickApkAsset(names, deviceAbiOverride: 'armv7')!.$2,
+          'u-arm64');
+      expect(pickApkAsset([], deviceAbiOverride: 'arm64'), isNull);
+    });
+
+    test('parseRelease honors device ABI', () {
+      Map<String, dynamic> rel(List<Map<String, String>> assets) => {
+            'tag_name': 'v1.5.1',
+            'html_url': 'https://rel',
+            'assets': [
+              for (final a in assets)
+                {
+                  'name': a['name'],
+                  'browser_download_url': a['url']
+                },
+            ],
+          };
+      final o = rel([
+        {'name': 'cresca-arm64.apk', 'url': 'https://arm64'},
+        {'name': 'cresca-universal.apk', 'url': 'https://uni'},
+      ]);
+      expect(parseRelease(o, deviceAbi: 'arm64')!.apkUrl, 'https://arm64');
+      expect(parseRelease(o, deviceAbi: 'x86_64')!.apkUrl, 'https://uni');
     });
   });
 }

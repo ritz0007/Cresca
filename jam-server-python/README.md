@@ -64,4 +64,14 @@ offset) places late joiners and resume-from-pause exactly.
 
 Guards: 100 rooms max, 12 members/room, 60-track queue cap, 8 KB message
 cap, 800 ms host-state floor, 5 creates/min/IP, 3 h room TTL, empty rooms
-reaped after 60 s.
+reaped after 60 s, 1500 total sockets + 30/IP cap, 10 s handshake
+timeout, Origin allow-list (JAM_ALLOWED_ORIGINS), pos clamped 0..24h,
+https-only thumb/url, op id required.
+
+## Secure transport (WSS behind a reverse proxy)
+
+Terminate TLS at nginx/Caddy and forward plain ws to this box.
+App uses wss://jam.example.com (build with
+--dart-define=JAM_SERVER_URL=https://jam.example.com).
+Set JAM_ALLOWED_ORIGINS=https://jam.example.com to reject
+foreign browser Origins (native apps send none and always pass).

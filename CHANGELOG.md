@@ -1,5 +1,24 @@
 # Changelog — Cresca Music
 
+## 2.1.0 (UI refresh U1–U10; pubspec `2.1.0+23`)
+- Motion ON by default with kill-switch (U1); estimator clearance keeps
+  the last row above MiniPlayer + tab bar (U2); honest loading/empty/
+  error/Retry states everywhere (U3); full player + queue + video sheets
+  with drag handles, haptics, Snackbar-Undo, Resume pill (U4–U5);
+  search tuned (U6); library undo + reorder (U7); one-style toasts with
+  TalkBack live-region announcement (U8); release-harness fixes (U9).
+- Accessibility gate (U10): every sheet has a labelled `Close <sheet>`
+  (+ `Close player` pinned over the art), all icon-only buttons
+  labelled, seek/volume/EQ sliders announce values via
+  `semanticFormatterCallback`, podcast speed/sleep expose button role +
+  value from the engine notifiers, inactive tabs stay `ExcludeSemantics`.
+  Dump-verified zero unlabelled interactive nodes; 200% scale pass with
+  no overflow exceptions and Close always reachable.
+- Release gates: release-signed APK (`com.cresca.cresca_app`, kept
+  side-by-side with the stable native `com.cresca.app` — never rename),
+  label "Cresca Music", `usesCleartextTraffic` kept with host-by-host
+  proof (127.0.0.1 just_audio proxy + JAM hosts; everything else HTTPS).
+
 ## 1.5.1 (Flutter port — unreleased; pubspec still `1.5.0+20`)
 - Full Flutter rewrite of the native app per `RESTRUCTURE.md` (catalog
   A1–A9, T1–T2, H1–H11, R1–R3, S1–S4, M1, P1–P16, L1–L6, G1–G2,
@@ -47,6 +66,13 @@
   permission (`lib/system/live_updates.dart`), Spotify PKCE auth slice
   (`lib/auth/spotify.dart`), encrypted YouTube session G1
   (`lib/auth/session.dart`, session sheet).
+- Queue + lyrics + video interaction pass (U5): queue reorder haptic on
+  grab + 5 s Snackbar-Undo on reorder/remove (engine `restoreRemoved`
+  re-inserts + restores order, sounding track never yanks), drag handles
+  + long-press with labelled `Reorder …` semantics and track-id keys;
+  lyrics explicit `Resume` pill (finger beats auto-scroll until tapped,
+  tap-vs-drag gate 300 ms/8 dp); video one-tap labelled `Close video`
+  + quality-picker option semantics. Portrait lock unchanged.
 - Fixes since the port began (per commit messages): Range pre-flight skips
   403s in seconds; shell-overlay mini-player Material-wrapper crash fix;
   artist resolve skips YTM type badges + strips "Topic"; endless-scroll

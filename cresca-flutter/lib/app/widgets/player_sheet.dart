@@ -12,6 +12,7 @@ import 'dart:ui' show FontFeature, ImageFilter;
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
 
@@ -42,6 +43,7 @@ const _gapLg = 16.0;
 
 Future<void> openPlayerSheet(BuildContext context,
     {bool video = false}) async {
+  final messenger = ScaffoldMessenger.of(context);
   try {
     await showModalBottomSheet<void>(
       context: context,
@@ -59,7 +61,12 @@ Future<void> openPlayerSheet(BuildContext context,
             PlayerSheet(scroll: scroll, video: video),
       ),
     );
-  } catch (_) {}
+  } catch (_) {
+    try {
+      messenger.showSnackBar(
+          SnackBar(content: Semantics(liveRegion: true, child: Text('Could not open player'))));
+    } catch (_) {}
+  }
 }
 
 class PlayerSheet extends StatefulWidget {
@@ -73,7 +80,9 @@ class PlayerSheet extends StatefulWidget {
 }
 
 class _PlayerSheetState extends State<PlayerSheet> {
-  double? _dragPos;
+  // Scrub position while dragging: ValueNotifier so finger ticks rebuild
+  // only the seek bar (via ValueListenableBuilder), never the sheet.
+  final ValueNotifier<double?> _dragPos = ValueNotifier(null);
   bool _lyricsExpanded = false;
   final ValueNotifier<List<LyricLine>> _lyricLines = ValueNotifier(const []);
 
@@ -154,6 +163,9 @@ class _PlayerSheetState extends State<PlayerSheet> {
 
   @override
   void dispose() {
+    try {
+      _dragPos.dispose();
+    } catch (_) {}
     try {
       _lyricLines.dispose();
     } catch (_) {}
@@ -351,8 +363,7 @@ class _PlayerSheetState extends State<PlayerSheet> {
                       state: state,
                       handle: _videoHandle,
                       dragPos: _dragPos,
-                      onDrag: (v) =>
-                          setState(() => _dragPos = v),
+                      onDrag: (v) => _dragPos.value = v,
                       onSeek: (ms) {
                         try {
                           state.controller.player.seek(
@@ -366,8 +377,7 @@ class _PlayerSheetState extends State<PlayerSheet> {
                           _videoHandle.seekToMs
                               ?.call(ms.toInt());
                         } catch (_) {}
-                        setState(
-                            () => _dragPos = null);
+                        _dragPos.value = null;
                       },
                     ),
                     _Transport(
@@ -415,16 +425,38 @@ class _PlayerSheetState extends State<PlayerSheet> {
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       SizedBox(height: topPad + 6),
-                      Semantics(
-                        label: 'Drag handle',
-                        container: true,
-                        child: const SizedBox(
-                          width: double.infinity,
-                          height: 28,
-                          child: Center(
-                            child: _GrabBar(),
+                      Stack(
+                        alignment: Alignment.center,
+                        children: [
+                          const SheetGrabHandle(),
+                          // TalkBack close: drag-to-dismiss is
+                          // pointer-only, so pin a labelled Close.
+                          Positioned(
+                            right: 4,
+                            top: 0,
+                            bottom: 0,
+                            child: Center(
+                              child: IconButton(
+                                icon: const Icon(
+                                    Icons.close,
+                                    color: Colors.white,
+                                    shadows: [
+                                      Shadow(
+                                          blurRadius: 8,
+                                          color:
+                                              Colors.black87)
+                                    ]),
+                                tooltip: 'Close player',
+                                onPressed: () {
+                                  try {
+                                    Navigator.pop(
+                                        context);
+                                  } catch (_) {}
+                                },
+                              ),
+                            ),
                           ),
-                        ),
+                        ],
                       ),
                       if (!_lyricsExpanded)
                         // Plain caption over the dark blurred
@@ -458,21 +490,6 @@ class _PlayerSheetState extends State<PlayerSheet> {
         );
       },
     );
-  }
-}
-
-/// Grab bar (shared chrome): 40x4 pill centered in a 48px
-/// touch/semantics zone.
-class _GrabBar extends StatelessWidget {
-  const _GrabBar();
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-        width: 40,
-        height: 4,
-        decoration: BoxDecoration(
-            color: Colors.white54,
-            borderRadius: BorderRadius.circular(2)));
   }
 }
 
@@ -827,7 +844,8 @@ class _MarqueeTitleState extends State<_MarqueeTitle> {
     final myGen = gen ?? ++_gen;
     try {
       if (!mounted || _disposed || !_ctrl.hasClients) return;
-      final motion = AppScope.of(context).motionOn;
+      final scope = AppScope.of(context);
+      final motion = scope.motionOn;
       final max = _ctrl.position.maxScrollExtent;
       if (max <= 0 || !motion) {
         if (mounted) setState(() => _overflows = false);
@@ -841,7 +859,7 @@ class _MarqueeTitleState extends State<_MarqueeTitle> {
       while (mounted && !_disposed && myGen == _gen && _ctrl.hasClients) {
         bool motionNow = false;
         try {
-          motionNow = AppScope.of(context).motionOn;
+          motionNow = scope.motionOn;
         } catch (_) {
           motionNow = false;
         }
@@ -1552,6 +1570,8 @@ class _ArtSwipeState extends State<_ArtSwipe>
         try {
           if (mounted) setState(() => _dx = 0);
         } catch (_) {}
+        // A swipe fired on a popped sheet must not advance the queue.
+        if (!mounted) return;
         try {
           fire?.call();
         } catch (_) {}
@@ -1560,6 +1580,7 @@ class _ArtSwipeState extends State<_ArtSwipe>
       try {
         if (mounted) setState(() => _dx = 0);
       } catch (_) {}
+      if (!mounted) return;
       try {
         fire?.call();
       } catch (_) {}
@@ -1652,7 +1673,12 @@ class _StaticArtBody extends StatelessWidget {
                     artist: track.artist,
                     thumbUrl: art,
                     watchUrl: track.watchUrl),
-                size: width),
+                size: width,
+                // Full-width poster decodes at maxres width (1280):
+                // the 480 list cap would smear it on xxxhdpi.
+                // hq thumb behind it for maxres 404s.
+                maxPx: 1280,
+                fallbackUrl: track.thumbUrl),
           ),
         );
     return LayoutBuilder(
@@ -1668,10 +1694,19 @@ class _StaticArtBody extends StatelessWidget {
 
 /// Thin seek bar (reference): hairline progress, tap + drag scrub,
 /// knob swell while dragging, elapsed left / -remaining right.
-class _SeekBar extends StatelessWidget {
+///
+/// 60fps interpolation: positionStream ticks ~1Hz, so painting it
+/// directly hurdles the thumb. A Ticker repaints every frame from the
+/// last stream anchor instead: `drag ?? hold ?? (lastPos + elapsed if
+/// playing)`. The finger is 1:1 while dragging (the stream never fights
+/// back); after release the seek target is held until the stream
+/// catches up (within 1s) or 2s pass, so the thumb never snaps back.
+/// Swell rides AnimatedScale (transform-only, no layout shift).
+/// RepaintBoundary keeps every frame scoped to this bar.
+class _SeekBar extends StatefulWidget {
   final AppState state;
   final VideoHandle? handle;
-  final double? dragPos;
+  final ValueListenable<double?> dragPos;
   final ValueChanged<double> onDrag;
   final ValueChanged<double> onSeek;
   const _SeekBar(
@@ -1682,111 +1717,267 @@ class _SeekBar extends StatelessWidget {
       required this.onSeek});
 
   @override
+  State<_SeekBar> createState() => _SeekBarState();
+}
+
+class _SeekBarState extends State<_SeekBar>
+    with SingleTickerProviderStateMixin {
+  late final Ticker _ticker;
+  Duration _lastPos = Duration.zero;
+  DateTime _lastAt = DateTime.now();
+  bool _playing = false;
+  // Seek target held after release until positionStream catches up.
+  double? _hold;
+  DateTime? _holdAt;
+  double _holdTotal = 0;
+  StreamSubscription<Duration>? _posSub;
+  StreamSubscription<PlayerState>? _stateSub;
+  VoidCallback? _dragListener;
+
+  @override
+  void initState() {
+    super.initState();
+    final player = widget.state.controller.player;
+    try {
+      _lastPos = player.position;
+    } catch (_) {}
+    try {
+      _playing = player.playing;
+    } catch (_) {}
+    _lastAt = DateTime.now();
+    _posSub = player.positionStream.listen((p) {
+      _lastPos = p;
+      _lastAt = DateTime.now();
+      final h = _hold;
+      if (h != null &&
+          (p.inMilliseconds.toDouble() - h).abs() < 1000) {
+        _hold = null;
+        _holdAt = null;
+      }
+      if (mounted) setState(() {});
+      _pokeTicker();
+    }, onError: (_) {});
+    _stateSub = player.playerStateStream.listen((s) {
+      // Re-anchor on pause so the frozen thumb matches the last painted
+      // frame instead of jumping back to a stale tick.
+      if (_playing && !s.playing) {
+        try {
+          _lastPos =
+              Duration(milliseconds: _displayMs(_totalMs()).toInt());
+        } catch (_) {}
+        _lastAt = DateTime.now();
+      }
+      _playing = s.playing;
+      if (mounted) setState(() {});
+      _pokeTicker();
+    }, onError: (_) {});
+    _ticker = createTicker((_) {
+      final at = _holdAt;
+      if (_hold != null &&
+          at != null &&
+          DateTime.now().difference(at).inMilliseconds > 2000) {
+        _hold = null;
+        _holdAt = null;
+      }
+      if (_hold != null && _totalMs() != _holdTotal) {
+        // Track changed under a pending hold: never paint the old
+        // track's target on the new track.
+        _hold = null;
+        _holdAt = null;
+      }
+      // Stops itself when the frame goes static.
+      _pokeTicker();
+      if (mounted) setState(() {});
+    });
+    _dragListener = () {
+      if (mounted) setState(() {});
+      _pokeTicker();
+    };
+    widget.dragPos.addListener(_dragListener!);
+    _pokeTicker();
+  }
+
+  @override
+  void didUpdateWidget(covariant _SeekBar old) {
+    super.didUpdateWidget(old);
+    if (!identical(old.dragPos, widget.dragPos)) {
+      try {
+        if (_dragListener != null) {
+          old.dragPos.removeListener(_dragListener!);
+        }
+      } catch (_) {}
+      _dragListener = () {
+        if (mounted) setState(() {});
+        _pokeTicker();
+      };
+      widget.dragPos.addListener(_dragListener!);
+    }
+  }
+
+  @override
+  void dispose() {
+    try {
+      _posSub?.cancel();
+    } catch (_) {}
+    try {
+      _stateSub?.cancel();
+    } catch (_) {}
+    try {
+      if (_dragListener != null) {
+        widget.dragPos.removeListener(_dragListener!);
+      }
+    } catch (_) {}
+    try {
+      _ticker.dispose();
+    } catch (_) {}
+    super.dispose();
+  }
+
+  /// Runs the ticker only while something moves (playing or a pending
+  /// hold); a paused, settled bar costs zero frames.
+  void _pokeTicker() {
+    final need = _playing || _hold != null;
+    try {
+      if (need && !_ticker.isTicking) _ticker.start();
+      if (!need && _ticker.isTicking) _ticker.stop();
+    } catch (_) {}
+  }
+
+  double _totalMs() {
+    try {
+      return (widget.state.controller.player.duration ?? Duration.zero)
+          .inMilliseconds
+          .toDouble();
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  double _displayMs(double total) {
+    if (total <= 0) return 0;
+    final drag = widget.dragPos.value;
+    if (drag != null) return drag.clamp(0.0, total);
+    final h = _hold;
+    if (h != null) return h.clamp(0.0, total);
+    final base = _lastPos.inMilliseconds.toDouble().clamp(0.0, total);
+    if (!_playing) return base;
+    final elapsed =
+        DateTime.now().difference(_lastAt).inMilliseconds.toDouble();
+    return (base + elapsed).clamp(0.0, total);
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return StreamBuilder<Duration>(
-      stream: state.controller.player.positionStream,
-      builder: (_, posSnap) {
-        final pos =
-            (posSnap.data ?? Duration.zero).inMilliseconds.toDouble();
-        final total = (state.controller.player.duration ?? Duration.zero)
-            .inMilliseconds
-            .toDouble();
-        final value = dragPos ??
-            (total <= 0 ? 0.0 : pos.clamp(0.0, total));
-        final clamped =
-            total <= 0 ? 0.0 : value.clamp(0.0, total);
-        final max = total <= 0 ? 1.0 : total;
-        Widget slider(double v) => SliderTheme(
-              data: SliderTheme.of(context).copyWith(
-                // Elegant thin track; compact thumb resting, gentle swell
-                // while dragging; wide overlay keeps the 48px touch target.
-                trackHeight: 3,
-                trackShape:
-                    const RoundedRectSliderTrackShape(),
-                thumbShape: RoundSliderThumbShape(
-                    enabledThumbRadius:
-                        dragPos != null ? 9 : 6),
-                overlayShape: const RoundSliderOverlayShape(
-                    overlayRadius: 24),
-                activeTrackColor:
-                    Colors.white.withValues(alpha: 0.95),
-                inactiveTrackColor:
-                    Colors.white.withValues(alpha: 0.22),
-                thumbColor: Colors.white,
-              ),
-              child: Slider(
-                value: max <= 0 ? 0.0 : v.clamp(0.0, max),
-                max: max,
-                onChanged: onDrag,
-                onChangeEnd: onSeek,
-              ),
-            );
-        // Progress animates between position ticks (TweenAnimationBuilder
-        // eases the painted value; dragging stays immediate).
-        final bar = dragPos != null
-            ? slider(clamped)
-            : TweenAnimationBuilder<double>(
-                duration:
-                    Duration(milliseconds: state.motionMs(180)),
-                curve: Curves.linear,
-                tween: Tween<double>(begin: 0, end: clamped),
-                builder: (_, v, _) => slider(v),
-              );
-        return Padding(
-          padding: const EdgeInsets.symmetric(horizontal: _gutter),
-          child: Column(
+    final total = _totalMs();
+    final value = _displayMs(total);
+    final clamped =
+        total <= 0 ? 0.0 : value.clamp(0.0, total);
+    final max = total <= 0 ? 1.0 : total;
+    // Finger wins while dragging — the stream underneath never moves
+    // the thumb, so scrub is 1:1 with no fight-back. Only this bar
+    // rebuilds (ticker + drag listener), never the sheet.
+    final dragging = widget.dragPos.value != null;
+    final bar = RepaintBoundary(
+      child: SliderTheme(
+        data: SliderTheme.of(context).copyWith(
+          trackHeight: 3,
+          trackShape:
+              const RoundedRectSliderTrackShape(),
+          thumbShape: const RoundSliderThumbShape(
+              enabledThumbRadius: 6),
+          overlayShape: const RoundSliderOverlayShape(
+              overlayRadius: 24),
+          activeTrackColor:
+              Colors.white.withValues(alpha: 0.95),
+          inactiveTrackColor:
+              Colors.white.withValues(alpha: 0.22),
+          thumbColor: Colors.white,
+        ),
+        // Swell animates (transform-only, so layout never shifts).
+        child: AnimatedScale(
+          scale: dragging ? 1.35 : 1.0,
+          duration: Duration(
+              milliseconds: widget.state.motionMs(150)),
+          curve: Curves.easeOut,
+          child: Semantics(
+            label: 'Seek',
+            child: Slider(
+              // TalkBack announces position while scrubbing.
+              semanticFormatterCallback: (v) =>
+                  '${fmtMs(v.toInt())} of ${fmtMs(max.toInt())}',
+              value:
+                  max <= 0 ? 0.0 : clamped.clamp(0.0, max),
+            max: max,
+            onChanged: widget.onDrag,
+            onChangeEnd: (v) {
+              // Hold the target until the stream catches up — no
+              // snap-back to the pre-seek tick.
+              _hold = v;
+              _holdTotal = total;
+              _holdAt = DateTime.now();
+              _pokeTicker();
+              widget.onSeek(v);
+            },
+            ),
+          ),
+        ),
+      ),
+    );
+    return Padding(
+      padding:
+          const EdgeInsets.symmetric(horizontal: _gutter),
+      child: Column(
+        children: [
+          bar,
+          Padding(
+            padding:
+                const EdgeInsets.only(top: _gapXs),
+            // Quiet time labels + shadows over the dark wash —
+            // no scrim box (it stamped a black rectangle).
+            child: Row(
+            mainAxisAlignment:
+                MainAxisAlignment.spaceBetween,
             children: [
-              bar,
-              Padding(
-                padding: const EdgeInsets.only(top: _gapXs),
-                // Quiet time labels + shadows over the dark wash —
-                // no scrim box (it stamped a black rectangle).
-                child: Row(
-                mainAxisAlignment:
-                    MainAxisAlignment.spaceBetween,
-                children: [
-                    Text(fmtMs(value.toInt()),
-                        style: TextStyle(
-                            color: Colors.white
-                                .withValues(alpha: 0.65),
-                            fontSize: 12,
-                            fontWeight: FontWeight.w500,
-                            letterSpacing: 0.3,
-                            fontFeatures: const [
-                              FontFeature.tabularFigures()
-                            ],
-                            shadows: const [
-                              Shadow(
-                                  blurRadius: 8,
-                                  color: Colors.black87)
-                            ])),
-                    // BitChord/YTM parity: remaining, not total.
-                    Text(
-                        total <= 0
-                            ? fmtMs(0)
-                            : '-${fmtMs((total - value).clamp(0.0, total).toInt())}',
-                        style: TextStyle(
-                            color: Colors.white
-                                .withValues(alpha: 0.65),
-                            fontSize: 12,
-                            fontWeight: FontWeight.w500,
-                            letterSpacing: 0.3,
-                            fontFeatures: const [
-                              FontFeature.tabularFigures()
-                            ],
-                            shadows: const [
-                              Shadow(
-                                  blurRadius: 8,
-                                  color: Colors.black87)
-                            ])),
-                  ],
-                ),
-              ),
+                Text(fmtMs(value.toInt()),
+                style: TextStyle(
+                    color: Colors.white
+                        .withValues(alpha: 0.65),
+                    fontSize: 12,
+                    fontWeight: FontWeight.w500,
+                    letterSpacing: 0.3,
+                    fontFeatures: const [
+                      FontFeature.tabularFigures()
+                    ],
+                    shadows: const [
+                      Shadow(
+                          blurRadius: 8,
+                          color: Colors.black87)
+                    ])),
+              // BitChord/YTM parity: remaining, not total.
+              Text(
+                  total <= 0
+                      ? fmtMs(0)
+                      : '-${fmtMs((total - value).clamp(0.0, total).toInt())}',
+                  style: TextStyle(
+                      color: Colors.white
+                          .withValues(alpha: 0.65),
+                      fontSize: 12,
+                      fontWeight: FontWeight.w500,
+                      letterSpacing: 0.3,
+                      fontFeatures: const [
+                        FontFeature.tabularFigures()
+                      ],
+                      shadows: const [
+                        Shadow(
+                            blurRadius: 8,
+                            color: Colors.black87)
+                      ])),
             ],
           ),
-        );
-      },
-    );
+        ),
+      ],
+    ),
+  );
   }
 }
 
@@ -1990,6 +2181,14 @@ class _VolumeRow extends StatefulWidget {
 
 class _VolumeRowState extends State<_VolumeRow> {
   late final Stream<double> _stream = _sysVolume();
+  // Finger position while dragging: the stream round-trip lags, so the
+  // thumb shows this until release (1:1 tracking, no fight-back).
+  // [_hold] keeps the release target until the stream confirms it, so
+  // the thumb never snaps back to a stale tick (watch() is
+  // event-driven, not a ticker — no frame interpolation needed here).
+  final ValueNotifier<double?> _drag = ValueNotifier(null);
+  double? _hold;
+  double? _base;
 
   static Stream<double> _sysVolume() async* {
     try {
@@ -2001,63 +2200,96 @@ class _VolumeRowState extends State<_VolumeRow> {
   }
 
   @override
+  void dispose() {
+    try {
+      _drag.dispose();
+    } catch (_) {}
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final state = widget.state;
     return StreamBuilder<double>(
       stream: _stream,
       initialData: 1.0,
       builder: (_, snap) {
         final v = (snap.data ?? 1.0).clamp(0.0, 1.0);
-        // Volume eases between stream ticks (120ms); the drag itself
-        // stays immediate via onChanged driving the system volume.
-        final slider = TweenAnimationBuilder<double>(
-          duration: Duration(milliseconds: state.motionMs(pressMs)),
-          curve: Curves.linear,
-          tween: Tween<double>(begin: 0, end: v),
-          builder: (_, av, _) => SliderTheme(
-            data: SliderTheme.of(context).copyWith(
-              trackHeight: 4,
-              thumbShape:
-                  const RoundSliderThumbShape(
-                      enabledThumbRadius: 7),
-              overlayShape:
-                  const RoundSliderOverlayShape(
-                      overlayRadius: 24),
-              activeTrackColor: Colors.white
-                  .withValues(alpha: 0.9),
-              inactiveTrackColor: Colors.white
-                  .withValues(alpha: 0.22),
-              thumbColor: Colors.white,
-            ),
-            child: Slider(
-              value: av,
-              onChanged: (nv) {
-                try {
-                  SystemVolume.setLevel(nv);
-                } catch (_) {}
-              },
-            ),
-          ),
-        );
-        return Padding(
-          padding:
-              const EdgeInsets.fromLTRB(
-                  _gutter, 0, _gutter, _gapXs),
-          child: Row(
-            children: [
-              Icon(Icons.volume_down_outlined,
-                  size: 20,
-                  color: Colors.white
-                      .withValues(alpha: 0.65)),
-              const SizedBox(width: _gapMd),
-              Expanded(child: slider),
-              const SizedBox(width: _gapMd),
-              Icon(Icons.volume_up_outlined,
-                  size: 20,
-                  color: Colors.white
-                      .withValues(alpha: 0.65)),
-            ],
-          ),
+        // Round-trip landed (or an external change won): adopt live.
+        if (_hold != null && _base != null && v != _base) {
+          _hold = null;
+          _base = null;
+        }
+        return ValueListenableBuilder<double?>(
+          valueListenable: _drag,
+          builder: (_, drag, _) {
+            final shown =
+                (drag ?? _hold ?? v).clamp(0.0, 1.0);
+            // Direct value: the old TweenAnimationBuilder rebuilt its
+            // tween from 0 on every tick, so the thumb lagged behind
+            // the finger and jittered on stream updates.
+            final slider = RepaintBoundary(
+              child: SliderTheme(
+                data: SliderTheme.of(context).copyWith(
+                  trackHeight: 4,
+                  thumbShape:
+                      const RoundSliderThumbShape(
+                          enabledThumbRadius: 7),
+                  overlayShape:
+                      const RoundSliderOverlayShape(
+                          overlayRadius: 24),
+                  activeTrackColor: Colors.white
+                      .withValues(alpha: 0.9),
+                  inactiveTrackColor: Colors.white
+                      .withValues(alpha: 0.22),
+                  thumbColor: Colors.white,
+                ),
+                child: Semantics(
+                  label: 'Volume',
+                  child: Slider(
+                    value: shown,
+                    // TalkBack announces the level while dragging.
+                    semanticFormatterCallback: (nv) =>
+                        'Volume ${(nv * 100).round()} percent',
+                  onChanged: (nv) {
+                    if (_drag.value == null) {
+                      // New finger wins outright: drop any stale hold.
+                      _base = v;
+                      _hold = null;
+                    }
+                    _drag.value = nv;
+                    try {
+                      SystemVolume.setLevel(nv);
+                    } catch (_) {}
+                  },
+                  onChangeEnd: (_) {
+                    _hold = _drag.value;
+                    _drag.value = null;
+                  },
+                  ),
+                ),
+              ),
+            );
+            return Padding(
+              padding:
+                  const EdgeInsets.fromLTRB(
+                      _gutter, 0, _gutter, _gapXs),
+              child: Row(
+                children: [
+                  Icon(Icons.volume_down_outlined,
+                      size: 20,
+                      color: Colors.white
+                          .withValues(alpha: 0.65)),
+                  const SizedBox(width: _gapMd),
+                  Expanded(child: slider),
+                  const SizedBox(width: _gapMd),
+                  Icon(Icons.volume_up_outlined,
+                      size: 20,
+                      color: Colors.white
+                          .withValues(alpha: 0.65)),
+                ],
+              ),
+            );
+          },
         );
       },
     );
@@ -2076,6 +2308,7 @@ class DetailsSection extends StatefulWidget {
 
 class _DetailsSectionState extends State<DetailsSection> {
   VideoDetails? _details;
+  int _gen = 0;
 
   @override
   void initState() {
@@ -2090,10 +2323,14 @@ class _DetailsSectionState extends State<DetailsSection> {
   }
 
   Future<void> _load() async {
+    final myGen = ++_gen;
+    final watchUrl = widget.track.watchUrl;
     final store = AppScope.of(context).details;
     try {
-      final d = await store.load(widget.track.watchUrl);
-      if (!mounted) return;
+      final d = await store.load(watchUrl);
+      // Skip-fast guard: a superseded load must not paint the old
+      // track's details over the new one.
+      if (!mounted || myGen != _gen) return;
       setState(() => _details = d);
     } catch (_) {}
   }

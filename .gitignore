@@ -15,9 +15,14 @@ docs/ARCHITECTURE.md
 Thumbs.db
 .idea/
 *.iml
+__pycache__/
 
 # Release APKs live on GitHub Releases, not in git
 *.apk
+*.zip
+
+# Secrets / local env — never commit
+.env
 
 # Release signing lives OUTSIDE the repo — never commit keys
 cresca-flutter/android/key.properties

@@ -14,6 +14,7 @@ import '../design.dart';
 import '../state.dart';
 
 Future<void> openJamSheet(BuildContext context) async {
+  final messenger = ScaffoldMessenger.of(context);
   try {
     await showModalBottomSheet<void>(
       context: context,
@@ -27,7 +28,12 @@ Future<void> openJamSheet(BuildContext context) async {
         builder: (_, scroll) => JamSheet(scroll: scroll),
       ),
     );
-  } catch (_) {}
+  } catch (_) {
+    try {
+      messenger.showSnackBar(
+          SnackBar(content: Semantics(liveRegion: true, child: Text('Could not open JAM'))));
+    } catch (_) {}
+  }
 }
 
 class JamSheet extends StatelessWidget {
@@ -55,20 +61,7 @@ class JamSheet extends StatelessWidget {
           controller: scroll,
           slivers: [
             SliverToBoxAdapter(
-              child: Center(
-                child: Container(
-                  margin: const EdgeInsets.only(top: 8),
-                  width: 40,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: Theme.of(context)
-                        .colorScheme
-                        .onSurfaceVariant
-                        .withValues(alpha: 0.5),
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-              ),
+              child: const SheetGrabHandle(),
             ),
             SliverAppBar(
               pinned: true,
@@ -77,6 +70,13 @@ class JamSheet extends StatelessWidget {
               title: Text('Listen together',
                   style:
                       TextStyle(color: glassText(dark))),
+              actions: [
+                IconButton(
+                  icon: const Icon(Icons.close),
+                  tooltip: 'Close jam',
+                  onPressed: () => Navigator.pop(context),
+                ),
+              ],
             ),
             SliverToBoxAdapter(
               child: Padding(
@@ -224,12 +224,16 @@ class _JoinFormState extends State<_JoinForm> {
           onPressed:
               canCreate ? () => _go(host: true) : null,
           child: _busy
-              ? const Row(
+              ? Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    _DelayedSpinner(size: 20, strokeWidth: 2),
-                    SizedBox(width: 10),
-                    Text('Creating…',
+                    DelayedSpinner(
+                        size: 20,
+                        strokeWidth: 2,
+                        motionOn:
+                            widget.state.motionOn),
+                    const SizedBox(width: 10),
+                    const Text('Creating…',
                         style: TextStyle(
                             fontWeight: FontWeight.w700)),
                   ],
@@ -569,71 +573,17 @@ class _RoomCard extends StatelessWidget {
   }
 
   Future<void> _share(BuildContext context, String code) async {
+    final messenger = ScaffoldMessenger.of(context);
     try {
       await SharePlus.instance.share(ShareParams(
         text: 'Join my JAM on Cresca: $code\n'
             'cresca://jam/$code',
       ));
-    } catch (_) {}
-  }
-}
-
-/// Spinner that reserves its slot from frame one (no size jump) and
-/// fades in only after 300 ms (no flicker on fast loads). Motion-off
-/// shows it immediately (1 ms via [motionMs]).
-class _DelayedSpinner extends StatefulWidget {
-  final double size;
-  final double strokeWidth;
-  const _DelayedSpinner({this.size = 20, this.strokeWidth = 2});
-
-  @override
-  State<_DelayedSpinner> createState() => _DelayedSpinnerState();
-}
-
-class _DelayedSpinnerState extends State<_DelayedSpinner> {
-  bool _show = false;
-
-  @override
-  void initState() {
-    super.initState();
-    // Motion flag reads post-frame: dependOnInheritedWidget is illegal
-    // in initState, so the delay starts once the scope is readable.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      bool on = true;
+    } catch (_) {
       try {
-        on = AppScope.of(context).motionOn;
+        messenger.showSnackBar(
+            SnackBar(content: Semantics(liveRegion: true, child: Text('Could not share invite'))));
       } catch (_) {}
-      if (!on) {
-        setState(() => _show = true);
-        return;
-      }
-      Future<void>.delayed(
-          const Duration(milliseconds: 300), () {
-        if (mounted) setState(() => _show = true);
-      });
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    bool on = true;
-    try {
-      on = AppScope.of(context).motionOn;
-    } catch (_) {}
-    return SizedBox(
-      width: widget.size,
-      height: widget.size,
-      child: AnimatedOpacity(
-        opacity: _show ? 1.0 : 0.0,
-        duration:
-            Duration(milliseconds: motionMs(on, 180)),
-        curve: Curves.easeOut,
-        child: _show
-            ? CircularProgressIndicator(
-                strokeWidth: widget.strokeWidth)
-            : null,
-      ),
-    );
+    }
   }
 }

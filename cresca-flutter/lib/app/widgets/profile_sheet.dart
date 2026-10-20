@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import '../app.dart';
 import '../design.dart';
 import '../state.dart';
+import 'cresca_toast.dart';
 import 'session_sheet.dart';
 
 Future<void> openProfileSheet(BuildContext context) async {
@@ -15,7 +16,9 @@ Future<void> openProfileSheet(BuildContext context) async {
     bool motionOn = true;
     try {
       motionOn = AppScope.of(context).motionOn;
-    } catch (_) {}
+    } catch (_) {
+      // silent: motion probe, animation default (on) is safe
+    }
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -31,7 +34,10 @@ Future<void> openProfileSheet(BuildContext context) async {
         ),
       ),
     );
-  } catch (_) {}
+  } catch (e, st) {
+    await logUserFailure(context, 'open settings failed', e, st);
+    await showCrescaToast(context, 'Could not open settings — Retry');
+  }
 }
 
 class ProfileSheet extends StatefulWidget {
@@ -71,21 +77,8 @@ class _ProfileSheetState extends State<ProfileSheet> {
         return CustomScrollView(
           controller: widget.scroll,
           slivers: [
-            SliverToBoxAdapter(
-              child: Center(
-                child: Container(
-                  margin: const EdgeInsets.only(top: 8),
-                  width: 40,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: Theme.of(context)
-                        .colorScheme
-                        .onSurfaceVariant
-                        .withValues(alpha: 0.5),
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-              ),
+            const SliverToBoxAdapter(
+              child: SheetGrabHandle(),
             ),
             SliverAppBar(
               pinned: true,
@@ -94,6 +87,13 @@ class _ProfileSheetState extends State<ProfileSheet> {
               title: Text('Profile & settings',
                   style:
                       TextStyle(color: glassText(dark))),
+              actions: [
+                IconButton(
+                  icon: const Icon(Icons.close),
+                  tooltip: 'Close profile',
+                  onPressed: () => Navigator.pop(context),
+                ),
+              ],
             ),
             SliverToBoxAdapter(
               child: Padding(
@@ -127,7 +127,8 @@ class _ProfileSheetState extends State<ProfileSheet> {
                       trailing: _busySpotify
                           // Delayed fade-in (300 ms): no flicker on
                           // fast connects; slot pre-sized, no jump.
-                          ? const _DelayedSpinner()
+                          ? DelayedSpinner(
+                              motionOn: state.motionOn)
                           : TextButton(
                               onPressed: () =>
                                   _spotifyTap(state),
@@ -220,7 +221,12 @@ class _ProfileSheetState extends State<ProfileSheet> {
                         try {
                           await state.live
                               .openNotificationSettings();
-                        } catch (_) {}
+                        } catch (e, st) {
+                          await state.crash.log(
+                              'notification settings failed',
+                              e,
+                              st);
+                        }
                       },
                     ),
                     _H('Downloads'),
@@ -256,11 +262,17 @@ class _ProfileSheetState extends State<ProfileSheet> {
                           final msg =
                               await state.clearCache();
                           if (context.mounted) {
-                            ScaffoldMessenger.of(context)
-                                .showSnackBar(SnackBar(
-                                    content: Text(msg)));
+                            await showCrescaToast(
+                                context, msg);
                           }
-                        } catch (_) {}
+                        } catch (e, st) {
+                          await state.crash.log(
+                              'clear cache failed', e, st);
+                          if (context.mounted) {
+                            await showCrescaToast(context,
+                                'Could not clear cache — Retry');
+                          }
+                        }
                       },
                     ),
                     _H('Diagnostics'),
@@ -276,12 +288,19 @@ class _ProfileSheetState extends State<ProfileSheet> {
                           final ok = await state.crash
                               .shareNewest();
                           if (context.mounted && !ok) {
-                            ScaffoldMessenger.of(context)
-                                .showSnackBar(const SnackBar(
-                                    content: Text(
-                                        'No crash log yet')));
+                            await showCrescaToast(context,
+                                'No crash log yet');
                           }
-                        } catch (_) {}
+                        } catch (e, st) {
+                          await state.crash.log(
+                              'share crash log failed',
+                              e,
+                              st);
+                          if (context.mounted) {
+                            await showCrescaToast(context,
+                                'No crash log yet');
+                          }
+                        }
                       },
                     ),
                     _H('Updates'),
@@ -293,7 +312,9 @@ class _ProfileSheetState extends State<ProfileSheet> {
                       final subtitle = checking
                           ? 'Checking for updates…'
                           : u == null
-                              ? 'You are on the latest release.'
+                              ? (state.updateCheckFailed
+                                  ? 'Update check failed — Retry'
+                                  : 'You are on the latest release.')
                               : prog >= 0
                                   ? 'Downloading ${u.tag}… ${prog.round()}%'
                                   : downloaded
@@ -371,7 +392,8 @@ class _ProfileSheetState extends State<ProfileSheet> {
                             trailing: checking
                                 // Delayed fade-in (300 ms); slot
                                 // pre-sized, no jump.
-                                ? const _DelayedSpinner()
+                                ? DelayedSpinner(
+                                    motionOn: state.motionOn)
                                 : IconButton(
                                     icon: const Icon(
                                         Icons.refresh_outlined),
@@ -387,8 +409,8 @@ class _ProfileSheetState extends State<ProfileSheet> {
                                                   ctx)
                                               .showSnackBar(
                                                   SnackBar(
-                                                      content: Text(
-                                                          msg)));
+                                                      content: Semantics(liveRegion: true, child: Text(
+                                                          msg))));
                                         }
                                       } catch (_) {}
                                     },
@@ -450,8 +472,8 @@ class _ProfileSheetState extends State<ProfileSheet> {
                                                           ctx)
                                                       .showSnackBar(
                                                           SnackBar(
-                                                              content: Text(
-                                                                  msg)));
+                                                              content: Semantics(liveRegion: true, child: Text(
+                                                                  msg))));
                                                 }
                                               } catch (_) {}
                                             },
@@ -502,25 +524,25 @@ class _ProfileSheetState extends State<ProfileSheet> {
       if (!state.spotify.hasClientId) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                  content: Text(
-                      'Spotify is not configured in this build')));
+              SnackBar(
+                  content: Semantics(liveRegion: true, child: Text(
+                      'Spotify is not configured in this build'))));
         }
         return;
       }
       final ok = await state.spotify.connect();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            content: Text(ok
+            content: Semantics(liveRegion: true, child: Text(ok
                 ? 'Spotify connected'
-                : 'Spotify connect failed — try again')));
+                : 'Spotify connect failed — try again'))));
         setState(() {});
       }
     } catch (_) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-                content: Text('Spotify connect failed')));
+            SnackBar(
+                content: Semantics(liveRegion: true, child: Text('Spotify connect failed'))));
       }
     } finally {
       if (mounted) setState(() => _busySpotify = false);
@@ -578,62 +600,6 @@ class _UpdateProgressState extends State<_UpdateProgress> {
       curve: Curves.easeOut,
       builder: (_, v, child) => LinearProgressIndicator(
         value: v.clamp(0.0, 1.0),
-      ),
-    );
-  }
-}
-
-/// Pre-sized spinner slot (20dp) that fades in only after 300 ms —
-/// no flicker on fast loads, no size jump. Motion-off shows instantly.
-class _DelayedSpinner extends StatefulWidget {
-  const _DelayedSpinner();
-
-  @override
-  State<_DelayedSpinner> createState() => _DelayedSpinnerState();
-}
-
-class _DelayedSpinnerState extends State<_DelayedSpinner> {
-  bool _show = false;
-
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      bool on = true;
-      try {
-        on = AppScope.of(context).motionOn;
-      } catch (_) {}
-      if (!on) {
-        setState(() => _show = true);
-        return;
-      }
-      Future<void>.delayed(const Duration(milliseconds: 300), () {
-        if (mounted) setState(() => _show = true);
-      });
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    bool on = true;
-    try {
-      on = AppScope.of(context).motionOn;
-    } catch (_) {}
-    int ms = 180;
-    try {
-      ms = AppScope.of(context).motionMs(180);
-    } catch (_) {}
-    return SizedBox(
-      width: 20,
-      height: 20,
-      child: AnimatedOpacity(
-        opacity: _show ? 1.0 : 0.0,
-        duration: Duration(milliseconds: on ? ms : 1),
-        curve: Curves.easeOut,
-        child: _show
-            ? const CircularProgressIndicator(strokeWidth: 2)
-            : null,
       ),
     );
   }

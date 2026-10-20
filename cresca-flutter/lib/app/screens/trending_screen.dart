@@ -8,6 +8,7 @@
 
 import 'package:flutter/material.dart';
 
+import '../../core/rail_slots.dart';
 import '../../core/track.dart';
 import '../app.dart';
 import '../design.dart';
@@ -15,6 +16,7 @@ import '../state.dart';
 import '../widgets/track_menu.dart';
 import '../widgets/track_row.dart';
 import '../widgets/player_sheet.dart';
+import '../widgets/state_widgets.dart';
 import 'see_all.dart';
 
 class TrendingScreen extends StatefulWidget {
@@ -30,6 +32,11 @@ class _TrendingScreenState extends State<TrendingScreen> {
   List<YtTrack> _topVideos = [];
   final Map<String, List<YtTrack>> _railVideos = {};
   bool _videoLoading = false;
+
+  /// U6 per-rail status for the video fetches: 'global' + rail titles
+  /// whose fetch threw. Rebuilt per load (success clears). Combined
+  /// with state.trendingFailedRails for the in-place banners.
+  Set<String> _videoFailed = {};
 
   @override
   void initState() {
@@ -48,26 +55,36 @@ class _TrendingScreenState extends State<TrendingScreen> {
   /// Defensive video fetch: chart video shelf + one video search per
   /// region rail, in parallel. Any failure falls back to the
   /// state (audio-chart) lists, which still open the video player on
-  /// tap via video_sheet's muxed resolve. Never throws.
+  /// tap via video_sheet's muxed resolve. Failures are recorded per
+  /// rail in _videoFailed (success clears) for the in-place banners.
+  /// Never throws.
   Future<void> _loadVideoTop() async {
     try {
       if (_videoLoading) return;
       _videoLoading = true;
       final state = AppScope.of(context);
-      const titles = ['Hindi', 'International', 'Telugu', 'Punjabi'];
+      const titles = trendingRailTitles;
+      final failed = <String>{};
+      Future<List<YtTrack>> guardVideo(
+          String key, Future<List<YtTrack>> f) async {
+        try {
+          final r = await f.timeout(const Duration(seconds: 30));
+          if (r.isEmpty) failed.add(key);
+          return r;
+        } catch (_) {
+          failed.add(key);
+          return <YtTrack>[];
+        }
+      }
       try {
         final futures = <Future>[
-          state.repo
-              .trendingVideoTracks(max: 25)
-              .timeout(const Duration(seconds: 30))
-              .catchError((_) => <YtTrack>[]),
+          guardVideo('global', state.repo.trendingVideoTracks(max: 25)),
           for (final t in titles)
-            state.repo
-                .searchVideos(
+            guardVideo(
+                t,
+                state.repo.searchVideos(
                     'top ${t.toLowerCase()} songs official music video',
-                    max: 15)
-                .timeout(const Duration(seconds: 30))
-                .catchError((_) => <YtTrack>[]),
+                    max: 15)),
         ];
         final results = await Future.wait(futures);
         if (!mounted) return;
@@ -82,8 +99,11 @@ class _TrendingScreenState extends State<TrendingScreen> {
               if (vids.isNotEmpty) _railVideos[titles[i]] = vids;
             }
           } catch (_) {}
+          _videoFailed = failed;
         });
-      } catch (_) {}
+      } catch (_) {
+        if (mounted) setState(() => _videoFailed = failed);
+      }
       _videoLoading = false;
     } catch (_) {
       _videoLoading = false;
@@ -104,20 +124,36 @@ class _TrendingScreenState extends State<TrendingScreen> {
     return AnimatedBuilder(
       animation: state,
       builder: (_, _) {
-        // Refresh dissolve mirrors home: rails fade behind the native
-        // spinner while reloading (opacity only, motion-gated).
-        final refreshing = state.trendingLoading &&
-            (_topVideos.isNotEmpty ||
-                state.trendingGlobal.isNotEmpty ||
-                state.trendingRails.isNotEmpty);
-        final dissolve = refreshing ? 0.35 : 1.0;
-        final dissolveMs = state.motionMs(220);
         // Effective chart: video shelf first (rank kept), state chart
         // fallback (rank kept). Never re-sorted.
         final top =
             _topVideos.isNotEmpty ? _topVideos : state.trendingGlobal;
-        final rails = state.trendingRails;
-        final allEmpty = top.isEmpty && rails.isEmpty;
+        // Canonical rail slots in paint order (trendingRailTitles): each
+        // resolves to video tracks, else state tracks, else — when that
+        // rail's fetch failed and nothing is loading — an in-place
+        // InlineRetryBanner. One rail's 403 never blanks its siblings.
+        final anyLoading = state.trendingLoading || _videoLoading;
+        final stateTracks = <String, List<YtTrack>>{};
+        for (final r in state.trendingRails) {
+          try {
+            stateTracks[r.section.title] = r.tracks;
+          } catch (_) {}
+        }
+        final slots = resolveRailSlots(
+          titles: trendingRailTitles,
+          primary: _railVideos,
+          fallback: stateTracks,
+          failedPrimary: _videoFailed,
+          failedFallback: state.trendingFailedRails,
+        );
+        final anyTracks =
+            top.isNotEmpty || slots.any((s) => s.tracks.isNotEmpty);
+        final anyFailed = _videoFailed.isNotEmpty ||
+            state.trendingFailedRails.isNotEmpty;
+        // Refresh dissolve mirrors home: rails fade behind the native
+        // spinner while reloading (opacity only, motion-gated).
+        final dissolve = (anyLoading && anyTracks) ? 0.35 : 1.0;
+        final dissolveMs = state.motionMs(220);
         return Scaffold(
           appBar: AppBar(
             title: const Text('Trending'),
@@ -140,47 +176,64 @@ class _TrendingScreenState extends State<TrendingScreen> {
                   onRefresh: _refresh,
                   child: ListView(
                     // Bottom chrome is app-shell; scroll under the glass.
-                    // Live measured clearance (210 fallback pre-measure).
+                    // Live measured clearance (estimator fallback pre-measure).
                     padding: EdgeInsets.only(
                         bottom:
                             BottomChromeScope.clearanceOf(context)),
                     children: [
-                      if (allEmpty &&
-                          (state.trendingLoading || _videoLoading))
-                        const _TrendSkeleton()
-                      else if (allEmpty)
-                        _TrendError(onRetry: _refresh)
+                      if (!anyTracks && anyLoading)
+                        const LoadingState()
+                      else if (!anyTracks)
+                        // Page-level failure (all rails): full ErrorRetry
+                        // with deck copy. Mixed failure banners per rail.
+                        ErrorRetry(
+                          message:
+                              "Couldn't load 'Trending' — check connection",
+                          onRetry: _refresh,
+                        )
                       else ...[
-                        _Dissolve(
+                        // Stale-rows refresh failure: one banner on top,
+                        // content underneath stays interactive.
+                        if (anyFailed && !anyLoading)
+                          InlineRetryBanner(onRetry: _refresh),
+                        Dissolve(
                           opacity: dissolve,
                           ms: dissolveMs,
                           child: _VideoGlobal(
                               tracks: top,
                               state: state,
-                              loading: state.trendingLoading &&
-                                  top.isEmpty,
+                              loading: anyLoading && top.isEmpty,
                               onRetry: _refresh),
                         ),
-                        for (var ri = 0;
-                            ri < rails.length;
-                            ri++)
-                          _Dissolve(
-                            opacity: dissolve,
-                            ms: dissolveMs,
-                            child: StaggerEntrance(
-                              key: ValueKey(
-                                  'trend-${rails[ri].section.title}'),
-                              index: ri + 1,
-                              child: _RegionRail(
-                                title:
-                                    rails[ri].section.title,
-                                tracks: _railVideos[rails[ri]
-                                            .section
-                                            .title] ??
-                                    rails[ri].tracks,
+                        for (var i = 0; i < slots.length; i++)
+                          if (slots[i].tracks.isNotEmpty)
+                            Dissolve(
+                              opacity: dissolve,
+                              ms: dissolveMs,
+                              child: StaggerEntrance(
+                                key: ValueKey(
+                                    'trend-${slots[i].title}'),
+                                index: i + 1,
+                                child: _RegionRail(
+                                  title: slots[i].title,
+                                  tracks: slots[i].tracks,
+                                ),
+                              ),
+                            )
+                          else if (slots[i].failed && !anyLoading)
+                            Dissolve(
+                              opacity: dissolve,
+                              ms: dissolveMs,
+                              child: StaggerEntrance(
+                                key: ValueKey(
+                                    'trend-${slots[i].title}-retry'),
+                                index: i + 1,
+                                child: _RailRetry(
+                                  title: slots[i].title,
+                                  onRetry: _refresh,
+                                ),
                               ),
                             ),
-                          ),
                       ],
                     ],
                   ),
@@ -190,6 +243,34 @@ class _TrendingScreenState extends State<TrendingScreen> {
           ),
         );
       },
+    );
+  }
+}
+
+/// In-place per-rail failure: the rail's title names the scope, Retry
+/// re-runs the same loader as the page. Never throws.
+class _RailRetry extends StatelessWidget {
+  final String title;
+  final VoidCallback onRetry;
+  const _RailRetry({required this.title, required this.onRetry});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(title,
+              style: const TextStyle(
+                  fontSize: 17, fontWeight: FontWeight.w600)),
+          InlineRetryBanner(
+            message: "Couldn't load '$title' — check connection",
+            onRetry: onRetry,
+          ),
+        ],
+      ),
     );
   }
 }
@@ -231,9 +312,13 @@ class _VideoGlobal extends StatelessWidget {
           ),
           if (tracks.isEmpty)
             if (loading)
-              const _TrendSkeleton()
+              const LoadingState(itemCount: 4)
             else
-              _TrendError(onRetry: onRetry),
+              ErrorRetry(
+                message:
+                    "Couldn't load 'Top 100 Global' — check connection",
+                onRetry: onRetry,
+              ),
           for (var i = 0;
               i < (tracks.length > 10 ? 10 : tracks.length);
               i++)
@@ -276,6 +361,7 @@ class _VideoRankRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final state = AppScope.of(context);
     final scheme = Theme.of(context).colorScheme;
+    final low = track.title.toLowerCase();
     // RepaintBoundary: ranked rows rebuild on AppState notifies —
     // keep each row out of the list's repaint scope.
     return RepaintBoundary(
@@ -323,8 +409,7 @@ class _VideoRankRow extends StatelessWidget {
               ),
             ),
             Icon(
-                track.title.toLowerCase().contains('official') ||
-                        track.title.toLowerCase().contains('mv')
+                low.contains('official') || low.contains('mv')
                     ? Icons.play_circle_outline
                     : Icons.music_video_outlined,
                 color: scheme.onSurfaceVariant),
@@ -343,52 +428,6 @@ class _VideoRankRow extends StatelessWidget {
         ),
         ),
       ),
-    );
-  }
-}
-
-/// Home _ErrorCard pattern: honest offline message + Retry.
-class _TrendError extends StatelessWidget {
-  final VoidCallback onRetry;
-  const _TrendError({required this.onRetry});
-
-  @override
-  Widget build(BuildContext context) {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(32),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.cloud_off_outlined, size: 48),
-            const SizedBox(height: 12),
-            const Text(
-                'Trending videos unavailable — check your connection.',
-                textAlign: TextAlign.center),
-            const SizedBox(height: 12),
-            FilledButton(
-                onPressed: onRetry,
-                child: const Text('Retry')),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-/// Skeleton rows while the first trending load is in flight.
-class _TrendSkeleton extends StatelessWidget {
-  const _TrendSkeleton();
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      children: const [
-        TrackSkeleton(),
-        TrackSkeleton(),
-        TrackSkeleton(),
-        TrackSkeleton(),
-      ],
     );
   }
 }
@@ -555,25 +594,6 @@ class _RegionRail extends StatelessWidget {
           ),
         ],
       ),
-    );
-  }
-}
-
-/// Refresh dissolve: opacity-only fade behind the native spinner.
-/// Duration is pre-collapsed via motionMs by the caller.
-class _Dissolve extends StatelessWidget {
-  final double opacity;
-  final int ms;
-  final Widget child;
-  const _Dissolve(
-      {required this.opacity, required this.ms, required this.child});
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedOpacity(
-      duration: Duration(milliseconds: ms),
-      opacity: opacity,
-      child: child,
     );
   }
 }

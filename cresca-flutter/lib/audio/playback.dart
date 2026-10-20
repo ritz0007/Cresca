@@ -9,7 +9,6 @@
 // call gate, skip budget) is unit-tested in core/.
 
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:audio_service/audio_service.dart';
@@ -253,6 +252,40 @@ class PlayerController {
   int _loadGen = 0;
   int _lastBroadcastMs = 0;
 
+  /// Transport debounce: one Next/Prev tap = one advance. Rapid taps,
+  /// notification double-delivery (skipToNext + custom actionNext both
+  /// route to next()), and swipe+button stacks otherwise queue
+  /// overlapping next() calls that each advance the engine. System
+  /// auto-advance (track completion) bypasses via [force].
+  static const Duration transportDebounce = Duration(milliseconds: 400);
+  int _lastNextMs = 0;
+  int _lastPrevMs = 0;
+  // Last manual Next/Prev tap (any direction). A natural `completed`
+  // landing in this window belongs to the OLD track — the tap already
+  // advanced past it, so the auto-advance must stand down, else one
+  // tap near track-end skips two songs.
+  static const Duration completedRaceWindow = Duration(milliseconds: 2000);
+  int _lastManualAdvanceMs = 0;
+  /// True when this tap lands inside the debounce window (drop it).
+  /// Never throws.
+  bool _debounced(bool forward) {
+    try {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (forward) {
+        if (now - _lastNextMs < transportDebounce.inMilliseconds) {
+          return true;
+        }
+        _lastNextMs = now;
+      } else {
+        if (now - _lastPrevMs < transportDebounce.inMilliseconds) {
+          return true;
+        }
+        _lastPrevMs = now;
+      }
+    } catch (_) {}
+    return false;
+  }
+
   /// Live gapless window: track ids in playlist order, mirrored with the
   /// player playlist ([player.audioSources]). Tail fills append live (no
   /// rebuild = no jank); manual loads replace the playlist wholesale.
@@ -277,6 +310,19 @@ class PlayerController {
   /// Fired after every successful track load and transport advance so
   /// the app layer can top up autoplay tails (radio endless).
   Future<void> Function()? onAdvanced;
+
+  /// Fired BEFORE the engine adopts a new index (track change) so the
+  /// app layer can persist per-track state (episode bookmarks) while
+  /// the outgoing track + position are still live. Fire-and-forget;
+  /// never throws (invocation is guarded).
+  Future<void> Function()? onTrackChanging;
+
+  void _emitChanging() {
+    try {
+      final f = onTrackChanging;
+      if (f != null) unawaited(f());
+    } catch (_) {}
+  }
 
   // ----- Endless-queue refill hook (ADDITIVE ONLY) -----
   // The app layer wires [refillFor] to repository.endlessRefillFor and
@@ -420,6 +466,7 @@ class PlayerController {
 
   Future<void> playQueue(List<YtTrack> tracks, int start) async {
     try {
+      _emitChanging();
       engine.setQueue(tracks, start);
       skipBudget.reset();
       _emit();
@@ -429,6 +476,7 @@ class PlayerController {
 
   Future<void> playAt(int index) async {
     try {
+      _emitChanging();
       engine.playAt(index);
       skipBudget.reset();
       _emit();
@@ -436,8 +484,15 @@ class PlayerController {
     } catch (_) {}
   }
 
-  Future<void> next() async {
+  Future<void> next({bool force = false}) async {
     try {
+      // One Next = one advance (rapid-tap / notification double-fire /
+      // swipe+button stacks). Auto-advance passes force:true.
+      if (!force && _debounced(true)) return;
+      try {
+        _lastManualAdvanceMs = DateTime.now().millisecondsSinceEpoch;
+      } catch (_) {}
+      _emitChanging();
       // Repeat-one never re-resolves: rewind + play in place.
       if (engine.repeatMode == repeatOne && engine.current != null) {
         try {
@@ -451,13 +506,22 @@ class PlayerController {
         _emit();
         return;
       }
-      // Instant path: the next item is already buffered behind current
-      // (gapless window) — seek over, no resolve, no spinner.
+      // Engine-first (single-tap single-advance): adopt the next index
+      // BEFORE seeking the gapless window. The seek fires
+      // currentIndexStream → _onIndex, which adopts by tag; with the
+      // engine already there (idx == currentIndex) it returns instead
+      // of advancing a second time. The old order (seek, then
+      // engine.next()) raced the stream event → intermittent 2-song
+      // skips from one tap.
       final want = engine.upcomingIds(1);
-      if (want.isNotEmpty && await _tryInstantAdvance(want.first, 1)) {
-        final r = engine.next();
-        _emit();
-        if (r.step == NextStep.play) {
+      final r = engine.next();
+      _emit();
+      if (r.step == NextStep.play) {
+        final cur = engine.current;
+        if (want.isNotEmpty &&
+            cur != null &&
+            cur.id == want.first.id &&
+            await _tryInstantAdvance(want.first, 1)) {
           unawaited(saveSessionNow());
           _maybeBroadcast(force: true);
           unawaited(_slideWindow(1));
@@ -465,14 +529,8 @@ class PlayerController {
           try {
             await onAdvanced?.call();
           } catch (_) {}
-        } else if (r.step == NextStep.exhausted) {
-          await _onExhausted(r.exhaustedTrack);
+          return;
         }
-        return;
-      }
-      final r = engine.next();
-      _emit();
-      if (r.step == NextStep.play) {
         await _loadCurrent(autoplay: true);
       } else if (r.step == NextStep.exhausted) {
         await _onExhausted(r.exhaustedTrack);
@@ -480,25 +538,31 @@ class PlayerController {
     } catch (_) {}
   }
 
-  Future<void> previous() async {
+  Future<void> previous({bool force = false}) async {
     try {
-      // Instant path: previous item still sits in the window behind us.
+      if (!force && _debounced(false)) return;
+      try {
+        _lastManualAdvanceMs = DateTime.now().millisecondsSinceEpoch;
+      } catch (_) {}
+      _emitChanging();
+      // Engine-first, same race as next(): adopt before seeking so the
+      // late index event finds idx == currentIndex and returns.
       final prev = engine.previousIds(1);
-      if (prev.isNotEmpty && await _tryInstantAdvance(prev.first, -1)) {
-        final idx = engine.previous();
-        _emit();
-        if (idx >= 0) {
+      final idx = engine.previous();
+      _emit();
+      if (idx >= 0) {
+        final cur = engine.current;
+        if (prev.isNotEmpty &&
+            cur != null &&
+            cur.id == prev.first.id &&
+            await _tryInstantAdvance(prev.first, -1)) {
           skipBudget.reset();
           unawaited(saveSessionNow());
           _maybeBroadcast(force: true);
           unawaited(_trimTail());
           unawaited(_precacheNext());
+          return;
         }
-        return;
-      }
-      final idx = engine.previous();
-      _emit();
-      if (idx >= 0) {
         skipBudget.reset();
         await _loadCurrent(autoplay: true);
       }
@@ -557,8 +621,10 @@ class PlayerController {
     } catch (_) {}
   }
 
-  /// 5s position ticker (P13): position-only save, gated by
-  /// [SessionTickPolicy] — no write when paused or unmoved.
+  /// 5s position ticker (P13): gated by [SessionTickPolicy]; the write
+  /// itself goes through [saveSessionNow] so the app-layer session
+  /// writer stays the single file writer (atomic, no torn JSON on
+  /// kill-mid-write). Memory only here — no direct file IO.
   Future<void> savePositionTick() async {
     try {
       final now = DateTime.now().millisecondsSinceEpoch;
@@ -569,16 +635,7 @@ class PlayerController {
       )) {
         return;
       }
-      final f = File('${cacheDir.path}/$sessionFile');
-      if (!await f.exists()) return;
-      final pos = player.position.inMilliseconds;
-      final text = await f.readAsString();
-      final decoded = jsonDecode(text);
-      if (decoded is! Map) return;
-      final root = decoded.cast<String, dynamic>();
-      root['positionMs'] = pos < 0 ? 0 : pos;
-      root['savedAt'] = now;
-      await f.writeAsString(jsonEncode(root));
+      await saveSessionNow();
     } catch (_) {}
   }
 
@@ -1164,7 +1221,20 @@ class PlayerController {
       if (s.processingState == ProcessingState.completed) {
         final has = engine.hasNext(exhaustHookArmed: true);
         if (endAction(has) == EndAction.advance) {
-          unawaited(next());
+          // System-driven, not a tap: bypass the transport debounce so
+          // a manual skip landing in the same window never eats the
+          // auto-advance (or vice versa — both target the same track).
+          // ...except a tap JUST happened: the completed event belongs
+          // to the old track and the engine already moved past it, so
+          // advancing again would skip two songs from one tap.
+          try {
+            final now = DateTime.now().millisecondsSinceEpoch;
+            if (now - _lastManualAdvanceMs <
+                completedRaceWindow.inMilliseconds) {
+              return;
+            }
+          } catch (_) {}
+          unawaited(next(force: true));
         } else {
           try {
             unawaited(player.seek(Duration.zero));
@@ -1221,6 +1291,7 @@ class PlayerController {
       if (id.isEmpty) return;
       final idx = engine.items.indexWhere((e) => e.id == id);
       if (idx < 0 || idx == engine.currentIndex) return;
+      _emitChanging();
       engine.playAt(idx);
       _emit();
       unawaited(saveSessionNow());

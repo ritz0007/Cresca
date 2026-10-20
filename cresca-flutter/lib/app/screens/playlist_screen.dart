@@ -33,6 +33,13 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
   List<YtTrack> _suggested = [];
   bool _suggesting = false;
 
+  /// Suggest trigger state: suggested loads once per playlist (init,
+  /// not build — build-time fetch re-fired on every paint while empty
+  /// and looped network on failure). Session-mem cache per playlist.
+  bool _suggestStarted = false;
+  String _suggestFor = '';
+  static final Map<String, List<YtTrack>> _suggestCache = {};
+
   UserPlaylist? _of(AppState state) {
     try {
       return state.library.playlists
@@ -40,6 +47,25 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
     } catch (_) {
       return null;
     }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_suggestStarted) return;
+    _suggestStarted = true;
+    try {
+      final state = AppScope.of(context);
+      final p = _of(state);
+      if (p == null) return;
+      _suggestFor = p.id;
+      final hit = _suggestCache[p.id];
+      if (hit != null && hit.isNotEmpty) {
+        _suggested = List.of(hit);
+        return;
+      }
+      _suggest(state, p);
+    } catch (_) {}
   }
 
   Future<void> _suggest(AppState state, UserPlaylist p) async {
@@ -110,6 +136,15 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
         }
       } catch (_) {}
       if (mounted) setState(() => _suggested = clean.take(12).toList());
+    // Session-mem cache: revisits paint instantly, no refetch.
+    try {
+      if (_suggestFor.isNotEmpty) {
+        _suggestCache[_suggestFor] = List.of(_suggested);
+        while (_suggestCache.length > 20) {
+          _suggestCache.remove(_suggestCache.keys.first);
+        }
+      }
+    } catch (_) {}
     } catch (_) {}
     if (mounted) setState(() => _suggesting = false);
   }
@@ -204,7 +239,7 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
       }
       if (yes != true) return;
       await state.library.deletePlaylist(p.id);
-      if (mounted) Navigator.pop(context);
+      if (context.mounted) Navigator.pop(context);
     } catch (_) {}
   }
 
@@ -230,9 +265,6 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
                 child: Text('Playlist not found')),
           );
         }
-        if (_suggested.isEmpty && !_suggesting) {
-          _suggest(state, p);
-        }
         return Scaffold(
           appBar: AppBar(
             title: Text(p.name),
@@ -254,7 +286,7 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
               Expanded(
                 child: ListView(
                   // Bottom chrome is app-shell; live measured clearance
-                  // (210 fallback) so tail rows never slide under it.
+                  // (estimator fallback) so tail rows never slide under it.
                   padding: EdgeInsets.only(
                       bottom:
                           BottomChromeScope.clearanceOf(context)),
@@ -348,8 +380,14 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
                       ),
                     ),
                     for (var i = 0; i < p.tracks.length; i++)
-                      Dismissible(
-                        key: ValueKey('pl-${p.tracks[i].id}'),
+                      Builder(builder: (_) {
+                        // Capture the row now: the dismiss callback runs
+                        // an async gap later, when indices may have moved.
+                        final rowTrack = p.tracks[i];
+                        final at = i;
+                        return Dismissible(
+                        key: ValueKey(
+                            'pl-${p.id}-$at-${rowTrack.id}'),
                         direction: DismissDirection.endToStart,
                         background: Container(
                             alignment: Alignment.centerRight,
@@ -358,47 +396,37 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
                             child: const Icon(
                                 Icons.delete_outline)),
                         onDismissed: (_) async {
-                          // Capture for Undo before mutating.
-                          final removed = p.tracks[i];
-                          final at = i;
+                          // Single-row remove: twins keep their slots.
                           try {
-                            await state.library.removeFromPlaylist(
-                                p.id, removed.id);
+                            await state.library.removeTrackAt(
+                                p.id, at);
                           } catch (_) {}
                           if (!context.mounted) return;
                           try {
                             SemanticsService.sendAnnouncement(
                                 View.of(context),
-                                'Removed ${removed.title}. Undo available.',
+                                'Removed ${rowTrack.title}. Undo available.',
                                 TextDirection.ltr);
                           } catch (_) {}
                           if (!context.mounted) return;
                           ScaffoldMessenger.of(context)
                               .showSnackBar(
                             SnackBar(
-                              content: Text(
-                                  'Removed ${removed.title}'),
+                              content: Semantics(liveRegion: true, child: Text(
+                                  'Removed ${rowTrack.title}')),
                               action: SnackBarAction(
                                 label: 'Undo',
                                 onPressed: () async {
                                   try {
-                                    // Re-add through the library so the
-                                    // restore is persisted, then move it
-                                    // back to its old slot in-memory for
-                                    // identical order (a later library
-                                    // write persists the order too).
+                                    // Re-insert at the same slot in-memory,
+                                    // then persist: the move is RAM-only
+                                    // until the write lands (kill-safe).
+                                    p.tracks.insert(
+                                        at.clamp(0,
+                                            p.tracks.length),
+                                        rowTrack);
                                     await state.library
-                                        .addToPlaylist(
-                                            p.id, removed);
-                                    try {
-                                      p.tracks.removeWhere((e) =>
-                                          e.id ==
-                                          removed.id);
-                                      p.tracks.insert(
-                                          at.clamp(0,
-                                              p.tracks.length),
-                                          removed);
-                                    } catch (_) {}
+                                        .persistPlaylists();
                                   } catch (_) {}
                                   if (mounted) {
                                     setState(() {});
@@ -409,15 +437,16 @@ class _PlaylistScreenState extends State<PlaylistScreen> {
                           );
                         },
                         child: StaggerEntrance(
-                          index: i,
+                          index: at,
                           child: TrackRow(
-                            track: p.tracks[i],
+                            track: rowTrack,
                             contextQueue: p.tracks,
-                            index: i,
+                            index: at,
                             origin: 'Playlist',
                           ),
                         ),
-                      ),
+                        );
+                      }),
                     if (_suggesting)
                       const Padding(
                         padding: EdgeInsets.all(16),

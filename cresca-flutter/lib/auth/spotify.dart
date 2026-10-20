@@ -53,6 +53,18 @@ String _randomState() {
   }
 }
 
+/// CSRF state check (native exchange 1:1): the callback state must equal
+/// the stored state, and neither may be empty — old links without state
+/// are rejected instead of trusted. Pure; never throws.
+bool spotifyStateOk(String gotState, String wantState) {
+  try {
+    if (gotState.isEmpty || wantState.isEmpty) return false;
+    return gotState == wantState;
+  } catch (_) {
+    return false;
+  }
+}
+
 String codeChallenge(String verifier) {
   try {
     final digest = sha256.convert(utf8.encode(verifier));
@@ -159,8 +171,8 @@ class SpotifySession {
             if (!done.isCompleted) done.complete(false);
             return;
           }
-          // CSRF check (native exchange 1:1): reject only on explicit
-          // mismatch so old links without state still work.
+          // CSRF check (native exchange 1:1): the callback state must
+          // equal the stored state, and neither may be empty.
           final gotState = uri.queryParameters['state'] ?? '';
           var wantState = _state;
           if (wantState.isEmpty) {
@@ -170,9 +182,7 @@ class SpotifySession {
               wantState = '';
             }
           }
-          if (wantState.isNotEmpty &&
-              gotState.isNotEmpty &&
-              wantState != gotState) {
+          if (!spotifyStateOk(gotState, wantState)) {
             if (!done.isCompleted) done.complete(false);
             return;
           }

@@ -332,15 +332,22 @@ class _EqPulseState extends State<_EqPulse>
 class _Art extends StatelessWidget {
   final YtTrack track;
   final double size;
-  const _Art({required this.track, this.size = 48});
+  final int maxPx;
+  final String fallbackUrl;
+  const _Art(
+      {required this.track,
+      this.size = 48,
+      this.maxPx = 480,
+      this.fallbackUrl = ''});
 
   @override
   Widget build(BuildContext context) {
     if (track.thumbUrl.isEmpty) return _Fallback(size: size);
     // Tight decode: never unpack a 1080px upload into a small slot.
     // ~3x the layout size stays crisp on xxxhdpi without the full
-    // native decode + resize pass per scroll frame.
-    final px = (size * 3).ceil().clamp(48, 480);
+    // native decode + resize pass per scroll frame. Hero slots pass
+    // a bigger maxPx (poster) instead of changing this default.
+    final px = (size * 3).ceil().clamp(48, maxPx);
     final fadeMs = AppScope.of(context).motionMs(150);
     return RepaintBoundary(
       child: ClipRRect(
@@ -370,7 +377,23 @@ class _Art extends StatelessWidget {
             fadeInDuration: Duration(milliseconds: fadeMs),
             fadeOutDuration: const Duration(milliseconds: 1),
             placeholder: (_, _) => _Fallback(size: size),
-            errorWidget: (_, _, _) => _Fallback(size: size),
+            // Hero art (maxres) 404s on some videos: fall back to the
+            // provably-loading thumb instead of the gradient.
+            errorWidget: (_, _, _) => fallbackUrl.isNotEmpty &&
+                    fallbackUrl != track.thumbUrl
+                ? CachedNetworkImage(
+                    imageUrl: fallbackUrl,
+                    width: size,
+                    height: size,
+                    fit: BoxFit.cover,
+                    fadeInDuration:
+                        Duration(milliseconds: fadeMs),
+                    fadeOutDuration:
+                        const Duration(milliseconds: 1),
+                    errorWidget: (_, _, _) =>
+                        _Fallback(size: size),
+                  )
+                : _Fallback(size: size),
           ),
         ),
       ),
@@ -409,10 +432,18 @@ class _Fallback extends StatelessWidget {
 class TrackArt extends StatelessWidget {
   final YtTrack track;
   final double size;
-  const TrackArt({super.key, required this.track, this.size = 48});
+  final int maxPx;
+  final String fallbackUrl;
+  const TrackArt(
+      {super.key,
+      required this.track,
+      this.size = 48,
+      this.maxPx = 480,
+      this.fallbackUrl = ''});
 
   @override
-  Widget build(BuildContext context) => _Art(track: track, size: size);
+  Widget build(BuildContext context) =>
+      _Art(track: track, size: size, maxPx: maxPx, fallbackUrl: fallbackUrl);
 }
 
 /// Skeleton shimmer placeholder (first load, H8; static when motion off).

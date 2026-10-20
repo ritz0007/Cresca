@@ -37,7 +37,7 @@ class LibraryScreen extends StatelessWidget {
                   padding: EdgeInsets.only(
                       // Bottom chrome (mini player + pill) is app-shell;
                       // lists scroll under the glass. Live measured
-                      // clearance (210 fallback pre-measure).
+                      // clearance (estimator fallback pre-measure).
                       bottom:
                           BottomChromeScope.clearanceOf(context)),
                   children: [

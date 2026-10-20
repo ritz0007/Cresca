@@ -15,6 +15,7 @@ import 'audio_pipeline_sheet.dart';
 import 'jam_sheet.dart';
 
 Future<void> openAudioOutputSheet(BuildContext context) async {
+  final messenger = ScaffoldMessenger.of(context);
   try {
     bool motionOn = true;
     try {
@@ -38,7 +39,12 @@ Future<void> openAudioOutputSheet(BuildContext context) async {
         ),
       ),
     );
-  } catch (_) {}
+  } catch (_) {
+    try {
+      messenger.showSnackBar(
+          SnackBar(content: Semantics(liveRegion: true, child: Text('Could not open audio output'))));
+    } catch (_) {}
+  }
 }
 
 class _AudioOutputSheet extends StatelessWidget {
@@ -76,25 +82,27 @@ class _AudioOutputSheet extends StatelessWidget {
               crossAxisAlignment:
                   CrossAxisAlignment.start,
               children: [
-                // Drag handle: decoration-only fill over the dark
-                // glass (AA-verified glassSubtext at 50%).
-                Center(
-                  child: Container(
-                      width: 40,
-                      height: 4,
-                      decoration: BoxDecoration(
-                          color: glassSubtext(dark)
-                              .withValues(alpha: 0.5),
-                          borderRadius:
-                              BorderRadius.circular(
-                                  2))),
-                ),
+                // Drag handle: shared 40x4 pill in a 48 px
+                // touch/semantics zone.
+                const SheetGrabHandle(),
                 const SizedBox(height: 14),
-                Text('Audio output',
-                    style: TextStyle(
-                        color: glassText(dark),
-                        fontSize: 21,
-                        fontWeight: FontWeight.w800)),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text('Audio output',
+                          style: TextStyle(
+                              color: glassText(dark),
+                              fontSize: 21,
+                              fontWeight: FontWeight.w800)),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close),
+                      tooltip: 'Close audio output',
+                      color: glassSubtext(dark),
+                      onPressed: () => Navigator.pop(context),
+                    ),
+                  ],
+                ),
                 const SizedBox(height: 14),
                 // Device card (only output).
                 stagger(
@@ -299,6 +307,14 @@ class _VolumeCard extends StatefulWidget {
 
 class _VolumeCardState extends State<_VolumeCard> {
   late final Stream<double> _stream = _sysVolume();
+  // Finger position while dragging: stream round-trip lags, so the thumb
+  // shows this until release for 1:1 tracking with no fight-back.
+  // [_hold] keeps the release target until the stream confirms it, so
+  // the thumb never snaps back to a stale tick (watch() is
+  // event-driven, not a ticker — no frame interpolation needed here).
+  final ValueNotifier<double?> _drag = ValueNotifier(null);
+  double? _hold;
+  double? _base;
 
   static Stream<double> _sysVolume() async* {
     try {
@@ -307,6 +323,14 @@ class _VolumeCardState extends State<_VolumeCard> {
       yield 1.0;
     }
     yield* SystemVolume.watch();
+  }
+
+  @override
+  void dispose() {
+    try {
+      _drag.dispose();
+    } catch (_) {}
+    super.dispose();
   }
 
   @override
@@ -332,61 +356,96 @@ class _VolumeCardState extends State<_VolumeCard> {
           // then fades to full — no thumb jump from a 1.0 seed.
           final v = snap.data;
           final ready = v != null;
-          final level = (v ?? 1.0).clamp(0.0, 1.0);
-          return PulseOpacity(
-            motionOn: widget.motionOn,
-            pulsing: !ready,
-            child: Opacity(
-              opacity: ready ? 1.0 : 0.6,
-              child: Row(
-            children: [
-              Icon(
-                  Icons
-                      .volume_up_outlined,
-                  color: glassText(dark),
-                  size: 22),
-              const SizedBox(width: 10),
-              Expanded(
-                child: SliderTheme(
-                  data: SliderTheme.of(
-                          context)
-                      .copyWith(
-                    trackHeight: 4,
-                    thumbShape:
-                        const RoundSliderThumbShape(
-                            enabledThumbRadius:
-                                7),
-                    overlayShape:
-                        const RoundSliderOverlayShape(
-                            overlayRadius:
-                                14),
-                    activeTrackColor:
-                        Colors.white,
-                    inactiveTrackColor: Colors
-                        .white
-                        .withValues(
-                            alpha: 0.28),
-                    thumbColor:
-                        Colors.white,
+          final streamLevel = (v ?? 1.0).clamp(0.0, 1.0);
+          return ValueListenableBuilder<double?>(
+            valueListenable: _drag,
+            builder: (_, drag, _) {
+              // Round-trip landed (or an external change won): adopt live.
+              if (_hold != null && _base != null && snap.data != null) {
+                final lv = snap.data!.clamp(0.0, 1.0);
+                if (lv != _base) {
+                  _hold = null;
+                  _base = null;
+                }
+              }
+              // Finger wins while dragging; held target wins after
+              // release until the stream confirms; stream ticks
+              // underneath never move the thumb until release.
+              final level =
+                  (drag ?? _hold ?? streamLevel).clamp(0.0, 1.0);
+              return PulseOpacity(
+                motionOn: widget.motionOn,
+                pulsing: !ready,
+                child: Opacity(
+                  opacity: ready ? 1.0 : 0.6,
+                  child: Row(
+                children: [
+                  Icon(
+                      Icons
+                          .volume_up_outlined,
+                      color: glassText(dark),
+                      size: 22),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: RepaintBoundary(
+                      child: SliderTheme(
+                        data: SliderTheme.of(
+                                context)
+                            .copyWith(
+                          trackHeight: 4,
+                          thumbShape:
+                              const RoundSliderThumbShape(
+                                  enabledThumbRadius:
+                                      7),
+                          overlayShape:
+                              const RoundSliderOverlayShape(
+                                  overlayRadius:
+                                      14),
+                          activeTrackColor:
+                              Colors.white,
+                          inactiveTrackColor: Colors
+                              .white
+                              .withValues(
+                                  alpha: 0.28),
+                          thumbColor:
+                              Colors.white,
+                        ),
+                        // Direct value + drag-notifier: the thumb
+                        // tracks the finger 1:1; no tween/animation.
+                        child: Slider(
+                          value: level,
+                          label:
+                              'Volume ${(level * 100).round()}%',
+                          onChanged: ready
+                              ? (nv) {
+                                  if (_drag.value == null) {
+                                    // New finger wins outright: drop
+                                    // any stale hold.
+                                    _base = streamLevel;
+                                    _hold = null;
+                                  }
+                                  _drag.value = nv;
+                                  try {
+                                    SystemVolume.setLevel(
+                                        nv);
+                                  } catch (_) {}
+                                }
+                              : null,
+                          onChangeEnd: ready
+                              ? (_) {
+                                  _hold = _drag.value;
+                                  _drag.value = null;
+                                }
+                              : null,
+                        ),
+                      ),
+                    ),
                   ),
-                  child: Slider(
-                    value: level,
-                    label:
-                        'Volume ${(level * 100).round()}%',
-                    onChanged: ready
-                        ? (nv) {
-                            try {
-                              SystemVolume.setLevel(
-                                  nv);
-                            } catch (_) {}
-                          }
-                        : null,
-                  ),
-                ),
+                ],
               ),
-            ],
-          ),
-            ),
+                ),
+              );
+            },
           );
         },
       ),

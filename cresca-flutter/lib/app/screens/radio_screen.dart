@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import '../app.dart';
 import '../design.dart';
 import '../radio_store.dart';
+import '../widgets/state_widgets.dart';
 import '../widgets/track_row.dart';
 
 class RadioScreen extends StatelessWidget {
@@ -19,91 +20,102 @@ class RadioScreen extends StatelessWidget {
       animation: state,
       builder: (_, _) {
         final radios = state.library.radios;
+        // U6 de-nested: one CustomScrollView (no nested vertical lists).
+        // The horizontal lane keeps its fixed height; the stations ride a
+        // real SliverGrid. The feed is finite, so the footer is
+        // unconditionally terminal — EndFooter still gates on
+        // hasMore && !loading for future paged feeds (spinner only while
+        // a station/radio load is in flight, "You're all caught up" after).
         return Scaffold(
           appBar: AppBar(title: const Text('Radio')),
-          body: Column(
-            children: [
-              Expanded(
-                child: ListView(
-                  // Live measured chrome clearance (210 fallback).
+          body: CustomScrollView(
+            slivers: [
+              const SliverToBoxAdapter(
+                child: Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 16),
+                  child: Text(
+                      'Your radios plus endless stations. Tap a radio to play it.'),
+                ),
+              ),
+              if (radios.isNotEmpty) ...[
+                const SliverToBoxAdapter(
+                  child: Padding(
+                    padding: EdgeInsets.fromLTRB(16, 8, 16, 4),
+                    child: StaggerEntrance(
+                      child: Text('Your radios',
+                          style: TextStyle(
+                              fontSize: 20,
+                              fontWeight: FontWeight.bold)),
+                    ),
+                  ),
+                ),
+                // Lane enters once via the per-card stagger below
+                // (capped at 8) — no outer entrance wrapper, so the
+                // first cards never pay two opacity/transform pairs.
+                SliverToBoxAdapter(
+                  child: SizedBox(
+                    key: ValueKey('radios-${radios.length}'),
+                    height: 210,
+                    child: ListView.builder(
+                      scrollDirection: Axis.horizontal,
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 16),
+                      itemCount: radios.length,
+                      // Keep lane items out of the list scope;
+                      // the per-row boundary lives in _RadioCard.
+                      addRepaintBoundaries: true,
+                      itemBuilder: (_, i) => StaggerEntrance(
+                        index: i,
+                        child: _RadioCard(radio: radios[i]),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+              const SliverToBoxAdapter(
+                child: Padding(
+                  padding: EdgeInsets.fromLTRB(16, 8, 16, 4),
+                  child: StaggerEntrance(
+                    index: 2,
+                    child: Text('Stations',
+                        style: TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.bold)),
+                  ),
+                ),
+              ),
+              SliverPadding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16),
+                sliver: SliverGrid(
+                  gridDelegate:
+                      const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 2,
+                    mainAxisSpacing: 12,
+                    crossAxisSpacing: 12,
+                    childAspectRatio: 1.6,
+                  ),
+                  delegate: SliverChildBuilderDelegate(
+                    (_, i) => StaggerEntrance(
+                      index: i,
+                      child:
+                          _StationCard(station: radioStations[i]),
+                    ),
+                    childCount: radioStations.length,
+                  ),
+                ),
+              ),
+              SliverToBoxAdapter(
+                // Bottom chrome is app-shell; live measured clearance
+                // (estimator fallback) so the footer clears it.
+                child: Padding(
                   padding: EdgeInsets.only(
                       bottom:
                           BottomChromeScope.clearanceOf(context)),
-                  children: [
-                    const Padding(
-                      padding:
-                          EdgeInsets.symmetric(horizontal: 16),
-                      child: Text(
-                          'Your radios plus endless stations. Tap a radio to play it.'),
-                    ),
-                    if (radios.isNotEmpty) ...[
-                      const Padding(
-                        padding: EdgeInsets.fromLTRB(16, 8, 16, 4),
-                        child: StaggerEntrance(
-                          child: Text('Your radios',
-                              style: TextStyle(
-                                  fontSize: 20,
-                                  fontWeight: FontWeight.bold)),
-                        ),
-                      ),
-                      // Lane enters once via the per-card stagger below
-                      // (capped at 8) — no outer entrance wrapper, so the
-                      // first cards never pay two opacity/transform pairs.
-                      SizedBox(
-                        key: ValueKey('radios-${radios.length}'),
-                        height: 210,
-                        child: ListView.builder(
-                          scrollDirection: Axis.horizontal,
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 16),
-                          itemCount: radios.length,
-                          // Keep lane items out of the list scope;
-                          // the per-row boundary lives in _RadioCard.
-                          addRepaintBoundaries: true,
-                          itemBuilder: (_, i) => StaggerEntrance(
-                            index: i,
-                            child: _RadioCard(radio: radios[i]),
-                          ),
-                        ),
-                      ),
-                    ],
-                    if (state.radioLoading)
-                      const Padding(
-                        padding: EdgeInsets.all(16),
-                        child: Center(
-                            child: CircularProgressIndicator()),
-                      ),
-                    const Padding(
-                      padding: EdgeInsets.fromLTRB(16, 8, 16, 4),
-                      child: StaggerEntrance(
-                        index: 2,
-                        child: Text('Stations',
-                            style: TextStyle(
-                                fontSize: 20,
-                                fontWeight: FontWeight.bold)),
-                      ),
-                    ),
-                    GridView.builder(
-                      shrinkWrap: true,
-                      physics:
-                          const NeverScrollableScrollPhysics(),
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 16),
-                      gridDelegate:
-                          const SliverGridDelegateWithFixedCrossAxisCount(
-                        crossAxisCount: 2,
-                        mainAxisSpacing: 12,
-                        crossAxisSpacing: 12,
-                        childAspectRatio: 1.6,
-                      ),
-                      itemCount: radioStations.length,
-                      itemBuilder: (_, i) => StaggerEntrance(
-                        index: i,
-                        child: _StationCard(
-                            station: radioStations[i]),
-                      ),
-                    ),
-                  ],
+                  child: EndFooter(
+                    hasMore: false,
+                    loading: state.radioLoading,
+                  ),
                 ),
               ),
             ],
@@ -124,10 +136,12 @@ class _RadioCard extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     // RepaintBoundary: art + like-button rows rebuild on likes —
     // keep each card out of the lane's repaint scope.
+    //
+    // The heart is NOT inside the open-tap subtree: PressScale fires
+    // onTapUp for any tap in its child (heart included), so a like
+    // used to also open the radio. Art + titles open; the heart only
+    // toggles.
     return RepaintBoundary(
-      child: PressScale(
-      motionOn: state.motionOn,
-      onTap: () => state.openRadio(radio),
       child: Container(
         width: 150,
         margin: const EdgeInsets.only(right: 12),
@@ -136,7 +150,10 @@ class _RadioCard extends StatelessWidget {
           children: [
             Stack(
               children: [
-                Container(
+                PressScale(
+                motionOn: state.motionOn,
+                onTap: () => state.openRadio(radio),
+                child: Container(
                   height: 130,
                   decoration: BoxDecoration(
                     borderRadius: BorderRadius.circular(16),
@@ -157,10 +174,14 @@ class _RadioCard extends StatelessWidget {
                         )
                       : TrackArt(track: radio.seed, size: 130),
                 ),
+                ),
                 Positioned(
                   right: 4,
                   top: 4,
                   child: IconButton(
+                    tooltip: radio.liked
+                        ? 'Remove from favorites'
+                        : 'Add to favorites',
                     icon: Icon(
                       radio.liked
                           ? Icons.favorite
@@ -190,18 +211,27 @@ class _RadioCard extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 4),
-            AdaptiveText(
-                data: radio.title,
-                background: scheme.surface,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis),
-            AdaptiveText(
-                data: '${radio.tracks.length} songs',
-                background: scheme.surface,
-                secondary: true,
-                style: Theme.of(context).textTheme.bodySmall),
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => state.openRadio(radio),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  AdaptiveText(
+                      data: radio.title,
+                      background: scheme.surface,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis),
+                  AdaptiveText(
+                      data: '${radio.tracks.length} songs',
+                      background: scheme.surface,
+                      secondary: true,
+                      style: Theme.of(context).textTheme.bodySmall),
+                ],
+              ),
+            ),
           ],
-        ),
         ),
       ),
     );

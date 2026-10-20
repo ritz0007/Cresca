@@ -46,10 +46,10 @@ const Duration tasteOverallTimeout = Duration(seconds: 25);
 const Duration mvSearchTimeout = Duration(seconds: 8);
 
 /// Top Picks assembly: at most this many recent seeds × this many related
-/// each, pooled to [topPicksPoolCap] (native topVibe shape: 10 × 3 → 24).
+/// each, pooled to [topPicksPoolCap] (10 × 4 → 36; 20 shown, room to rotate).
 const int topPicksSeedCap = 10;
-const int topPicksPerSeed = 3;
-const int topPicksPoolCap = 24;
+const int topPicksPerSeed = 4;
+const int topPicksPoolCap = 36;
 
 /// Taste profile snapshot file (affinities persist across restarts).
 const String tasteSnapshotFile = 'taste.json';
@@ -161,6 +161,19 @@ class YoutubeRepository {
     _yt = null;
     try {
       _http.close();
+    } catch (_) {}
+  }
+
+  /// Logout wipe: drops every in-memory memo (search/home/blend/snaps/
+  /// music-video) so no session-bound rows survive. Never throws.
+  void clearSessionMemos() {
+    try {
+      _memSnaps.clear();
+      _queryMemo.clear();
+      _homeMapMemo.clear();
+      _blendMemo.clear();
+      _mvMemo.clear();
+      _mvAt.clear();
     } catch (_) {}
   }
 
@@ -583,12 +596,19 @@ class YoutubeRepository {
       final songs = await trendingMusic(max: 6);
       final out = <YtTrack>[];
       final seen = <String>{};
-      for (final s in songs) {
-        if (out.length >= max) break;
+      for (var i = 0; i < songs.length && out.length < max; i += 3) {
         try {
-          final v = await resolveMusicVideoTrack(s);
-          if (v == null || !seen.add(v.id)) continue;
-          out.add(v);
+          final batch = await Future.wait([
+            for (final s in songs.skip(i).take(3))
+              resolveMusicVideoTrack(s).catchError((_) => null),
+          ]);
+          for (final v in batch) {
+            if (out.length >= max) break;
+            try {
+              if (v == null || !seen.add(v.id)) continue;
+              out.add(v);
+            } catch (_) {}
+          }
         } catch (_) {}
       }
       return out;
@@ -632,14 +652,10 @@ class YoutubeRepository {
       if (seeds.isEmpty) {
         return await searchMusic('new hindi songs 2026', max: max);
       }
-      final perArtist = <List<YtTrack>>[];
-      for (final a in seeds) {
-        try {
-          perArtist.add(await searchMusic('$a songs', max: 5));
-        } catch (_) {
-          perArtist.add([]);
-        }
-      }
+      final perArtist = await Future.wait([
+        for (final a in seeds)
+          searchMusic('$a songs', max: 5).catchError((_) => <YtTrack>[]),
+      ]);
       final out = interleaveRoundRobin(perArtist, max: max);
       if (out.isNotEmpty) return out;
       return await searchMusic('new hindi songs 2026', max: max);
@@ -1363,11 +1379,25 @@ class YoutubeRepository {
     Duration fetchTimeout = tasteFetchTimeout,
   }) async {
     try {
-      final seeds = recent
+      final allSeeds = recent
           .where((t) => t.watchUrl.trim().isNotEmpty)
-          .take(maxSeeds)
           .toList();
-      if (seeds.length < 2) return [];
+      if (allSeeds.length < 2) return [];
+      // Rotate the seed window by salt: every refresh / reopen / revisit
+      // pulls related from DIFFERENT recents, so the pool gains
+      // genuinely new (still taste-relevant) songs instead of re-ranking
+      // the same seeds' pool forever.
+      var seeds = allSeeds.take(maxSeeds).toList();
+      try {
+        final salt = rotationSalt ?? 0;
+        if (salt != 0 && allSeeds.length > maxSeeds) {
+          final start = salt % allSeeds.length;
+          seeds = [
+            for (var i = 0; i < maxSeeds; i++)
+              allSeeds[(start + i) % allSeeds.length]
+          ];
+        }
+      } catch (_) {}
       final profile = taste ??
           buildTasteProfile(recent: recent, liked: liked ?? const []);
       if (profile.isEmpty) return [];

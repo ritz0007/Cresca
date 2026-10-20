@@ -323,13 +323,14 @@ Future<Uint8List> fetchSegmented(
 
 /// Parallel chunked download: splits [totalSize] into [parts] Range
 /// connections (IDM-style, up to 16, all in flight), retries each part
-/// up to [retries], writes parts in order to [target]. Returns true on
-/// success. Falls back to a single plain GET when the size is unknown,
-/// the host ignores Range, OR the CDN throttles segmented fetching
-/// (googlevideo persistently 403s a URL after a few quick ranges —
-/// the whole-GET fallback is the production path for full files).
-/// Default 4 parts: stays inside the observed per-URL range quota while
-/// still 4x-ing head throughput. Never throws.
+/// up to [retries], and streams parts straight to [target] at their file
+/// offsets (RandomAccessFile) instead of assembling the whole file in
+/// RAM — offline files can be 50MB+. Falls back to a single plain GET
+/// when the size is unknown, the host ignores Range, OR the CDN throttles
+/// segmented fetching (googlevideo persistently 403s a URL after a few
+/// quick ranges — the whole-GET fallback is the production path for full
+/// files). Default 4 parts: stays inside the observed per-URL range quota
+/// while still 4x-ing head throughput. Never throws.
 Future<bool> downloadChunked(
   http.Client client,
   String url,
@@ -346,23 +347,53 @@ Future<bool> downloadChunked(
       return await _downloadWhole(client, url, target,
           timeout: timeout, onProgress: onProgress);
     }
-    final bytes = await fetchSegmented(client, url, 0, totalSize - 1,
-        parts: parts,
-        retries: retries,
-        timeout: timeout,
-        onProgress: onProgress);
-    if (bytes.isEmpty) {
-      // Segments rejected (host ignores Range, short parts, ...):
-      // one plain GET rather than a corrupt file.
-      return await _downloadWhole(client, url, target,
-          timeout: timeout, onProgress: onProgress);
-    }
+    final n = parts.clamp(1, 16);
+    final size = (totalSize + n - 1) ~/ n;
+    RandomAccessFile? raf;
     try {
-      await target.writeAsBytes(bytes);
-      return true;
+      raf = await target.open(mode: FileMode.write);
     } catch (_) {
       return false;
     }
+    try {
+      var received = 0;
+      for (var j = 0; j < n; j++) {
+        final s = j * size;
+        if (s >= totalSize) break;
+        var e = s + size - 1;
+        if (e >= totalSize) e = totalSize - 1;
+        // Sequential (CDN throttles Range bursts; one-at-a-time almost
+        // always succeeds), appended straight to the file: RAM stays
+        // ~one part, never the whole file.
+        var b = await _part(client, url, s, e, retries, timeout);
+        b ??= await _part(client, url, s, e, retries + 1, timeout * 2);
+        if (b == null) throw StateError('part $j rejected');
+        raf.writeFromSync(b);
+        received += b.length;
+        try {
+          onProgress?.call(received, totalSize);
+        } catch (_) {}
+      }
+      await raf.close();
+    } catch (_) {
+      try {
+        await raf.close();
+      } catch (_) {}
+      // A rejected part (host ignores Range, short part, ...) falls back
+      // to one plain GET rather than a corrupt file.
+      return await _downloadWhole(client, url, target,
+          timeout: timeout, onProgress: onProgress);
+    }
+    // Paranoia: exact length or reject (never hand back a corrupt file).
+    try {
+      if (await target.length() != totalSize) {
+        return await _downloadWhole(client, url, target,
+            timeout: timeout, onProgress: onProgress);
+      }
+    } catch (_) {
+      return false;
+    }
+    return true;
   } catch (_) {
     return false;
   }
@@ -401,15 +432,52 @@ Future<bool> _downloadWhole(
   required Duration timeout,
   ChunkProgress? onProgress,
 }) async {
+  // Streams response bytes straight to [target] (never buffers the whole
+  // body in RAM): this is the production path for full files.
+  http.StreamedResponse? res;
   try {
-    final res = await client
-        .get(Uri.parse(url), headers: mediaHeaders())
-        .timeout(timeout);
-    if (res.statusCode != 200 && res.statusCode != 206) return false;
-    if (res.bodyBytes.isEmpty) return false;
-    await target.writeAsBytes(res.bodyBytes);
+    final req = http.Request('GET', Uri.parse(url))
+      ..headers.addAll(mediaHeaders());
+    res = await client.send(req).timeout(timeout);
+  } catch (_) {
+    return false;
+  }
+  try {
+    if (res.statusCode != 200 && res.statusCode != 206) {
+      try {
+        await res.stream.drain();
+      } catch (_) {}
+      return false;
+    }
+    RandomAccessFile? raf;
     try {
-      onProgress?.call(res.bodyBytes.length, res.bodyBytes.length);
+      raf = await target.open(mode: FileMode.write);
+    } catch (_) {
+      try {
+        await res.stream.drain();
+      } catch (_) {}
+      return false;
+    }
+    var received = 0;
+    final total = res.contentLength ?? -1;
+    try {
+      await for (final chunk in res.stream.timeout(timeout)) {
+        raf.writeFromSync(chunk);
+        received += chunk.length;
+        try {
+          onProgress?.call(received, total);
+        } catch (_) {}
+      }
+      await raf.close();
+    } catch (_) {
+      try {
+        await raf.close();
+      } catch (_) {}
+      return false;
+    }
+    if (received <= 0) return false;
+    try {
+      onProgress?.call(received, received);
     } catch (_) {}
     return true;
   } catch (_) {

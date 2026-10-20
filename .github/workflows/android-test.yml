@@ -1,0 +1,35 @@
+# Cresca Android — flutter test + analyze on every push/PR.
+name: android-test
+
+on:
+  push:
+    paths:
+      - cresca-flutter/**
+      - .github/workflows/android-test.yml
+  pull_request:
+    paths:
+      - cresca-flutter/**
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Install dependencies
+        working-directory: cresca-flutter
+        run: flutter pub get
+
+      - name: Analyze
+        working-directory: cresca-flutter
+        run: flutter analyze
+
+      - name: Test
+        working-directory: cresca-flutter
+        run: flutter test

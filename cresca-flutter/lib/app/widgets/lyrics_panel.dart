@@ -1,5 +1,6 @@
 // Karaoke lyrics panel (P7): synced highlight + scale, dots on ≥9 s
-// gaps, auto-scroll + 3 s manual hold, tap-to-seek, plain fallback,
+// gaps, auto-scroll with explicit Resume pill on manual hold,
+// tap-to-seek (tap-vs-drag gated), plain fallback,
 // honest empty state. Captions race LRCLIB per track; results memo in
 // AppState for the session. InnerTube leg: WEB_REMIX player response
 // (serviceIntegrityDimensions ignored logs get timedtext too), then
@@ -63,6 +64,9 @@ class _LyricsSectionState extends State<LyricsSection> {
   LyricsState _state = const LyricsLoading();
   http.Client? _http;
   YoutubeExplode? _explode;
+  // Generation token: every _load bumps it; stale flights bail instead
+  // of painting the old track's lyrics over the new one (skip-fast).
+  int _gen = 0;
 
   @override
   void initState() {
@@ -78,6 +82,8 @@ class _LyricsSectionState extends State<LyricsSection> {
 
   @override
   void dispose() {
+    // Invalidate any in-flight fetch so it can't paint after dispose.
+    _gen++;
     try {
       _http?.close();
     } catch (_) {}
@@ -146,7 +152,8 @@ class _LyricsSectionState extends State<LyricsSection> {
 
   /// NewPipe leg (YoutubeRepository.captionLines parity): manual tracks
   /// first, en/hi preferred, VTT re-encoded by the extractor.
-  Future<LyricsState> _newpipeLeg(YoutubeExplode yt, String videoId) async {
+  Future<LyricsState> _newpipeLeg(
+      http.Client client, YoutubeExplode yt, String videoId) async {
     try {
       final manifest = await yt.videos.closedCaptions
           .getManifest(videoId)
@@ -164,7 +171,7 @@ class _LyricsSectionState extends State<LyricsSection> {
         });
       for (final t in tracks.take(3)) {
         try {
-          final res = await http
+          final res = await client
               .get(t.url)
               .timeout(const Duration(seconds: 9));
           if (res.statusCode < 200 || res.statusCode >= 300) continue;
@@ -181,6 +188,9 @@ class _LyricsSectionState extends State<LyricsSection> {
   }
 
   Future<void> _load([bool force = false]) async {
+    // Bump first: switching tracks (even to an episode or a memoized
+    // track) invalidates any in-flight fetch for the previous track.
+    final myGen = ++_gen;
     // Episodes carry no lyrics: skip the whole fetch cascade (which
     // would burn network + show a spinner for nothing).
     try {
@@ -200,31 +210,54 @@ class _LyricsSectionState extends State<LyricsSection> {
         return;
       }
     }
+    // Drop the previous fetch's transport first: rapid skips leaked one
+    // http.Client + YoutubeExplode per track.
+    try {
+      _http?.close();
+    } catch (_) {}
+    _http = null;
+    try {
+      _explode?.close();
+    } catch (_) {}
+    _explode = null;
     final client = http.Client();
     _http = client;
     final yt = _explode = YoutubeExplode();
     try {
       final videoId =
           extractVideoId(widget.track.watchUrl) ?? widget.track.id;
-      final capped = _captionLeg(client, videoId);
-      final npipe = _newpipeLeg(yt, videoId);
-      final lrc = fetchLrclib(
-        client,
-        artist: widget.track.displayArtist(),
-        title: widget.track.title,
-      );
-      // Captions win when they parse; else NewPipe tracks; LRCLIB last.
-      LyricsState res = await capped;
-      if (res is LyricsNotFound) res = await npipe;
-      if (res is LyricsNotFound) res = await lrc;
-      if (!mounted) return;
+      // All three legs fly in parallel; priority still decides
+      // (captions > NewPipe tracks > LRCLIB), so a fast miss never
+      // beats a slower hit.
+      final legs = await Future.wait([
+        _captionLeg(client, videoId)
+            .catchError((_) => const LyricsNotFound()),
+        _newpipeLeg(client, yt, videoId),
+        fetchLrclib(
+          client,
+          artist: widget.track.displayArtist(),
+          title: widget.track.title,
+        ).catchError((_) => const LyricsNotFound()),
+      ]);
+      LyricsState res = const LyricsNotFound();
+      for (final leg in legs) {
+        if (leg is! LyricsNotFound) {
+          res = leg;
+          break;
+        }
+      }
+      // Skip-fast guard: a superseded load must not paint the old
+      // track's lyrics over the new one.
+      if (!mounted || myGen != _gen) return;
       setState(() => _state = res);
       _publish(res);
       try {
         AppScope.of(context).lyricsMemo[widget.track.id] = res;
       } catch (_) {}
     } catch (_) {
-      if (mounted) setState(() => _state = const LyricsNotFound());
+      if (mounted && myGen == _gen) {
+        setState(() => _state = const LyricsNotFound());
+      }
     }
   }
 
@@ -640,7 +673,7 @@ class _LyricTools extends StatelessWidget {
         backgroundColor: Colors.black.withValues(alpha: 0.88),
         shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(14)),
-        content: Row(
+        content: Semantics(liveRegion: true, child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
             Container(
@@ -660,7 +693,7 @@ class _LyricTools extends StatelessWidget {
                       color: textOn(_panelBg), fontSize: 13)),
             ),
           ],
-        ),
+        )),
       ));
     } catch (_) {}
   }
@@ -974,8 +1007,9 @@ class _EmptyLyrics extends StatelessWidget {
 }
 
 /// Synced karaoke list: current line highlighted + scaled, dots where
-/// the next line is ≥9 s out, auto-scroll with 3 s manual hold,
-/// tap-to-seek. Item identity is startMs-keyed (not index-keyed), so a
+/// the next line is ≥9 s out, auto-scroll that yields to the finger with
+/// an explicit Resume pill (no silent timer yank),
+/// tap-to-seek (tap-vs-drag gated). Item identity is startMs-keyed (not index-keyed), so a
 /// language swap over the same timings reuses the same elements and
 /// the scroll offset + active highlight never reset. [offsetMs] shifts
 /// every line's effective timing live (highlight, roll, auto-scroll
@@ -1001,8 +1035,20 @@ class _KaraokeViewState extends State<_KaraokeView> {
   final ScrollController _scroll = ScrollController();
   final Map<String, GlobalKey> _keys = {};
   DateTime _lastManual = DateTime.fromMillisecondsSinceEpoch(0);
+  // Explicit manual-hold state: the finger beats auto-scroll until the
+  // user taps Resume (no silent auto-resume timer — timers that yank
+  // the lines back are the bug). Reset on track change below.
+  bool _userScrolling = false;
+  // Tap-vs-drag gate: a seek needs tapUp within 300 ms and <8 dp of
+  // movement. Screen-reader activation carries no touch data and
+  // always passes the gate.
+  DateTime? _downAt;
+  Offset? _downPos;
+  DateTime? _upAt;
+  Offset? _upPos;
   int _current = -1;
   int _rollMs = lyricRollMs;
+  int _resumeMs = 220;
 
   @override
   void dispose() {
@@ -1013,6 +1059,12 @@ class _KaraokeViewState extends State<_KaraokeView> {
   @override
   void didUpdateWidget(covariant _KaraokeView old) {
     super.didUpdateWidget(old);
+    // New track (same widget element, e.g. hidden publisher reuse):
+    // the finger-hold belongs to the old song — auto-scroll resumes.
+    if (old.track.id != widget.track.id) {
+      _userScrolling = false;
+      _lastManual = DateTime.fromMillisecondsSinceEpoch(0);
+    }
     // Language / offset swaps keep the same startMs sequence: element
     // identity, pixel offset and the active index all survive — never
     // jump or reset. Only prune keys for lines that genuinely left.
@@ -1055,8 +1107,12 @@ class _KaraokeViewState extends State<_KaraokeView> {
     try {
       if (current == _current) return;
       _current = current;
-      // Manual hold: user drags pause auto-scroll without jank (the
-      // position stream keeps flowing; we simply skip the scroll).
+      // Finger always wins: while the user holds the scroll, the
+      // position stream keeps flowing and we simply skip the scroll.
+      // Resume is explicit (the pill) — never a silent timer yank.
+      // The 3 s hold below stays as a backstop for programmatic
+      // scrolls that never raised the touch flag.
+      if (_userScrolling) return;
       if (DateTime.now().difference(_lastManual) <
           const Duration(seconds: manualHoldSec)) {
         return;
@@ -1073,6 +1129,22 @@ class _KaraokeViewState extends State<_KaraokeView> {
     } catch (_) {}
   }
 
+  /// Explicit resume: glide back to the current line (220 ms,
+  /// motion-aware) and hand auto-scroll the wheel again.
+  void _resume() {
+    try {
+      if (!_userScrolling) return;
+      setState(() => _userScrolling = false);
+      final k = _keys[_stemFor(_current)];
+      final ctx = k?.currentContext;
+      if (ctx == null) return;
+      Scrollable.ensureVisible(ctx,
+          alignment: 0.4,
+          duration: Duration(milliseconds: _resumeMs),
+          curve: Curves.easeInOut);
+    } catch (_) {}
+  }
+
   @override
   Widget build(BuildContext context) {
     return NotificationListener<ScrollNotification>(
@@ -1080,7 +1152,12 @@ class _KaraokeViewState extends State<_KaraokeView> {
         try {
           if (n is ScrollStartNotification &&
               n.dragDetails != null) {
+            // Touch scroll (not a programmatic ensureVisible): the
+            // finger takes over until Resume is tapped.
             _lastManual = DateTime.now();
+            if (!_userScrolling && mounted) {
+              setState(() => _userScrolling = true);
+            }
           }
         } catch (_) {}
         return false;
@@ -1088,7 +1165,47 @@ class _KaraokeViewState extends State<_KaraokeView> {
       child: Container(
         height: 300,
         margin: const EdgeInsets.symmetric(horizontal: 12),
-        child: _clock(),
+        child: Stack(
+          children: [
+            _clock(),
+            // Explicit Resume pill: bottom-center Glass chip. Tells
+            // the user auto-scroll will hand back on tap — the old
+            // silent 3 s hold yanked the lines with no warning.
+            if (_userScrolling)
+              Positioned(
+                bottom: 12,
+                left: 0,
+                right: 0,
+                child: Center(
+                  child: Semantics(
+                    button: true,
+                    label: 'Resume',
+                    excludeSemantics: true,
+                    child: PressScale(
+                      motionOn:
+                          AppScope.of(context).motionOn,
+                      onTap: _resume,
+                      child: Glass(
+                        radius: 999,
+                        padding:
+                            const EdgeInsets.symmetric(
+                                horizontal: 16,
+                                vertical: 10),
+                        child: Text('Resume',
+                            style: TextStyle(
+                                color:
+                                    textOn(_panelBg),
+                                fontSize: 13,
+                                fontWeight:
+                                    FontWeight.w600,
+                                height: 1.2)),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -1104,8 +1221,11 @@ class _KaraokeViewState extends State<_KaraokeView> {
       );
     }
     final state = AppScope.of(context);
+    // Throttle: position ticks rebuild the whole karaoke list; 4 Hz is
+    // plenty for highlight + autoscroll and skips the in-between frames.
     return StreamBuilder<Duration>(
-      stream: state.controller.player.positionStream,
+      stream: state.controller.player.positionStream.distinct((a, b) =>
+          (a.inMilliseconds ~/ 250) == (b.inMilliseconds ~/ 250)),
       builder: (_, snap) => _list(
           (snap.data ?? Duration.zero).inMilliseconds),
     );
@@ -1117,6 +1237,7 @@ class _KaraokeViewState extends State<_KaraokeView> {
             // post-frame auto-scroll (avoids context reads off-build).
             try {
               _rollMs = state.motionMs(lyricRollMs);
+              _resumeMs = state.motionMs(220);
             } catch (_) {}
             var cur = 0;
             final off = widget.offsetMs;
@@ -1169,8 +1290,44 @@ class _KaraokeViewState extends State<_KaraokeView> {
                 return GestureDetector(
                   key: _keyFor(i),
                   behavior: HitTestBehavior.opaque,
+                  onTapDown: (d) {
+                    _downAt = DateTime.now();
+                    _downPos = d.globalPosition;
+                  },
+                  onTapUp: (d) {
+                    _upAt = DateTime.now();
+                    _upPos = d.globalPosition;
+                  },
                   onTap: () {
                     try {
+                      // Finger wins: while the user holds the scroll,
+                      // taps never seek (tap Resume first).
+                      if (_userScrolling) return;
+                      final downAt = _downAt;
+                      final downPos = _downPos;
+                      final upAt = _upAt;
+                      final upPos = _upPos;
+                      _downAt = null;
+                      _downPos = null;
+                      _upAt = null;
+                      _upPos = null;
+                      // Tap, not drag: up within 300 ms and <8 dp of
+                      // movement. Screen-reader activation carries no
+                      // touch data and always passes.
+                      if (downAt != null &&
+                          upAt != null &&
+                          downPos != null &&
+                          upPos != null) {
+                        if (upAt.difference(downAt) >
+                            const Duration(
+                                milliseconds: 300)) {
+                          return;
+                        }
+                        if ((upPos - downPos).distance >
+                            8) {
+                          return;
+                        }
+                      }
                       // Offset applies on top: seek lands on the
                       // shifted (heard) moment, timings preserved.
                       state.controller.player.seek(Duration(

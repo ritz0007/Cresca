@@ -20,13 +20,11 @@ import 'package:flutter/material.dart';
 import '../../core/motion.dart' as motion;
 import '../../podcasts/models.dart';
 import '../../podcasts/playback_support.dart';
+import '../app.dart';
 import '../design.dart';
 
 /// Minimum touch target (48 px) applied to every control on this screen.
 const double _target = 48;
-
-/// Search debounce (mirrors search_screen S1).
-const int _searchDebounceMs = 250;
 
 class PodcastScreen extends StatefulWidget {
   /// Motion kill-switch (AppState.motionOn).
@@ -186,8 +184,8 @@ class _PodcastScreenState extends State<PodcastScreen> {
       }
       _debounce = Timer(
         Duration(
-            milliseconds:
-                motion.motionMs(widget.motionOn, _searchDebounceMs)),
+            milliseconds: motion.motionMs(
+                widget.motionOn, motion.searchDebounceMs)),
         () => _run(value),
       );
     } catch (_) {}
@@ -499,11 +497,16 @@ class _PodcastScreenState extends State<PodcastScreen> {
           const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
       child: Row(
         children: [
-          SizedBox(
-            height: _target,
-            child: PressScale(
-              motionOn: on,
-              onTap: _cycleSpeed,
+          Semantics(
+            button: true,
+            label: 'Playback speed',
+            // Same notifier as the visible label.
+            value: '${_speed.toStringAsFixed(1)}x',
+            child: SizedBox(
+              height: _target,
+              child: PressScale(
+                motionOn: on,
+                onTap: _cycleSpeed,
               child: Container(
                 padding: const EdgeInsets.symmetric(
                     horizontal: 14),
@@ -526,12 +529,20 @@ class _PodcastScreenState extends State<PodcastScreen> {
               ),
             ),
           ),
+          ),
           const SizedBox(width: 8),
-          SizedBox(
-            height: _target,
-            child: PressScale(
-              motionOn: on,
-              onTap: _sleepMenu,
+          Semantics(
+            button: true,
+            label: 'Sleep timer',
+            // Same notifier as the visible label.
+            value: sleeping
+                ? fmtEpisodeMs(_sleepLeftMs)
+                : 'Off',
+            child: SizedBox(
+              height: _target,
+              child: PressScale(
+                motionOn: on,
+                onTap: _sleepMenu,
               child: Container(
                 padding: const EdgeInsets.symmetric(
                     horizontal: 14),
@@ -564,6 +575,7 @@ class _PodcastScreenState extends State<PodcastScreen> {
                 ),
               ),
             ),
+          ),
           ),
         ],
       ),
@@ -722,8 +734,10 @@ class _PodcastScreenState extends State<PodcastScreen> {
     }
     return ListView.separated(
       key: const ValueKey('results'),
-      padding: const EdgeInsets.fromLTRB(
-          12, 4, 12, 24),
+      // Live chrome clearance on the standalone tab; embedded mode
+      // rides inside home's own clearance so it keeps the base pad.
+      padding: EdgeInsets.fromLTRB(12, 4, 12,
+          widget.embedded ? 24 : 24 + BottomChromeScope.clearanceOf(context)),
       itemCount: _episodes.length,
       separatorBuilder: (_, _) =>
           const SizedBox(height: 4),

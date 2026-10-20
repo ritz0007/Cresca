@@ -32,6 +32,10 @@ final class CrescaStore: ObservableObject {
     @Published var lyricStatus = ""
     @Published var liked: Set<String> = []
     @Published var instance = "https://inv.tux.pizza"
+    /// Fallback Invidious instances, tried in order when the primary
+    /// 403s or is offline. The working base sticks via `instance`.
+    var fallbackInstances = ["https://invidious.nerdvpn.de"]
+    private var instances: [String] { [instance] + fallbackInstances }
 
     let player = AVPlayer()
     private var timeObs: Any?
@@ -45,25 +49,31 @@ final class CrescaStore: ObservableObject {
         observeProgress()
     }
 
-    // ponytail: single public Invidious instance, add rotation list if it 403s/offline
+    // ponytail: single public Invidious Invidious instance, with fallback rotation
     func search(_ q: String) async {
         let query = q.trimmingCharacters(in: .whitespaces)
         guard !query.isEmpty else { return }
-        do {
-            var c = URLComponents(string: "\(instance)/api/v1/search")!
-            c.queryItems = [URLQueryItem(name: "q", value: query), URLQueryItem(name: "type", value: "video")]
-            let (data, _) = try await URLSession.shared.data(from: c.url!)
-            let arr = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] ?? []
-            results = arr.compactMap { o in
-                guard let id = o["videoId"] as? String,
-                      let title = o["title"] as? String else { return nil }
-                if title.count < 2 { return nil }
-                let dur = (o["lengthSeconds"] as? Int) ?? 0
-                if dur > 0 && dur > 600 { return nil } // songs-only, mirrors Android
-                return YtTrack(videoId: id, title: title,
-                    artist: (o["author"] as? String) ?? "Unknown", lengthSec: dur)
-            }
-        } catch { print("search failed: \(error)") }
+        for base in instances {
+            do {
+                guard var c = URLComponents(string: "\(base)/api/v1/search") else { continue }
+                c.queryItems = [URLQueryItem(name: "q", value: query), URLQueryItem(name: "type", value: "video")]
+                guard let url = c.url else { continue }
+                let (data, _) = try await URLSession.shared.data(from: url)
+                guard let arr = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { continue }
+                let hits = arr.compactMap { o -> YtTrack? in
+                    guard let id = o["videoId"] as? String,
+                          let title = o["title"] as? String else { return nil }
+                    if title.count < 2 { return nil }
+                    let dur = (o["lengthSeconds"] as? Int) ?? 0
+                    if dur > 0 && dur > 600 { return nil } // songs-only, mirrors Android
+                    return YtTrack(videoId: id, title: title,
+                        artist: (o["author"] as? String) ?? "Unknown", lengthSec: dur)
+                }
+                results = hits
+                instance = base
+                return
+            } catch { continue }
+        }
     }
 
     func play(_ t: YtTrack) async {
@@ -94,27 +104,36 @@ final class CrescaStore: ObservableObject {
     }
 
     private func streamURL(for videoId: String) async throws -> URL {
-        let api = URL(string: "\(instance)/api/v1/streams/\(videoId)")!
-        let (data, _) = try await URLSession.shared.data(from: api)
-        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-        let fmts = (json["adaptiveFormats"] as? [[String: Any]] ?? []) +
-                   (json["formatStreams"] as? [[String: Any]] ?? [])
-        // prefer audio-only opus/m4a, fallback to lowest video
-        let audios = fmts.filter { ($0["type"] as? String ?? "").hasPrefix("audio/") }
-        let pick = audios.first ?? fmts.first
-        guard let s = pick?["url"] as? String, let u = URL(string: s) else {
-            throw NSError(domain: "Cresca", code: 404, userInfo: [NSLocalizedDescriptionKey: "No stream URL (instance down or 403)"])
+        var lastError = NSError(domain: "Cresca", code: 404, userInfo: [NSLocalizedDescriptionKey: "No stream URL (instance down or 403)"])
+        for base in instances {
+            do {
+                guard let api = URL(string: "\(base)/api/v1/streams/\(videoId)") else { continue }
+                let (data, _) = try await URLSession.shared.data(from: api)
+                guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+                let fmts = (json["adaptiveFormats"] as? [[String: Any]] ?? []) +
+                           (json["formatStreams"] as? [[String: Any]] ?? [])
+                // prefer audio-only opus/m4a, fallback to lowest video
+                let audios = fmts.filter { ($0["type"] as? String ?? "").hasPrefix("audio/") }
+                let pick = audios.first ?? fmts.first
+                guard let s = pick?["url"] as? String, let u = URL(string: s) else { continue }
+                instance = base
+                return u
+            } catch {
+                lastError = error as NSError
+                continue
+            }
         }
-        return u
+        throw lastError
     }
 
     private func loadLyrics(artist: String, title: String) async {
         lyrics = []; lyricStatus = "Searching lyrics…"
         do {
             let clean = title.components(separatedBy: " (").first ?? title
-            var c = URLComponents(string: "https://lrclib.net/api/search")!
+            guard var c = URLComponents(string: "https://lrclib.net/api/search") else { lyricStatus = "No lyrics"; return }
             c.queryItems = [URLQueryItem(name: "q", value: "\(clean) \(artist)")]
-            let (data, _) = try await URLSession.shared.data(from: c.url!)
+            guard let url = c.url else { lyricStatus = "No lyrics"; return }
+            let (data, _) = try await URLSession.shared.data(from: url)
             let arr = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] ?? []
             guard let best = arr.first(where: { ($0["syncedLyrics"] as? String ?? "").count > 10 })
                     ?? arr.first else { lyricStatus = "No lyrics"; return }
@@ -123,7 +142,7 @@ final class CrescaStore: ObservableObject {
                 if !lyrics.isEmpty { return }
             }
             lyricStatus = (best["plainLyrics"] as? String ?? "").isEmpty ? "No lyrics" : ""
-            if lyricStatus == "" { lyrics = [LyricLine(ms: 0, text: best["plainLyrics"] as! String)] }
+            if lyricStatus == "" { lyrics = [LyricLine(ms: 0, text: best["plainLyrics"] as? String ?? "")] }
         } catch { lyricStatus = "No lyrics" }
     }
 
