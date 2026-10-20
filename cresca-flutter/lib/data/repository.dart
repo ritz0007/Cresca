@@ -243,9 +243,15 @@ class YoutubeRepository {
           } catch (_) {}
           return hit;
         }
-        // Negative: recently-empty query fails fast, zero RTT.
+        // Negative: recently-empty query fails fast, zero RTT — unless
+        // the last fetch failed at transport (U6): Retry must re-fetch
+        // so a recovered network paints instead of replaying the error.
         final neg = _snapEmptyAt['search:$key'];
-        if (neg != null && now - neg <= negativeTtlMs) return [];
+        if (neg != null &&
+            now - neg <= negativeTtlMs &&
+            !searchFailures.failed(key)) {
+          return [];
+        }
       } catch (_) {}
       final existing = _queryFlight[key];
       if (existing != null) {
@@ -263,34 +269,24 @@ class YoutubeRepository {
         }
       } catch (_) {}
       List<YtTrack> out;
-      // Transport failures are recorded, never cached: Retry re-fetches,
-      // so a recovered network paints instead of serving the failure
-      // again (U6: offline reads as error, never as empty).
-      var transportFailed = false;
       try {
         out = await mine;
       } catch (_) {
         out = [];
-        transportFailed = true;
       } finally {
         try {
           if (_queryFlight[key] == mine) _queryFlight.remove(key);
         } catch (_) {}
       }
       try {
-        if (transportFailed) {
-          searchFailures.noteFailure(key);
+        if (out.isNotEmpty) {
+          _memoStore(_queryMemo, key, out,
+              DateTime.now().millisecondsSinceEpoch, _queryMemoCap);
         } else {
-          searchFailures.noteSuccess(key);
-          if (out.isNotEmpty) {
-            _memoStore(_queryMemo, key, out,
-                DateTime.now().millisecondsSinceEpoch, _queryMemoCap);
-          } else {
-            _snapEmptyAt['search:$key'] =
-                DateTime.now().millisecondsSinceEpoch;
-            while (_snapEmptyAt.length > negativeCap) {
-              _snapEmptyAt.remove(_snapEmptyAt.keys.first);
-            }
+          _snapEmptyAt['search:$key'] =
+              DateTime.now().millisecondsSinceEpoch;
+          while (_snapEmptyAt.length > negativeCap) {
+            _snapEmptyAt.remove(_snapEmptyAt.keys.first);
           }
         }
       } catch (_) {}
@@ -319,6 +315,18 @@ class YoutubeRepository {
   Future<List<YtTrack>> _searchMusicFresh(String query, {int max = 15}) async {
     try {
       if (query.trim().isEmpty) return [];
+      // U6: observes transport failure so the search screen can raise
+      // Retry instead of "No results". Only a THROWN tier marks: a tier
+      // that answers (even with zero rows) is authoritative — genuine
+      // empty must stay empty. The extractor fallback throws on
+      // transport failure and returns [] on genuine empty, so the flag
+      // below fires exactly on failure. Key matches searchMusic's memo.
+      final failKey = 'q:${query.trim().toLowerCase()}|$max';
+      var tierFailed = false;
+      void markTierFailed() {
+        tierFailed = true;
+      }
+
       if (session.useInnerTube) {
         try {
           final json = await _post(
@@ -329,9 +337,18 @@ class YoutubeRepository {
             final fast = parseSearch(json, max);
             if (fast.isNotEmpty) return distinctById(fast).take(max).toList();
           }
-        } catch (_) {}
+        } catch (_) {
+          markTierFailed();
+        }
       }
-      return await searchVideos(query, max: max);
+      final vids = await searchVideos(query,
+          max: max, onTransportFailure: markTierFailed);
+      if (vids.isEmpty && tierFailed) {
+        searchFailures.noteFailure(failKey);
+      } else {
+        searchFailures.noteSuccess(failKey);
+      }
+      return vids;
     } catch (_) {
       return [];
     }
@@ -341,7 +358,8 @@ class YoutubeRepository {
       searchMusic(query, max: max);
 
   /// Plain video search via the extractor (music videos live here).
-  Future<List<YtTrack>> searchVideos(String query, {int max = 20}) async {
+  Future<List<YtTrack>> searchVideos(String query,
+      {int max = 20, void Function()? onTransportFailure}) async {
     try {
       if (query.trim().isEmpty) return [];
       final list = await _explode.search
@@ -359,6 +377,12 @@ class YoutubeRepository {
       }
       return out;
     } catch (_) {
+      // Transport failure (not genuine empty): the extractor throws,
+      // the parse path returns []. Callers that must tell them apart
+      // pass onTransportFailure (U6 search error states).
+      try {
+        onTransportFailure?.call();
+      } catch (_) {}
       return [];
     }
   }
